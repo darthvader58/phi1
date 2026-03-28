@@ -57,53 +57,49 @@ export default function RacePage() {
     setStarting(false);
   }
 
-  // Show lobby state if not racing yet
+  // Lobby state
   if (raceInfo?.status === "lobby") {
     const players = Object.values(raceInfo.players || {}) as any[];
     return (
-      <div className="max-w-3xl mx-auto px-4 py-8">
-        <h1 className="text-2xl font-bold mb-2 text-gray-200">
-          Race Lobby — {raceInfo.track?.charAt(0).toUpperCase() + raceInfo.track?.slice(1)}
-        </h1>
-        <p className="text-sm text-gray-500 mb-6">Race ID: {raceId}</p>
+      <div className="max-w-3xl mx-auto px-4 py-10">
+        <div className="mb-8">
+          <h1 className="text-3xl font-extrabold text-white tracking-tight">
+            {raceInfo.track?.charAt(0).toUpperCase() + raceInfo.track?.slice(1)} Grand Prix
+          </h1>
+          <p className="text-sm text-pit-muted font-mono mt-1">ID: {raceId}</p>
+        </div>
 
-        <div className="bg-gray-900 border border-gray-700 rounded-lg p-5 mb-4">
-          <h2 className="text-sm font-bold text-gray-300 mb-3">
-            PLAYERS ({players.length}/8)
-          </h2>
-          {players.length === 0 ? (
-            <p className="text-gray-600 text-sm">No players yet.</p>
-          ) : (
-            <div className="space-y-1">
-              {players.map((p: any) => (
-                <div key={p.car_id} className="text-sm text-gray-300">
-                  <span className="font-bold">{p.car_id}</span>
-                  <span className="text-gray-500 ml-2">{p.username}</span>
-                </div>
-              ))}
-            </div>
-          )}
+        <div className="card overflow-hidden mb-5">
+          <div className="px-5 py-3.5 border-b border-pit-border flex items-center justify-between">
+            <span className="section-label">Drivers</span>
+            <span className="text-[10px] text-pit-muted font-mono">{players.length}/8</span>
+          </div>
+          <div className="p-4">
+            {players.length === 0 ? (
+              <p className="text-pit-muted text-sm text-center py-6">Waiting for drivers...</p>
+            ) : (
+              <div className="space-y-2">
+                {players.map((p: any) => (
+                  <div key={p.car_id} className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-pit-surface/50">
+                    <div className="w-1 h-6 rounded-full bg-f1-red" />
+                    <span className="font-bold text-white text-sm">{p.car_id}</span>
+                    <span className="text-pit-muted text-xs">{p.username}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="flex gap-3">
-          <button
-            onClick={handleJoin}
-            disabled={joining}
-            className="px-5 py-2 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded
-                       text-sm font-bold transition-colors disabled:opacity-50"
-          >
+          <button onClick={handleJoin} disabled={joining} className="btn-secondary">
             {joining ? "Joining..." : "Join Race"}
           </button>
-          <button
-            onClick={handleStart}
-            disabled={starting || players.length === 0}
-            className="px-5 py-2 bg-red-700 hover:bg-red-600 text-white rounded
-                       text-sm font-bold transition-colors disabled:opacity-50"
-          >
+          <button onClick={handleStart} disabled={starting || players.length === 0} className="btn-primary">
             {starting ? "Starting..." : "Start Race"}
           </button>
         </div>
-        {error && <p className="text-red-400 text-xs mt-2">{error}</p>}
+        {error && <p className="text-f1-red text-xs mt-3">{error}</p>}
       </div>
     );
   }
@@ -113,14 +109,16 @@ export default function RacePage() {
     return (
       <div className="flex items-center justify-center min-h-[60vh]">
         <div className="text-center">
-          <div className="text-6xl font-bold text-red-500 mb-2">{countdown}</div>
-          <div className="text-gray-500 text-sm">Race starting...</div>
+          <div className="text-8xl font-black text-f1-red mb-3 tabular-nums animate-pulse-slow">
+            {countdown}
+          </div>
+          <div className="text-pit-muted text-sm uppercase tracking-widest">Lights Out</div>
         </div>
       </div>
     );
   }
 
-  // Race view (live or finished)
+  // Race view
   const cars = lapData?.cars || result?.standings || [];
   const trackName = raceInfo?.track || lapData?.weather || "bahrain";
   const weather = lapData?.weather || "dry";
@@ -128,50 +126,59 @@ export default function RacePage() {
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-4">
-      {/* Top bar */}
-      <div className="flex items-center gap-4 mb-4 bg-gray-900 border border-gray-700 rounded-lg px-4 py-2">
-        <div className="text-sm font-bold text-gray-200">
-          {raceInfo?.track?.toUpperCase() || "RACE"}
+      {/* Race info bar */}
+      <div className="card px-5 py-3 mb-4 flex items-center gap-4 flex-wrap">
+        <div className="flex items-center gap-3">
+          <div className="w-1 h-6 rounded-full bg-f1-red" />
+          <span className="text-sm font-extrabold text-white tracking-wide">
+            {raceInfo?.track?.toUpperCase() || "RACE"}
+          </span>
         </div>
-        <div className="text-sm text-gray-400">
-          Lap {currentLap || result?.total_laps || "?"}/{totalLaps || result?.total_laps || "?"}
-        </div>
-        <div className={`text-xs font-bold px-2 py-0.5 rounded ${
-          weather === "dry" ? "bg-gray-800 text-gray-400" :
-          weather === "wet" ? "bg-blue-900 text-blue-300" :
-          "bg-cyan-900 text-cyan-300"
+
+        <div className="divider h-4" />
+
+        <span className="text-sm text-pit-text font-mono tabular-nums">
+          LAP <span className="text-white font-bold">{currentLap || result?.total_laps || "?"}</span>
+          <span className="text-pit-muted">/{totalLaps || result?.total_laps || "?"}</span>
+        </span>
+
+        <div className={`badge text-[10px] font-bold ${
+          weather === "dry" ? "bg-pit-surface text-pit-text" :
+          weather === "wet" ? "bg-blue-500/10 text-blue-400" :
+          "bg-cyan-500/10 text-cyan-400"
         }`}>
           {weather.toUpperCase()}
         </div>
+
         {safetyCar && (
-          <div className="text-xs font-bold px-2 py-0.5 rounded bg-yellow-900 text-yellow-300">
+          <div className="badge bg-yellow-500/10 text-yellow-400 text-[10px] font-bold animate-pulse-slow">
             SAFETY CAR
           </div>
         )}
-        <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">
-          <span>Speed:</span>
+
+        <div className="ml-auto flex items-center gap-2">
+          <span className="text-[10px] text-pit-muted uppercase tracking-wider">Speed</span>
           {[1, 5, 20].map((s) => (
             <button
               key={s}
               onClick={() => setSpeed(s)}
-              className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors"
+              className="px-2.5 py-1 rounded-md bg-pit-surface text-pit-text text-[11px] font-bold
+                         hover:bg-pit-border hover:text-white transition-colors duration-150"
             >
               {s}x
             </button>
           ))}
+          <div className={`w-2 h-2 rounded-full ml-2 ${connected ? "bg-green-500" : "bg-red-500"}`}
+               title={connected ? "Connected" : "Disconnected"} />
         </div>
-        <div className={`w-2 h-2 rounded-full ${connected ? "bg-green-500" : "bg-red-500"}`}
-             title={connected ? "Connected" : "Disconnected"} />
       </div>
 
       {/* Main grid */}
       <div className="grid grid-cols-12 gap-4">
-        {/* Left: Leaderboard */}
         <div className="col-span-3">
           {cars.length > 0 && <Leaderboard cars={cars} />}
         </div>
 
-        {/* Center: Track map */}
         <div className="col-span-5">
           {cars.length > 0 && (
             <TrackMap
@@ -181,7 +188,6 @@ export default function RacePage() {
               safetyCar={safetyCar}
             />
           )}
-          {/* Gap chart */}
           {allLapData.length > 1 && (
             <div className="mt-4">
               <GapChart lapHistory={allLapData} width={480} height={200} />
@@ -189,28 +195,34 @@ export default function RacePage() {
           )}
         </div>
 
-        {/* Right: Event log */}
         <div className="col-span-4">
           <EventLog events={events} />
         </div>
       </div>
 
-      {/* Finished overlay */}
+      {/* Finished */}
       {status === "finished" && result && (
-        <div className="mt-6 bg-gray-900 border border-gray-700 rounded-lg p-5">
-          <h2 className="text-lg font-bold text-gray-200 mb-3">RACE COMPLETE</h2>
-          <div className="space-y-1">
+        <div className="card overflow-hidden mt-6">
+          <div className="px-5 py-3.5 border-b border-pit-border flex items-center gap-2">
+            <div className="accent-line" />
+            <span className="section-label">Race Complete</span>
+          </div>
+          <div className="p-5 space-y-1">
             {result.standings.map((car, idx) => (
-              <div key={car.car_id} className="flex items-center gap-3 text-sm">
-                <span className="w-8 text-right font-bold text-gray-400">
+              <div key={car.car_id}
+                   className={`flex items-center gap-4 text-sm px-3 py-2.5 rounded-lg
+                              ${idx === 0 ? "bg-f1-red/5" : "hover:bg-white/[0.02]"} transition-colors`}>
+                <span className={`w-10 text-right font-extrabold tabular-nums ${
+                  idx === 0 ? "text-f1-red" : idx < 3 ? "text-white" : "text-pit-muted"
+                }`}>
                   P{car.position}
                 </span>
-                <span className="w-20 font-bold text-gray-200">{car.car_id}</span>
-                <span className="text-gray-500">
+                <span className="w-20 font-bold text-white">{car.car_id}</span>
+                <span className="text-pit-text font-mono text-xs tabular-nums">
                   {car.retired ? "DNF" : `+${car.gap_to_leader.toFixed(3)}s`}
                 </span>
-                <span className="text-gray-600 text-xs">
-                  {car.pit_count} stops ({car.compounds_used.join(" → ")})
+                <span className="text-pit-muted text-[11px] ml-auto">
+                  {car.pit_count} stop{car.pit_count !== 1 ? "s" : ""} ({car.compounds_used.join(" → ")})
                 </span>
               </div>
             ))}

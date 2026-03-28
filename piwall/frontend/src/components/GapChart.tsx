@@ -9,7 +9,7 @@ interface Props {
   height?: number;
 }
 
-export default function GapChart({ lapHistory, width = 600, height = 250 }: Props) {
+export default function GapChart({ lapHistory, width = 600, height = 220 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -24,26 +24,21 @@ export default function GapChart({ lapHistory, width = 600, height = 250 }: Prop
     canvas.height = height * dpr;
     ctx.scale(dpr, dpr);
 
-    // Clear
-    ctx.fillStyle = "#111827";
+    // Background
+    ctx.fillStyle = "#161616";
     ctx.fillRect(0, 0, width, height);
 
-    const padding = { top: 20, right: 80, bottom: 30, left: 50 };
+    const padding = { top: 24, right: 72, bottom: 28, left: 44 };
     const plotW = width - padding.left - padding.right;
     const plotH = height - padding.top - padding.bottom;
 
-    // Gather car IDs from first lap
     const carIds = lapHistory[0].cars
       .filter((c) => !c.retired)
       .map((c) => c.car_id);
 
-    // Build gap data per car
     const maxLap = lapHistory[lapHistory.length - 1].lap;
     const gapData: Record<string, { lap: number; gap: number }[]> = {};
-
-    for (const id of carIds) {
-      gapData[id] = [];
-    }
+    for (const id of carIds) gapData[id] = [];
 
     let maxGap = 5;
     for (const snap of lapHistory) {
@@ -54,15 +49,13 @@ export default function GapChart({ lapHistory, width = 600, height = 250 }: Prop
         }
       }
     }
-
     maxGap = Math.ceil(maxGap / 5) * 5;
 
-    // Scale functions
     const xScale = (lap: number) => padding.left + (lap / maxLap) * plotW;
     const yScale = (gap: number) => padding.top + (gap / maxGap) * plotH;
 
-    // Grid lines
-    ctx.strokeStyle = "#1f2937";
+    // Grid
+    ctx.strokeStyle = "#1f1f1f";
     ctx.lineWidth = 0.5;
     for (let g = 0; g <= maxGap; g += 5) {
       const y = yScale(g);
@@ -72,27 +65,30 @@ export default function GapChart({ lapHistory, width = 600, height = 250 }: Prop
       ctx.stroke();
     }
 
-    // Axes labels
-    ctx.fillStyle = "#6b7280";
-    ctx.font = "10px monospace";
+    // Axis labels
+    ctx.fillStyle = "#3a3a3a";
+    ctx.font = "10px Inter, sans-serif";
     ctx.textAlign = "right";
     for (let g = 0; g <= maxGap; g += 5) {
-      ctx.fillText(`${g}s`, padding.left - 5, yScale(g) + 3);
+      ctx.fillText(`${g}s`, padding.left - 6, yScale(g) + 3);
     }
     ctx.textAlign = "center";
-    const lapStep = Math.max(1, Math.floor(maxLap / 10));
+    const lapStep = Math.max(1, Math.floor(maxLap / 8));
     for (let l = 0; l <= maxLap; l += lapStep) {
-      ctx.fillText(`${l}`, xScale(l), height - padding.bottom + 15);
+      ctx.fillText(`${l}`, xScale(l), height - padding.bottom + 14);
     }
-    ctx.fillText("Lap", width / 2, height - 5);
 
-    // Draw lines
+    // Lines
     carIds.forEach((id, idx) => {
       const points = gapData[id];
       if (points.length < 2) return;
 
-      ctx.strokeStyle = getCarColor(idx);
+      const color = getCarColor(idx);
+
+      // Line
+      ctx.strokeStyle = color;
       ctx.lineWidth = 1.5;
+      ctx.lineJoin = "round";
       ctx.beginPath();
       ctx.moveTo(xScale(points[0].lap), yScale(points[0].gap));
       for (let i = 1; i < points.length; i++) {
@@ -100,26 +96,34 @@ export default function GapChart({ lapHistory, width = 600, height = 250 }: Prop
       }
       ctx.stroke();
 
-      // Label at end
+      // End dot
       const last = points[points.length - 1];
-      ctx.fillStyle = getCarColor(idx);
-      ctx.font = "9px monospace";
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(xScale(last.lap), yScale(last.gap), 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Label
+      ctx.fillStyle = color;
+      ctx.font = "bold 9px Inter, sans-serif";
       ctx.textAlign = "left";
-      ctx.fillText(id, xScale(last.lap) + 4, yScale(last.gap) + 3);
+      ctx.fillText(id, xScale(last.lap) + 6, yScale(last.gap) + 3);
     });
 
     // Title
-    ctx.fillStyle = "#9ca3af";
-    ctx.font = "11px monospace";
+    ctx.fillStyle = "#3a3a3a";
+    ctx.font = "bold 10px Inter, sans-serif";
     ctx.textAlign = "left";
-    ctx.fillText("Gap to Leader", padding.left, 14);
+    ctx.fillText("GAP TO LEADER", padding.left, 14);
   }, [lapHistory, width, height]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      style={{ width, height }}
-      className="rounded-lg border border-gray-700"
-    />
+    <div className="card overflow-hidden">
+      <canvas
+        ref={canvasRef}
+        style={{ width, height }}
+        className="w-full"
+      />
+    </div>
   );
 }

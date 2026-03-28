@@ -11,7 +11,6 @@ export default function StrategyPage() {
   const [testing, setTesting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
-  const [history, setHistory] = useState<any[]>([]);
 
   useEffect(() => {
     api.getTemplate().then((res) => setTemplate(res.template)).catch(() => {});
@@ -34,7 +33,6 @@ export default function StrategyPage() {
     setSubmitting(true);
     setMessage("");
     try {
-      // For now, just validate
       const result = await api.testBot(code, testTrack, 10);
       setMessage("Strategy validated successfully! Join a race to use it.");
       setTestResult(result);
@@ -44,13 +42,22 @@ export default function StrategyPage() {
     setSubmitting(false);
   }
 
+  const bots = [
+    { id: "VEL-01", color: "text-f1-red", desc: "Greedy threshold — pits when deg > 2.2s" },
+    { id: "NXS-07", color: "text-purple-400", desc: "Undercut hunter — watches gaps + rival tyres" },
+    { id: "WXP-23", color: "text-cyan-400", desc: "Weather prophet — holds for SC windows" },
+    { id: "EQL-44", color: "text-yellow-400", desc: "Nash equilibrium — optimal pit timing" },
+    { id: "AGR-33", color: "text-green-400", desc: "Aggressive 2-stop — fixed pit windows" },
+  ];
+
   return (
-    <div className="max-w-6xl mx-auto px-4 py-8">
-      <h1 className="text-2xl font-bold mb-2 text-gray-200">Strategy Editor</h1>
-      <p className="text-sm text-gray-500 mb-6">
-        Write a Python function that decides when to pit and which compound to use.
-        Test it against the built-in bots before racing.
-      </p>
+    <div className="max-w-6xl mx-auto px-4 py-10">
+      <div className="mb-8">
+        <h1 className="text-3xl font-extrabold text-white tracking-tight">Strategy Editor</h1>
+        <p className="text-sm text-pit-text mt-1">
+          Write a Python function that decides when to pit and which compound to use.
+        </p>
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Editor */}
@@ -65,62 +72,66 @@ export default function StrategyPage() {
             />
           )}
           {message && (
-            <p className={`text-sm mt-2 ${message.includes("Error") ? "text-red-400" : "text-green-400"}`}>
+            <p className={`text-sm mt-3 ${message.includes("Error") ? "text-f1-red" : "text-green-400"}`}>
               {message}
             </p>
           )}
         </div>
 
-        {/* Test controls + results */}
-        <div className="space-y-4">
-          <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
-            <h3 className="text-sm font-bold text-gray-300 mb-2">TEST SETTINGS</h3>
-            <div className="space-y-2">
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Track</label>
-                <select
-                  value={testTrack}
-                  onChange={(e) => setTestTrack(e.target.value)}
-                  className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5
-                             text-sm text-gray-200 focus:border-red-500 focus:outline-none"
-                >
-                  {["bahrain", "monaco", "monza", "spa", "silverstone", "suzuka"].map((t) => (
-                    <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>
-                  ))}
-                </select>
-              </div>
+        {/* Sidebar */}
+        <div className="space-y-5">
+          {/* Test settings */}
+          <div className="card p-5">
+            <div className="flex items-center gap-2 mb-4">
+              <div className="accent-line" />
+              <span className="section-label">Test Settings</span>
+            </div>
+            <div>
+              <label className="text-[10px] text-pit-muted uppercase tracking-wider block mb-1.5">Track</label>
+              <select
+                value={testTrack}
+                onChange={(e) => setTestTrack(e.target.value)}
+                className="input w-full"
+              >
+                {["bahrain", "monaco", "monza", "spa", "silverstone", "suzuka"].map((t) => (
+                  <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>
+                ))}
+              </select>
             </div>
           </div>
 
+          {/* Test results */}
           {testResult && (
-            <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
-              <h3 className="text-sm font-bold text-gray-300 mb-2">TEST RESULT</h3>
-              <div className="space-y-1">
+            <div className="card overflow-hidden">
+              <div className="px-5 py-3.5 border-b border-pit-border">
+                <span className="section-label">Test Result</span>
+              </div>
+              <div className="p-4 space-y-1">
                 {testResult.standings?.map((car: any) => (
-                  <div key={car.car_id} className="flex items-center gap-2 text-xs">
-                    <span className={`w-8 text-right font-bold ${
-                      car.car_id === "USER" ? "text-green-400" : "text-gray-400"
+                  <div key={car.car_id} className="flex items-center gap-2 text-xs px-2 py-1.5 rounded-md hover:bg-white/[0.02]">
+                    <span className={`w-8 text-right font-extrabold tabular-nums ${
+                      car.car_id === "USER" ? "text-f1-red" : "text-pit-muted"
                     }`}>
                       P{car.position}
                     </span>
                     <span className={`font-bold ${
-                      car.car_id === "USER" ? "text-green-300" : "text-gray-300"
+                      car.car_id === "USER" ? "text-white" : "text-pit-text"
                     }`}>
                       {car.car_id}
                     </span>
-                    <span className="text-gray-500">
+                    <span className="text-pit-muted font-mono text-[11px]">
                       {car.retired ? "DNF" : `+${car.gap_to_leader.toFixed(1)}s`}
                     </span>
-                    <span className="text-gray-600">
+                    <span className="text-pit-muted text-[10px] ml-auto">
                       {car.pit_count}s
                     </span>
                   </div>
                 ))}
               </div>
               {testResult.events?.length > 0 && (
-                <div className="mt-3 border-t border-gray-800 pt-2 max-h-40 overflow-y-auto">
+                <div className="border-t border-pit-border p-3 max-h-40 overflow-y-auto">
                   {testResult.events.slice(0, 20).map((e: any, i: number) => (
-                    <div key={i} className="text-[10px] text-gray-500 font-mono">
+                    <div key={i} className="text-[10px] text-pit-muted font-mono leading-relaxed">
                       L{e.lap} {e.type}: {e.detail}
                     </div>
                   ))}
@@ -129,14 +140,19 @@ export default function StrategyPage() {
             </div>
           )}
 
-          <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
-            <h3 className="text-sm font-bold text-gray-300 mb-2">BUILT-IN BOTS</h3>
-            <div className="space-y-2 text-xs text-gray-400">
-              <div><span className="text-red-400 font-bold">VEL-01</span> — Greedy threshold (pit when deg &gt; 2.2s)</div>
-              <div><span className="text-purple-400 font-bold">NXS-07</span> — Undercut hunter (watches gaps + rival tyres)</div>
-              <div><span className="text-cyan-400 font-bold">WXP-23</span> — Weather prophet (holds for SC windows)</div>
-              <div><span className="text-yellow-400 font-bold">EQL-44</span> — Nash equilibrium (optimal pit timing)</div>
-              <div><span className="text-green-400 font-bold">AGR-33</span> — Aggressive 2-stop (fixed windows)</div>
+          {/* Bots reference */}
+          <div className="card p-5">
+            <div className="flex items-center gap-2 mb-4">
+              <div className="accent-line" />
+              <span className="section-label">Built-in Bots</span>
+            </div>
+            <div className="space-y-3">
+              {bots.map((bot) => (
+                <div key={bot.id} className="text-xs">
+                  <span className={`${bot.color} font-bold`}>{bot.id}</span>
+                  <span className="text-pit-text ml-2">{bot.desc}</span>
+                </div>
+              ))}
             </div>
           </div>
         </div>

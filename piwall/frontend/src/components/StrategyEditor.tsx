@@ -6,7 +6,8 @@ import dynamic from "next/dynamic";
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
   ssr: false,
   loading: () => (
-    <div className="h-96 bg-gray-900 flex items-center justify-center text-gray-500 font-mono">
+    <div className="h-[500px] bg-pit-dark rounded-card border border-pit-border
+                    flex items-center justify-center text-pit-muted text-sm">
       Loading editor...
     </div>
   ),
@@ -64,10 +65,14 @@ export default function StrategyEditor({
   const [code, setCode] = useState(TYPE_HINTS + initialCode);
 
   return (
-    <div className="flex flex-col gap-3">
-      <div className="border border-gray-700 rounded-lg overflow-hidden">
+    <div className="flex flex-col gap-4">
+      <div className="card overflow-hidden">
+        <div className="px-4 py-2.5 border-b border-pit-border flex items-center justify-between">
+          <span className="section-label">Strategy Code</span>
+          <span className="text-[10px] text-pit-muted font-mono">Python</span>
+        </div>
         <MonacoEditor
-          height="480px"
+          height="500px"
           language="python"
           theme="vs-dark"
           value={code}
@@ -78,28 +83,23 @@ export default function StrategyEditor({
             fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
             lineNumbers: "on",
             scrollBeyondLastLine: false,
-            padding: { top: 10 },
+            padding: { top: 12, bottom: 12 },
             wordWrap: "on",
+            renderLineHighlight: "gutter",
+            cursorBlinking: "smooth",
+            smoothScrolling: true,
+            bracketPairColorization: { enabled: true },
           }}
         />
       </div>
-      <div className="flex gap-2">
+
+      <div className="flex items-center gap-3">
         {onTest && (
-          <button
-            onClick={() => onTest(code)}
-            disabled={testing}
-            className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-200
-                       rounded font-mono text-sm disabled:opacity-50 transition-colors"
-          >
-            {testing ? "Testing..." : "Test vs Bots"}
+          <button onClick={() => onTest(code)} disabled={testing} className="btn-secondary">
+            {testing ? "Running..." : "Test vs Bots"}
           </button>
         )}
-        <button
-          onClick={() => onSubmit(code)}
-          disabled={submitting}
-          className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white
-                     rounded font-mono text-sm font-bold disabled:opacity-50 transition-colors"
-        >
+        <button onClick={() => onSubmit(code)} disabled={submitting} className="btn-primary">
           {submitting ? "Submitting..." : "Submit Strategy"}
         </button>
       </div>

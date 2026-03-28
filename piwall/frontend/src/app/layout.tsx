@@ -1,13 +1,6 @@
 import type { Metadata } from "next";
-import localFont from "next/font/local";
 import Link from "next/link";
 import "./globals.css";
-
-const geistMono = localFont({
-  src: "./fonts/GeistMonoVF.woff",
-  variable: "--font-geist-mono",
-  weight: "100 900",
-});
 
 export const metadata: Metadata = {
   title: "PIT WALL — F1 Strategy Game",
@@ -19,32 +12,52 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className="dark">
-      <body className={`${geistMono.variable} font-mono bg-gray-950 text-gray-100 min-h-screen`}>
+      <body className="bg-pit-black text-pit-light min-h-screen">
         {/* Navigation */}
-        <nav className="border-b border-gray-800 bg-gray-950/95 backdrop-blur sticky top-0 z-50">
-          <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-6">
-            <Link href="/" className="flex items-center gap-2 group">
-              <span className="text-red-500 font-bold text-lg tracking-tighter group-hover:text-red-400 transition-colors">
+        <nav className="fixed top-0 left-0 right-0 z-50 bg-pit-black/80 backdrop-blur-xl border-b border-pit-border">
+          <div className="max-w-7xl mx-auto px-6 h-14 flex items-center gap-8">
+            <Link href="/" className="flex items-center gap-2.5 group">
+              <div className="w-7 h-7 bg-f1-red rounded-md flex items-center justify-center
+                              group-hover:shadow-glow-red transition-shadow duration-300">
+                <span className="text-white text-xs font-black">PW</span>
+              </div>
+              <span className="text-white font-bold text-sm tracking-tight hidden sm:inline">
                 PIT WALL
               </span>
             </Link>
-            <div className="flex gap-4 text-sm text-gray-400">
-              <Link href="/lobby" className="hover:text-gray-200 transition-colors">
-                Lobby
-              </Link>
-              <Link href="/strategy" className="hover:text-gray-200 transition-colors">
-                Strategy
-              </Link>
-              <Link href="/season" className="hover:text-gray-200 transition-colors">
-                Season
-              </Link>
+
+            <div className="flex items-center gap-1">
+              {[
+                { href: "/lobby", label: "Lobby" },
+                { href: "/strategy", label: "Strategy" },
+                { href: "/season", label: "Season" },
+              ].map((link) => (
+                <Link
+                  key={link.href}
+                  href={link.href}
+                  className="px-3 py-1.5 text-sm text-pit-text hover:text-white
+                             rounded-md hover:bg-white/5 transition-all duration-200"
+                >
+                  {link.label}
+                </Link>
+              ))}
             </div>
-            <div className="ml-auto text-xs text-gray-600">
-              v0.1.0
+
+            <div className="ml-auto flex items-center gap-3">
+              <span className="text-[11px] text-pit-muted font-mono">v0.1</span>
+              <div className="w-px h-4 bg-pit-border" />
+              <Link
+                href="/lobby"
+                className="text-xs font-semibold text-f1-red hover:text-f1-redHover transition-colors"
+              >
+                Race Now
+              </Link>
             </div>
           </div>
         </nav>
-        <main>{children}</main>
+
+        {/* Content with nav offset */}
+        <main className="pt-14">{children}</main>
       </body>
     </html>
   );

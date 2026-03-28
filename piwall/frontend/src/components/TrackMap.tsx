@@ -9,7 +9,6 @@ interface Props {
   safetyCar: boolean;
 }
 
-// Simplified SVG track outlines (oval approximation with characteristic shapes)
 const TRACK_PATHS: Record<string, string> = {
   bahrain:
     "M 150 40 C 250 40, 280 60, 280 100 L 280 200 C 280 220, 270 240, 250 250 L 200 270 C 180 280, 160 280, 140 270 L 80 230 C 60 220, 50 200, 50 180 L 50 100 C 50 60, 80 40, 150 40 Z",
@@ -29,101 +28,99 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
   const activeCars = cars.filter((c) => !c.retired);
   const totalCars = activeCars.length || 1;
 
+  const trackColor = safetyCar ? "#eab308" : weather === "wet" ? "#1e40af" : "#2a2a2a";
+
   return (
-    <div className="bg-gray-900 border border-gray-700 rounded-lg p-3">
+    <div className="card p-4 relative overflow-hidden">
+      {/* Background glow for SC */}
+      {safetyCar && (
+        <div className="absolute inset-0 bg-gradient-radial from-yellow-500/5 to-transparent pointer-events-none" />
+      )}
+
       <svg viewBox="0 0 320 300" className="w-full h-auto">
+        {/* Track outline glow */}
+        <path
+          d={path}
+          fill="none"
+          stroke={trackColor}
+          strokeWidth={16}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          opacity={0.3}
+        />
         {/* Track surface */}
         <path
           d={path}
           fill="none"
-          stroke={safetyCar ? "#eab308" : weather === "wet" ? "#1e40af" : "#374151"}
-          strokeWidth={safetyCar ? 14 : 12}
+          stroke={trackColor}
+          strokeWidth={10}
           strokeLinecap="round"
           strokeLinejoin="round"
+          opacity={0.7}
         />
+        {/* Track center line */}
         <path
           d={path}
           fill="none"
-          stroke={weather === "wet" ? "#1e3a5f" : "#1f2937"}
-          strokeWidth={8}
+          stroke="#161616"
+          strokeWidth={6}
           strokeLinecap="round"
           strokeLinejoin="round"
         />
 
-        {/* Car dots positioned along the track */}
+        {/* Cars */}
         {activeCars.map((car, idx) => {
-          // Distribute cars along the track path proportionally to position
           const t = idx / totalCars;
-          // Simple parametric position on an ellipse approximation
           const angle = t * Math.PI * 2 - Math.PI / 2;
           const cx = 160 + 100 * Math.cos(angle);
           const cy = 150 + 100 * Math.sin(angle);
+          const carColor = getCarColor(idx);
+          const compColor = getCompoundColor(car.compound);
 
           return (
             <g key={car.car_id}>
+              {/* Glow */}
+              <circle cx={cx} cy={cy} r={14} fill={carColor} opacity={0.12} />
+              {/* Compound ring */}
+              <circle cx={cx} cy={cy} r={8} fill="none" stroke={compColor} strokeWidth={2} />
               {/* Car dot */}
-              <circle
-                cx={cx}
-                cy={cy}
-                r={8}
-                fill={getCarColor(idx)}
-                stroke={getCompoundColor(car.compound)}
-                strokeWidth={2.5}
-              />
-              {/* Car label */}
+              <circle cx={cx} cy={cy} r={6} fill={carColor} />
+              {/* Position */}
               <text
-                x={cx}
-                y={cy - 12}
-                textAnchor="middle"
-                fill="#d1d5db"
-                fontSize="8"
-                fontFamily="monospace"
-                fontWeight="bold"
-              >
-                {car.car_id}
-              </text>
-              {/* Position label */}
-              <text
-                x={cx}
-                y={cy + 3}
+                x={cx} y={cy + 2.5}
                 textAnchor="middle"
                 fill="#000"
                 fontSize="7"
-                fontFamily="monospace"
-                fontWeight="bold"
+                fontFamily="Inter, sans-serif"
+                fontWeight="800"
               >
                 {car.position}
+              </text>
+              {/* Label */}
+              <text
+                x={cx} y={cy - 14}
+                textAnchor="middle"
+                fill="#a0a0a0"
+                fontSize="7"
+                fontFamily="Inter, sans-serif"
+                fontWeight="600"
+              >
+                {car.car_id}
               </text>
             </g>
           );
         })}
 
-        {/* Safety car indicator */}
+        {/* SC badge */}
         {safetyCar && (
-          <text
-            x="160"
-            y="155"
-            textAnchor="middle"
-            fill="#eab308"
-            fontSize="16"
-            fontFamily="monospace"
-            fontWeight="bold"
-          >
-            SAFETY CAR
-          </text>
+          <g>
+            <rect x="115" y="138" width="90" height="24" rx="4" fill="#eab308" opacity={0.15} />
+            <text x="160" y="155" textAnchor="middle" fill="#eab308"
+                  fontSize="11" fontFamily="Inter, sans-serif" fontWeight="800" letterSpacing="0.1em">
+              SAFETY CAR
+            </text>
+          </g>
         )}
-
-        {/* Weather badge */}
-        <text
-          x="160"
-          y="290"
-          textAnchor="middle"
-          fill={weather === "dry" ? "#6b7280" : "#60a5fa"}
-          fontSize="10"
-          fontFamily="monospace"
-        >
-          {weather.toUpperCase()}
-        </text>
       </svg>
     </div>
   );

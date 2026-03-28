@@ -2,33 +2,113 @@
 @tailwind components;
 @tailwind utilities;
 
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
 :root {
-  --background: #030712;
-  --foreground: #f3f4f6;
+  --background: #0a0a0a;
+  --foreground: #e0e0e0;
 }
 
 body {
   background-color: var(--background);
   color: var(--foreground);
+  font-family: 'Inter', 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Scrollbar styling for dark theme */
+/* Scrollbar */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 ::-webkit-scrollbar-track {
-  background: #111827;
+  background: #111111;
 }
 ::-webkit-scrollbar-thumb {
-  background: #374151;
-  border-radius: 3px;
+  background: #2a2a2a;
+  border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #4b5563;
+  background: #3a3a3a;
 }
 
-/* Selection color */
 ::selection {
-  background: rgba(239, 68, 68, 0.3);
+  background: rgba(225, 6, 0, 0.25);
+  color: #fff;
+}
+
+/* Utility classes */
+@layer components {
+  .card {
+    @apply bg-pit-card border border-pit-border rounded-card;
+  }
+
+  .card-hover {
+    @apply card transition-all duration-300 hover:border-pit-muted hover:shadow-card-hover hover:-translate-y-0.5;
+  }
+
+  .btn-primary {
+    @apply px-5 py-2.5 bg-f1-red hover:bg-f1-redHover text-white font-semibold text-sm
+           rounded-lg transition-all duration-200 hover:shadow-glow-red active:scale-[0.97];
+  }
+
+  .btn-secondary {
+    @apply px-5 py-2.5 bg-pit-surface hover:bg-pit-muted text-pit-light font-medium text-sm
+           rounded-lg border border-pit-border transition-all duration-200;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold;
+  }
+
+  .input {
+    @apply w-full bg-pit-dark border border-pit-border rounded-lg px-4 py-2.5
+           text-sm text-pit-light placeholder-pit-muted
+           focus:border-f1-red/50 focus:outline-none focus:ring-1 focus:ring-f1-red/20
+           transition-colors duration-200;
+  }
+
+  .section-label {
+    @apply text-[11px] font-bold uppercase tracking-[0.15em] text-pit-muted;
+  }
+
+  .stat-value {
+    @apply text-2xl font-bold text-white tracking-tight;
+  }
+
+  .divider {
+    @apply border-t border-pit-border;
+  }
+}
+
+/* Grid background pattern */
+.bg-grid {
+  background-image: linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* Gradient overlays */
+.gradient-fade-b {
+  background: linear-gradient(to bottom, transparent, #0a0a0a);
+}
+
+.gradient-fade-t {
+  background: linear-gradient(to top, transparent, rgba(10,10,10,0.8));
+}
+
+/* Red accent line */
+.accent-line {
+  background: linear-gradient(90deg, #e10600, transparent);
+  height: 2px;
+}
+
+/* Compound dot */
+.compound-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+  flex-shrink: 0;
 }

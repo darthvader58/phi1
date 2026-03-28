@@ -55,51 +55,54 @@ export default function LobbyPage() {
   }
 
   return (
-    <div className="max-w-6xl mx-auto px-4 py-8">
-      <h1 className="text-2xl font-bold mb-6 text-gray-200">Race Lobby</h1>
+    <div className="max-w-6xl mx-auto px-4 py-10">
+      {/* Page header */}
+      <div className="mb-8">
+        <h1 className="text-3xl font-extrabold text-white tracking-tight">Race Lobby</h1>
+        <p className="text-sm text-pit-text mt-1">Join or create a race session</p>
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Left: Registration + Create Race */}
-        <div className="lg:col-span-2 space-y-4">
+        {/* Left column */}
+        <div className="lg:col-span-2 space-y-5">
           {!registered ? (
-            <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
-              <h2 className="text-sm font-bold text-gray-300 mb-3">REGISTER</h2>
-              <form onSubmit={handleRegister} className="flex gap-2">
+            <div className="card p-6">
+              <div className="flex items-center gap-2 mb-4">
+                <div className="accent-line" />
+                <span className="section-label">Register</span>
+              </div>
+              <form onSubmit={handleRegister} className="flex gap-3">
                 <input
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="Choose a username"
-                  className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2
-                             text-sm text-gray-200 placeholder-gray-600 focus:border-red-500
-                             focus:outline-none"
+                  className="input flex-1"
                   required
                 />
-                <button
-                  type="submit"
-                  className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white rounded
-                             text-sm font-bold transition-colors"
-                >
+                <button type="submit" className="btn-primary">
                   Register
                 </button>
               </form>
-              {error && <p className="text-red-400 text-xs mt-2">{error}</p>}
+              {error && <p className="text-f1-red text-xs mt-3">{error}</p>}
             </div>
           ) : (
-            <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-sm font-bold text-gray-300">CREATE RACE</h2>
-                <span className="text-xs text-gray-500">
-                  Logged in as <span className="text-gray-300">{username}</span>
+            <div className="card p-6">
+              <div className="flex items-center justify-between mb-5">
+                <div className="flex items-center gap-2">
+                  <div className="accent-line" />
+                  <span className="section-label">Create Race</span>
+                </div>
+                <span className="text-[11px] text-pit-muted font-mono">
+                  Logged in as <span className="text-white font-semibold">{username}</span>
                 </span>
               </div>
-              <div className="flex gap-3 items-end">
+              <div className="flex gap-4 items-end flex-wrap">
                 <div>
-                  <label className="text-xs text-gray-500 block mb-1">Track</label>
+                  <label className="text-[10px] text-pit-muted uppercase tracking-wider block mb-1.5">Track</label>
                   <select
                     value={track}
                     onChange={(e) => setTrack(e.target.value)}
-                    className="bg-gray-800 border border-gray-700 rounded px-3 py-2
-                               text-sm text-gray-200 focus:border-red-500 focus:outline-none"
+                    className="input"
                   >
                     {["bahrain", "monaco", "monza", "spa", "silverstone", "suzuka"].map((t) => (
                       <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>
@@ -107,87 +110,98 @@ export default function LobbyPage() {
                   </select>
                 </div>
                 <div>
-                  <label className="text-xs text-gray-500 block mb-1">Speed</label>
+                  <label className="text-[10px] text-pit-muted uppercase tracking-wider block mb-1.5">Speed</label>
                   <select
                     value={speed}
                     onChange={(e) => setSpeed(Number(e.target.value))}
-                    className="bg-gray-800 border border-gray-700 rounded px-3 py-2
-                               text-sm text-gray-200 focus:border-red-500 focus:outline-none"
+                    className="input"
                   >
                     <option value={1}>1x (Real-time)</option>
                     <option value={5}>5x</option>
                     <option value={20}>20x (Fast)</option>
                   </select>
                 </div>
-                <button
-                  onClick={handleCreateRace}
-                  className="px-5 py-2 bg-red-700 hover:bg-red-600 text-white rounded
-                             text-sm font-bold transition-colors"
-                >
+                <button onClick={handleCreateRace} className="btn-primary">
                   Create Race
                 </button>
               </div>
-              {error && <p className="text-red-400 text-xs mt-2">{error}</p>}
+              {error && <p className="text-f1-red text-xs mt-3">{error}</p>}
             </div>
           )}
 
           {/* Active races */}
-          <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
-            <h2 className="text-sm font-bold text-gray-300 mb-3">ACTIVE RACES</h2>
-            {races.length === 0 ? (
-              <p className="text-gray-600 text-sm">No active races. Create one above!</p>
+          <div className="card overflow-hidden">
+            <div className="px-5 py-3.5 border-b border-pit-border flex items-center justify-between">
+              <span className="section-label">Active Races</span>
+              <span className="text-[10px] text-pit-muted font-mono">{races.length} sessions</span>
+            </div>
+            <div className="p-3">
+              {races.length === 0 ? (
+                <p className="text-pit-muted text-sm text-center py-8">No active races. Create one above!</p>
+              ) : (
+                <div className="space-y-1.5">
+                  {races.map((race) => (
+                    <Link
+                      key={race.race_id}
+                      href={`/race/${race.race_id}`}
+                      className="flex items-center justify-between rounded-lg px-4 py-3
+                                 hover:bg-white/[0.03] transition-colors duration-150"
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="w-1 h-8 rounded-full bg-f1-red/60" />
+                        <div>
+                          <span className="text-white font-bold text-sm">
+                            {race.track.charAt(0).toUpperCase() + race.track.slice(1)}
+                          </span>
+                          <span className="text-pit-muted text-xs ml-2 font-mono">
+                            {race.player_count}/8
+                          </span>
+                        </div>
+                      </div>
+                      <span className={`badge text-[10px] font-bold ${
+                        race.status === "lobby" ? "bg-green-500/10 text-green-400" :
+                        race.status === "running" ? "bg-yellow-500/10 text-yellow-400" :
+                        "bg-pit-surface text-pit-muted"
+                      }`}>
+                        {race.status.toUpperCase()}
+                      </span>
+                    </Link>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Right: ELO Leaderboard */}
+        <div className="card overflow-hidden">
+          <div className="px-5 py-3.5 border-b border-pit-border flex items-center justify-between">
+            <span className="section-label">ELO Leaderboard</span>
+            <span className="text-[10px] text-pit-muted font-mono">Top 20</span>
+          </div>
+          <div className="p-3">
+            {leaderboard.length === 0 ? (
+              <p className="text-pit-muted text-sm text-center py-8">No players yet.</p>
             ) : (
-              <div className="space-y-2">
-                {races.map((race) => (
-                  <Link
-                    key={race.race_id}
-                    href={`/race/${race.race_id}`}
-                    className="flex items-center justify-between bg-gray-800/50 rounded p-3
-                               hover:bg-gray-800 transition-colors"
-                  >
-                    <div>
-                      <span className="text-gray-200 font-bold text-sm">
-                        {race.track.charAt(0).toUpperCase() + race.track.slice(1)}
-                      </span>
-                      <span className="text-gray-500 text-xs ml-2">
-                        {race.player_count}/8 players
-                      </span>
-                    </div>
-                    <span className={`text-xs font-bold px-2 py-0.5 rounded ${
-                      race.status === "lobby" ? "bg-green-900 text-green-400" :
-                      race.status === "running" ? "bg-yellow-900 text-yellow-400" :
-                      "bg-gray-800 text-gray-500"
+              <div className="space-y-0.5">
+                {leaderboard.slice(0, 20).map((p, idx) => (
+                  <div key={p.username}
+                       className="flex items-center gap-2 text-xs px-2 py-2 rounded-md hover:bg-white/[0.02] transition-colors">
+                    <span className={`w-6 text-right font-extrabold tabular-nums ${
+                      idx === 0 ? "text-f1-red" : idx < 3 ? "text-white" : "text-pit-muted"
                     }`}>
-                      {race.status.toUpperCase()}
+                      {idx + 1}
                     </span>
-                  </Link>
+                    <span className="flex-1 text-white font-semibold truncate">{p.username}</span>
+                    <span className="text-pit-muted text-[10px]">{p.team}</span>
+                    <span className="w-14 text-right font-bold text-white tabular-nums font-mono">
+                      {p.elo}
+                    </span>
+                  </div>
                 ))}
               </div>
             )}
           </div>
-        </div>
-
-        {/* Right: Leaderboard */}
-        <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
-          <h2 className="text-sm font-bold text-gray-300 mb-3">ELO LEADERBOARD</h2>
-          {leaderboard.length === 0 ? (
-            <p className="text-gray-600 text-sm">No players yet.</p>
-          ) : (
-            <div className="space-y-1">
-              {leaderboard.slice(0, 20).map((p, idx) => (
-                <div key={p.username} className="flex items-center gap-2 text-xs">
-                  <span className="w-6 text-right text-gray-600 font-bold">
-                    #{idx + 1}
-                  </span>
-                  <span className="flex-1 text-gray-300 truncate">{p.username}</span>
-                  <span className="text-gray-500">{p.team}</span>
-                  <span className="w-14 text-right font-bold text-gray-200">
-                    {p.elo}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
       </div>
     </div>

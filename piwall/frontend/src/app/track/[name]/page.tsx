@@ -17,63 +17,75 @@ export default function TrackPage() {
 
   if (error) {
     return (
-      <div className="max-w-3xl mx-auto px-4 py-8">
-        <p className="text-red-400">Error: {error}</p>
+      <div className="max-w-3xl mx-auto px-4 py-10">
+        <p className="text-f1-red text-sm">Error: {error}</p>
       </div>
     );
   }
 
   if (!track) {
     return (
-      <div className="max-w-3xl mx-auto px-4 py-8">
-        <p className="text-gray-500">Loading track data...</p>
+      <div className="max-w-3xl mx-auto px-4 py-10">
+        <div className="text-pit-muted text-sm animate-pulse-slow">Loading track data...</div>
       </div>
     );
   }
 
-  return (
-    <div className="max-w-4xl mx-auto px-4 py-8">
-      <h1 className="text-2xl font-bold mb-1 text-gray-200">{track.display_name}</h1>
-      <p className="text-sm text-gray-500 mb-6">{track.country}</p>
+  const stats = [
+    ["Total Laps", track.total_laps],
+    ["Pit Loss", `${track.pit_loss_seconds}s`],
+    ["DRS Zones", track.drs_zones],
+    ["Overtake Difficulty", `${(track.overtake_difficulty * 100).toFixed(0)}%`],
+    ["SC Prob (dry)", `${(track.safety_car_prob_dry * 100).toFixed(0)}%/lap`],
+    ["SC Prob (wet)", `${(track.safety_car_prob_wet * 100).toFixed(0)}%/lap`],
+  ];
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-        {/* Track stats */}
-        <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
-          <h2 className="text-sm font-bold text-gray-300 mb-3">CIRCUIT DATA</h2>
-          <div className="space-y-2 text-sm">
-            {[
-              ["Total Laps", track.total_laps],
-              ["Pit Loss", `${track.pit_loss_seconds}s`],
-              ["DRS Zones", track.drs_zones],
-              ["Overtake Difficulty", `${(track.overtake_difficulty * 100).toFixed(0)}%`],
-              ["SC Prob (dry)", `${(track.safety_car_prob_dry * 100).toFixed(0)}%/lap`],
-              ["SC Prob (wet)", `${(track.safety_car_prob_wet * 100).toFixed(0)}%/lap`],
-            ].map(([label, value]) => (
-              <div key={label as string} className="flex justify-between">
-                <span className="text-gray-500">{label}</span>
-                <span className="text-gray-200 font-bold">{value}</span>
+  return (
+    <div className="max-w-4xl mx-auto px-4 py-10">
+      <div className="mb-8">
+        <div className="flex items-center gap-3 mb-1">
+          <div className="w-1.5 h-8 rounded-full bg-f1-red" />
+          <h1 className="text-3xl font-extrabold text-white tracking-tight">{track.display_name}</h1>
+        </div>
+        <p className="text-sm text-pit-text ml-5">{track.country}</p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mb-6">
+        {/* Circuit data */}
+        <div className="card overflow-hidden">
+          <div className="px-5 py-3.5 border-b border-pit-border">
+            <span className="section-label">Circuit Data</span>
+          </div>
+          <div className="p-5 space-y-0">
+            {stats.map(([label, value]) => (
+              <div key={label as string}
+                   className="flex justify-between items-center py-2.5 border-b border-pit-border/30 last:border-0">
+                <span className="text-pit-text text-sm">{label}</span>
+                <span className="stat-value text-base">{value}</span>
               </div>
             ))}
           </div>
         </div>
 
         {/* Typical stints */}
-        <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
-          <h2 className="text-sm font-bold text-gray-300 mb-3">TYPICAL STINT LENGTH</h2>
-          <div className="space-y-3">
+        <div className="card overflow-hidden">
+          <div className="px-5 py-3.5 border-b border-pit-border">
+            <span className="section-label">Typical Stint Length</span>
+          </div>
+          <div className="p-5 space-y-4">
             {Object.entries(track.typical_stint || {}).map(([compound, laps]) => {
               const color = COMPOUND_COLORS[compound] || "#888";
               const maxLaps = track.total_laps;
               const pct = ((laps as number) / maxLaps) * 100;
               return (
                 <div key={compound}>
-                  <div className="flex justify-between text-sm mb-1">
-                    <span style={{ color }} className="font-bold">{compound}</span>
-                    <span className="text-gray-400">{laps as number} laps</span>
+                  <div className="flex justify-between text-sm mb-2">
+                    <span style={{ color }} className="font-bold text-xs uppercase tracking-wider">{compound}</span>
+                    <span className="text-pit-text font-mono text-xs tabular-nums">{laps as number} laps</span>
                   </div>
-                  <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
+                  <div className="h-2 bg-pit-surface rounded-full overflow-hidden">
                     <div
-                      className="h-full rounded-full"
+                      className="h-full rounded-full transition-all duration-500"
                       style={{ width: `${pct}%`, backgroundColor: color }}
                     />
                   </div>
@@ -84,10 +96,13 @@ export default function TrackPage() {
         </div>
       </div>
 
-      {/* Strategy hints */}
-      <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
-        <h2 className="text-sm font-bold text-gray-300 mb-3">STRATEGY NOTES</h2>
-        <div className="text-sm text-gray-400 space-y-2">
+      {/* Strategy notes */}
+      <div className="card overflow-hidden">
+        <div className="px-5 py-3.5 border-b border-pit-border flex items-center gap-2">
+          <div className="accent-line" />
+          <span className="section-label">Strategy Notes</span>
+        </div>
+        <div className="p-5 text-sm text-pit-text space-y-3 leading-relaxed">
           {track.overtake_difficulty > 0.7 && (
             <p>
               High overtake difficulty — track position is crucial. Undercuts are
@@ -107,7 +122,7 @@ export default function TrackPage() {
             </p>
           )}
           <p>
-            Pit loss of {track.pit_loss_seconds}s means you need{" "}
+            Pit loss of <span className="text-white font-bold">{track.pit_loss_seconds}s</span> means you need{" "}
             {track.pit_loss_seconds > 23 ? "significant" : "moderate"} tyre
             degradation benefit to justify an extra stop.
           </p>
