@@ -66,7 +66,72 @@ export interface PlayerInfo {
   elo: number;
   team: string;
   created_at: string;
+  stats: {
+    total_races: number;
+    wins: number;
+    podiums: number;
+    dnfs: number;
+    win_rate: number;
+  };
+  elo_history: EloEntry[];
+  recent_races: RaceResultEntry[];
   bot_history: { code_hash: string; submitted_at: string }[];
+}
+
+export interface EloEntry {
+  race_id: string;
+  elo_before: number;
+  elo_after: number;
+  delta: number;
+}
+
+export interface RaceResultEntry {
+  race_id: string;
+  track: string;
+  race_type: string;
+  position: number;
+  points: number;
+  pit_count: number;
+  compounds_used: string[];
+  retired: boolean;
+  finished_at: string | null;
+}
+
+export interface SeasonInfo {
+  id: string;
+  name: string;
+  tracks: string[];
+  active: boolean;
+  start_date: string | null;
+  end_date: string | null;
+  race_count: number;
+}
+
+export interface SeasonStanding {
+  player_id: string;
+  username: string;
+  team: string;
+  elo: number;
+  total_points: number;
+  races: number;
+  wins: number;
+  podiums: number;
+  best_finish: number;
+  per_race: { race_id: string; position: number; points: number; retired: boolean }[];
+}
+
+export interface ActiveSeasonData {
+  active: boolean;
+  season: {
+    id: string;
+    name: string;
+    tracks: string[];
+    start_date: string | null;
+    races: { id: string; track: string; status: string; finished_at: string | null }[];
+    standings: SeasonStanding[];
+    next_track: string | null;
+    completed_tracks: string[];
+  } | null;
 }
 
 export interface WsMessage {

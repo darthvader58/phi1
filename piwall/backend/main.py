@@ -133,6 +133,10 @@ class TestBotRequest(BaseModel):
     track: str = "bahrain"
     laps: int = 20
 
+class CreateSeasonRequest(BaseModel):
+    name: str
+    tracks: List[str] = ["bahrain", "monaco", "monza", "spa", "silverstone", "suzuka"]
+
 
 # ─── Endpoints ───────────────────────────────────────────────────────
 
@@ -162,11 +166,20 @@ def create_race(req: CreateRaceRequest, x_api_key: str = Header()):
 
     db = SessionLocal()
     try:
-        race = crud.create_race(db, req.track, req.race_type)
+        # Auto-assign season races to the active season
+        season_id = None
+        if req.race_type == "season":
+            active_season = crud.get_active_season(db)
+            if not active_season:
+                raise HTTPException(400, "No active season. Create a season first.")
+            season_id = active_season.id
+
+        race = crud.create_race(db, req.track, req.race_type, season_id=season_id)
         lobby = RaceLobby(race.id, req.track, req.race_type)
         lobby.speed = req.speed
         active_lobbies[race.id] = lobby
-        return {"race_id": race.id, "track": req.track, "status": "lobby"}
+        return {"race_id": race.id, "track": req.track, "status": "lobby",
+                "race_type": req.race_type, "season_id": season_id}
     finally:
         db.close()
 
@@ -321,11 +334,37 @@ def get_player(username: str):
         if not player:
             raise HTTPException(404, "Player not found")
         submissions = crud.get_player_submissions(db, player.id, limit=10)
+        elo_history = crud.get_elo_history(db, player.id)
+        race_results = crud.get_player_race_results(db, player.id, limit=20)
+
+        # Compute stats
+        total_races = len(race_results)
+        wins = sum(1 for r in race_results if r["position"] == 1 and not r["retired"])
+        podiums = sum(1 for r in race_results if r["position"] <= 3 and not r["retired"])
+        dnfs = sum(1 for r in race_results if r["retired"])
+
         return {
             "username": player.username,
             "elo": round(player.elo, 1),
             "team": player.team_name,
             "created_at": player.created_at.isoformat() if player.created_at else None,
+            "stats": {
+                "total_races": total_races,
+                "wins": wins,
+                "podiums": podiums,
+                "dnfs": dnfs,
+                "win_rate": round(wins / total_races * 100, 1) if total_races > 0 else 0,
+            },
+            "elo_history": [
+                {
+                    "race_id": h.race_id,
+                    "elo_before": round(h.elo_before, 1),
+                    "elo_after": round(h.elo_after, 1),
+                    "delta": round(h.delta, 1),
+                }
+                for h in elo_history
+            ],
+            "recent_races": race_results,
             "bot_history": [
                 {"code_hash": s.code_hash, "submitted_at": s.submitted_at.isoformat()}
                 for s in submissions
@@ -430,6 +469,212 @@ def test_bot(req: TestBotRequest, x_api_key: str = Header()):
 @app.get("/api/strategy/template")
 def get_strategy_template():
     return {"template": STRATEGY_TEMPLATE}
+
+
+# ─── Season endpoints ───────────────────────────────────────────────
+
+@app.post("/api/season")
+def create_season(req: CreateSeasonRequest, x_api_key: str = Header()):
+    authenticate(x_api_key)
+    for t in req.tracks:
+        if t not in TRACKS:
+            raise HTTPException(400, f"Unknown track: {t}")
+    db = SessionLocal()
+    try:
+        # Deactivate any existing active season
+        active = crud.get_active_season(db)
+        if active:
+            crud.end_season(db, active.id)
+        season = crud.create_season(db, req.name, req.tracks)
+        return {
+            "id": season.id,
+            "name": season.name,
+            "tracks": season.track_rotation,
+            "active": season.active,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/seasons")
+def list_seasons():
+    db = SessionLocal()
+    try:
+        seasons = crud.get_all_seasons(db)
+        return [
+            {
+                "id": s.id,
+                "name": s.name,
+                "tracks": s.track_rotation,
+                "active": s.active,
+                "start_date": s.start_date.isoformat() if s.start_date else None,
+                "end_date": s.end_date.isoformat() if s.end_date else None,
+                "race_count": len(s.races),
+            }
+            for s in seasons
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/api/season/active")
+def get_active_season():
+    db = SessionLocal()
+    try:
+        season = crud.get_active_season(db)
+        if not season:
+            return {"active": False, "season": None}
+        races = crud.get_season_races(db, season.id)
+        standings = crud.get_season_standings(db, season.id)
+        return {
+            "active": True,
+            "season": {
+                "id": season.id,
+                "name": season.name,
+                "tracks": season.track_rotation,
+                "start_date": season.start_date.isoformat() if season.start_date else None,
+                "races": [
+                    {
+                        "id": r.id,
+                        "track": r.track,
+                        "status": r.status,
+                        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+                    }
+                    for r in races
+                ],
+                "standings": standings,
+                "next_track": _get_next_track(season.track_rotation, races),
+                "completed_tracks": [r.track for r in races if r.status == "finished"],
+            },
+        }
+    finally:
+        db.close()
+
+
+def _get_next_track(track_rotation: list, races: list) -> Optional[str]:
+    """Determine the next track in the season rotation."""
+    completed = [r.track for r in races if r.status == "finished"]
+    for track in track_rotation:
+        if track not in completed:
+            return track
+    return None
+
+
+@app.get("/api/season/{season_id}/standings")
+def get_season_standings(season_id: str):
+    db = SessionLocal()
+    try:
+        season = crud.get_season(db, season_id)
+        if not season:
+            raise HTTPException(404, "Season not found")
+        standings = crud.get_season_standings(db, season_id)
+        races = crud.get_season_races(db, season_id)
+        return {
+            "season_id": season_id,
+            "name": season.name,
+            "standings": standings,
+            "races_completed": len([r for r in races if r.status == "finished"]),
+            "races_total": len(season.track_rotation or []),
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/season/{season_id}/end")
+def end_season(season_id: str, x_api_key: str = Header()):
+    authenticate(x_api_key)
+    db = SessionLocal()
+    try:
+        season = crud.end_season(db, season_id)
+        if not season:
+            raise HTTPException(404, "Season not found")
+        return {"status": "ended", "id": season.id, "name": season.name}
+    finally:
+        db.close()
+
+
+# ─── Player profile + ELO history ───────────────────────────────────
+
+@app.get("/api/player/{username}/elo-history")
+def get_elo_history(username: str):
+    db = SessionLocal()
+    try:
+        player = crud.get_player_by_username(db, username)
+        if not player:
+            raise HTTPException(404, "Player not found")
+        history = crud.get_elo_history(db, player.id)
+        return {
+            "username": player.username,
+            "current_elo": round(player.elo, 1),
+            "history": [
+                {
+                    "race_id": h.race_id,
+                    "elo_before": round(h.elo_before, 1),
+                    "elo_after": round(h.elo_after, 1),
+                    "delta": round(h.delta, 1),
+                }
+                for h in history
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/player/{username}/races")
+def get_player_races(username: str):
+    db = SessionLocal()
+    try:
+        player = crud.get_player_by_username(db, username)
+        if not player:
+            raise HTTPException(404, "Player not found")
+        results = crud.get_player_race_results(db, player.id)
+        return {
+            "username": player.username,
+            "races": results,
+        }
+    finally:
+        db.close()
+
+
+# ─── Matchmaking ────────────────────────────────────────────────────
+
+@app.get("/api/matchmaking/suggest")
+def suggest_match(x_api_key: str = Header()):
+    """Suggest a race lobby with players closest in ELO to the requester."""
+    player = authenticate(x_api_key)
+
+    # Find active lobbies with players within ELO range
+    suggestions = []
+    for rid, lobby in active_lobbies.items():
+        if lobby.status != "lobby":
+            continue
+        if len(lobby.players) >= 8:
+            continue
+
+        # Calculate average ELO of players in lobby
+        db = SessionLocal()
+        try:
+            elos = []
+            for pid in lobby.players:
+                p = db.query(crud.Player).filter(crud.Player.id == pid).first()
+                if p:
+                    elos.append(p.elo)
+            avg_elo = sum(elos) / len(elos) if elos else 1200.0
+            elo_diff = abs(player["elo"] - avg_elo)
+            suggestions.append({
+                "race_id": rid,
+                "track": lobby.track,
+                "race_type": lobby.race_type,
+                "player_count": len(lobby.players),
+                "avg_elo": round(avg_elo, 0),
+                "elo_diff": round(elo_diff, 0),
+            })
+        finally:
+            db.close()
+
+    # Sort by ELO proximity
+    suggestions.sort(key=lambda x: x["elo_diff"])
+    return {"suggestions": suggestions[:5]}
 
 
 # ─── WebSocket ───────────────────────────────────────────────────────

@@ -24,16 +24,18 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
 }
 
 export const api = {
+  // Auth
   register: (username: string, teamName = "Independent") =>
     apiFetch("/api/register", {
       method: "POST",
       body: JSON.stringify({ username, team_name: teamName }),
     }),
 
-  createRace: (track: string, speed = 5) =>
+  // Races
+  createRace: (track: string, speed = 5, raceType = "quick") =>
     apiFetch("/api/race/create", {
       method: "POST",
-      body: JSON.stringify({ track, speed }),
+      body: JSON.stringify({ track, speed, race_type: raceType }),
     }),
 
   joinRace: (raceId: string, compound = "MEDIUM") =>
@@ -53,15 +55,40 @@ export const api = {
 
   getRace: (raceId: string) => apiFetch(`/api/race/${raceId}`),
   listRaces: () => apiFetch("/api/races"),
+
+  // Leaderboard
   getLeaderboard: () => apiFetch("/api/leaderboard"),
+
+  // Player
   getPlayer: (username: string) => apiFetch(`/api/player/${username}`),
+  getPlayerEloHistory: (username: string) => apiFetch(`/api/player/${username}/elo-history`),
+  getPlayerRaces: (username: string) => apiFetch(`/api/player/${username}/races`),
+
+  // Tracks
   getTrack: (name: string) => apiFetch(`/api/track/${name}`),
   listTracks: () => apiFetch("/api/tracks"),
-  getTemplate: () => apiFetch("/api/strategy/template"),
 
+  // Strategy
+  getTemplate: () => apiFetch("/api/strategy/template"),
   testBot: (code: string, track = "bahrain", laps = 20) =>
     apiFetch("/api/test-bot", {
       method: "POST",
       body: JSON.stringify({ code, track, laps }),
     }),
+
+  // Seasons
+  createSeason: (name: string, tracks: string[]) =>
+    apiFetch("/api/season", {
+      method: "POST",
+      body: JSON.stringify({ name, tracks }),
+    }),
+
+  listSeasons: () => apiFetch("/api/seasons"),
+  getActiveSeason: () => apiFetch("/api/season/active"),
+  getSeasonStandings: (seasonId: string) => apiFetch(`/api/season/${seasonId}/standings`),
+  endSeason: (seasonId: string) =>
+    apiFetch(`/api/season/${seasonId}/end`, { method: "POST" }),
+
+  // Matchmaking
+  getSuggestedMatches: () => apiFetch("/api/matchmaking/suggest"),
 };

@@ -154,6 +154,33 @@ def get_active_season(db: Session) -> Optional[Season]:
     return db.query(Season).filter(Season.active == True).first()
 
 
+def get_all_seasons(db: Session) -> List[Season]:
+    return db.query(Season).order_by(Season.start_date.desc()).all()
+
+
+def get_season(db: Session, season_id: str) -> Optional[Season]:
+    return db.query(Season).filter(Season.id == season_id).first()
+
+
+def end_season(db: Session, season_id: str) -> Optional[Season]:
+    season = get_season(db, season_id)
+    if season:
+        season.active = False
+        season.end_date = datetime.datetime.utcnow()
+        db.commit()
+        db.refresh(season)
+    return season
+
+
+def get_season_races(db: Session, season_id: str) -> List[Race]:
+    return (
+        db.query(Race)
+        .filter(Race.season_id == season_id)
+        .order_by(Race.created_at.asc())
+        .all()
+    )
+
+
 def get_season_standings(db: Session, season_id: str) -> List[dict]:
     """Get championship standings for a season."""
     races = db.query(Race).filter(Race.season_id == season_id, Race.status == "finished").all()
@@ -172,13 +199,65 @@ def get_season_standings(db: Session, season_id: str) -> List[dict]:
                 "player_id": r.player_id,
                 "username": player.username if player else r.car_id,
                 "team": player.team_name if player else "Unknown",
+                "elo": player.elo if player else 1200.0,
                 "total_points": 0,
                 "races": 0,
                 "wins": 0,
+                "podiums": 0,
+                "best_finish": 99,
+                "per_race": [],
             }
         standings[r.player_id]["total_points"] += r.points
         standings[r.player_id]["races"] += 1
         if r.position == 1 and not r.retired:
             standings[r.player_id]["wins"] += 1
+        if r.position <= 3 and not r.retired:
+            standings[r.player_id]["podiums"] += 1
+        if r.position < standings[r.player_id]["best_finish"]:
+            standings[r.player_id]["best_finish"] = r.position
+        standings[r.player_id]["per_race"].append({
+            "race_id": r.race_id,
+            "position": r.position,
+            "points": r.points,
+            "retired": r.retired,
+        })
 
     return sorted(standings.values(), key=lambda x: -x["total_points"])
+
+
+# ─── ELO History ─────────────────────────────────────────────────────
+
+def get_elo_history(db: Session, player_id: str, limit: int = 100) -> List[EloHistory]:
+    return (
+        db.query(EloHistory)
+        .filter(EloHistory.player_id == player_id)
+        .order_by(EloHistory.id.asc())
+        .limit(limit)
+        .all()
+    )
+
+
+def get_player_race_results(db: Session, player_id: str, limit: int = 50) -> List[dict]:
+    """Get a player's recent race results with track info."""
+    results = (
+        db.query(RaceResultRow, Race)
+        .join(Race, RaceResultRow.race_id == Race.id)
+        .filter(RaceResultRow.player_id == player_id)
+        .order_by(Race.finished_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "race_id": r.race_id,
+            "track": race.track,
+            "race_type": race.race_type,
+            "position": r.position,
+            "points": r.points,
+            "pit_count": len(r.pit_laps) if r.pit_laps else 0,
+            "compounds_used": r.compounds_used or [],
+            "retired": r.retired,
+            "finished_at": race.finished_at.isoformat() if race.finished_at else None,
+        }
+        for r, race in results
+    ]
