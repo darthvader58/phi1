@@ -23,6 +23,16 @@ export interface RivalBelief {
   estimated_compound: string;
   pit_probability_next_5_laps: number;
   confidence: number;
+  estimated_deg_rate: number;
+  undercut_viable: boolean;
+  undercut_gain: number;
+  optimal_pit_in: number;
+  // Compact WebSocket format aliases
+  age?: number;
+  compound?: string;
+  pit_prob?: number;
+  undercut?: boolean;
+  uc_gain?: number;
 }
 
 export interface LapSnapshot {

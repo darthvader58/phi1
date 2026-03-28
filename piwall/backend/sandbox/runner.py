@@ -224,12 +224,31 @@ def my_strategy(state, my_car):
             .compound (str), .tyre_age (int), .fuel_kg (float),
             .pit_count (int), .pit_laps (list), .last_lap_time (float),
             .total_time (float), .retired (bool), .drs_available (bool),
-            .compounds_used (list), .beliefs (dict)
+            .compounds_used (list),
+            .beliefs (dict of rival_id -> belief):
+                .estimated_tyre_age (float) - Bayesian estimate of rival tyre laps
+                .estimated_compound (str) - Inferred compound from deg rate
+                .pit_probability_next_5_laps (float) - Logistic pit probability
+                .confidence (float) - Belief certainty (0-1)
+                .estimated_deg_rate (float) - Learned deg rate (s/lap)
+                .undercut_viable (bool) - Is undercut feasible?
+                .undercut_gain (float) - Estimated time gain from undercut
+                .optimal_pit_in (int) - Est. laps until rival pits
 
     Returns:
         dict with keys: pit (bool), compound (str)
     """
     remaining = state.total_laps - state.lap
+
+    # Check for undercut opportunities using the belief system
+    for rival in state.cars:
+        if rival.car_id == my_car.car_id or rival.retired:
+            continue
+        belief = my_car.beliefs.get(rival.car_id, {})
+        if belief.get("undercut_viable") and belief.get("undercut_gain", 0) > 1.0:
+            if remaining > 10 and my_car.tyre_age > 8:
+                new_compound = "HARD" if remaining > 20 else "MEDIUM"
+                return {"pit": True, "compound": new_compound}
 
     # Example: pit when tyre age > 20 and enough laps remain
     if my_car.tyre_age > 20 and remaining > 5:

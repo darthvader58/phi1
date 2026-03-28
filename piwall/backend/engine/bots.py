@@ -3,13 +3,27 @@
 Five bot personalities that always fill the field:
 
 VEL-01: Greedy threshold — pits when tyre deg exceeds a fixed threshold
-NXS-07: Undercut hunter — monitors gap + rival tyre age for undercut timing
+NXS-07: Undercut hunter — uses belief system undercut detection
 WXP-23: Weather prophet — holds tyres for weather/SC windows
-EQL-44: Nash equilibrium — integrates full deg curve, pits when dEV > pit_delta
+EQL-44: Nash equilibrium — uses game theory optimal pit window
 AGR-33: Aggressive 2-stop — fixed pit windows regardless of conditions
 """
 
 from .race import RaceState, CarState, Decision
+
+
+def _pick_compound(remaining: int, current: str, pit_count: int) -> str:
+    """Helper to pick a compound based on remaining laps and compound rule."""
+    if remaining > 25:
+        new = "HARD"
+    elif remaining > 15:
+        new = "MEDIUM"
+    else:
+        new = "SOFT"
+    # Must use different compound on first stop
+    if pit_count == 0 and new == current:
+        new = "MEDIUM" if current != "MEDIUM" else "HARD"
+    return new
 
 
 def vel_01_strategy(state: RaceState, my_car: CarState) -> Decision:
@@ -25,17 +39,7 @@ def vel_01_strategy(state: RaceState, my_car: CarState) -> Decision:
     if estimated_deg > 2.2 and my_car.tyre_age >= 8:
         remaining = state.total_laps - state.lap
         if remaining > 5:
-            # Pick the compound that will last the remaining laps
-            if remaining > 25:
-                new_compound = "HARD"
-            elif remaining > 15:
-                new_compound = "MEDIUM"
-            else:
-                new_compound = "SOFT"
-            # Must use a different compound if this is the first stop
-            if my_car.pit_count == 0 and new_compound == my_car.compound:
-                new_compound = "MEDIUM" if my_car.compound != "MEDIUM" else "HARD"
-            return Decision(pit=True, compound=new_compound)
+            return Decision(pit=True, compound=_pick_compound(remaining, my_car.compound, my_car.pit_count))
 
     return Decision(pit=False, compound=my_car.compound)
 
@@ -43,42 +47,46 @@ def vel_01_strategy(state: RaceState, my_car: CarState) -> Decision:
 def nxs_07_strategy(state: RaceState, my_car: CarState) -> Decision:
     """NXS-07: Undercut hunter.
 
-    Monitors rivals ahead — if a rival has old tyres and the gap is small,
-    pits early to attempt the undercut.
+    Uses the belief system's undercut detection to find and exploit
+    undercut windows on rivals ahead. Falls back to belief-based
+    pit probability monitoring.
     """
     remaining = state.total_laps - state.lap
     if remaining <= 5 or my_car.tyre_age < 5:
         return Decision(pit=False, compound=my_car.compound)
 
-    # Look at rivals ahead
+    # Check for viable undercuts from belief data
+    best_undercut_gain = 0.0
+    has_undercut = False
     for rival in state.cars:
         if rival.car_id == my_car.car_id or rival.retired:
             continue
         if rival.position < my_car.position:
+            belief = my_car.beliefs.get(rival.car_id, {})
+
+            # Use the integrated undercut detection
+            undercut_viable = belief.get("undercut_viable", False)
+            undercut_gain = belief.get("undercut_gain", belief.get("uc_gain", 0))
+
+            if undercut_viable and undercut_gain > best_undercut_gain:
+                best_undercut_gain = undercut_gain
+                has_undercut = True
+
+            # Fallback: belief-based heuristic
+            rival_tyre_age = belief.get("estimated_tyre_age", belief.get("age", 0))
+            rival_pit_prob = belief.get("pit_probability_next_5_laps", belief.get("pit_prob", 0))
             gap = my_car.gap_to_leader - rival.gap_to_leader
-            # Check belief about rival tyre age
-            rival_belief = my_car.beliefs.get(rival.car_id, {})
-            rival_tyre_age = rival_belief.get("estimated_tyre_age", rival.tyre_age)
-            rival_pit_prob = rival_belief.get("pit_probability_next_5_laps", 0)
 
-            # Undercut opportunity: rival has old tyres and we're close
             if (gap < 5.0 and rival_tyre_age > 12 and
-                    my_car.tyre_age > 10 and rival_pit_prob > 0.3):
-                # Pit one lap before we think they will
-                if remaining > 10:
-                    new_compound = "HARD" if remaining > 20 else "MEDIUM"
-                else:
-                    new_compound = "SOFT"
-                if my_car.pit_count == 0 and new_compound == my_car.compound:
-                    new_compound = "MEDIUM" if my_car.compound != "MEDIUM" else "HARD"
-                return Decision(pit=True, compound=new_compound)
+                    my_car.tyre_age > 10 and rival_pit_prob > 0.4):
+                has_undercut = True
 
-    # Fallback: pit on general degradation
+    if has_undercut and remaining > 8:
+        return Decision(pit=True, compound=_pick_compound(remaining, my_car.compound, my_car.pit_count))
+
+    # Fallback: pit on heavy degradation
     if my_car.tyre_age > 25:
-        new_compound = "SOFT" if remaining <= 12 else "MEDIUM"
-        if my_car.pit_count == 0 and new_compound == my_car.compound:
-            new_compound = "HARD"
-        return Decision(pit=True, compound=new_compound)
+        return Decision(pit=True, compound=_pick_compound(remaining, my_car.compound, my_car.pit_count))
 
     return Decision(pit=False, compound=my_car.compound)
 
@@ -86,38 +94,39 @@ def nxs_07_strategy(state: RaceState, my_car: CarState) -> Decision:
 def wxp_23_strategy(state: RaceState, my_car: CarState) -> Decision:
     """WXP-23: Weather prophet.
 
-    Tries to capitalize on safety car periods and weather changes.
+    Capitalizes on safety car periods and weather changes.
     Delays pit stops to coincide with SC (free pit stop) or weather transitions.
+    Also monitors rival beliefs to avoid pitting into traffic.
     """
     remaining = state.total_laps - state.lap
 
-    # If safety car is out and we haven't pitted recently, pit now (cheap stop)
+    # Safety car: pit now for cheap stop
     if state.safety_car and my_car.tyre_age >= 8 and remaining > 5:
-        if remaining > 20:
-            new_compound = "HARD"
-        elif remaining > 12:
-            new_compound = "MEDIUM"
-        else:
-            new_compound = "SOFT"
-        if my_car.pit_count == 0 and new_compound == my_car.compound:
-            new_compound = "MEDIUM" if my_car.compound != "MEDIUM" else "HARD"
-        return Decision(pit=True, compound=new_compound)
+        return Decision(pit=True, compound=_pick_compound(remaining, my_car.compound, my_car.pit_count))
 
     # Weather change: switch to appropriate tyres
     if state.weather in ("wet", "damp") and my_car.compound in ("SOFT", "MEDIUM", "HARD"):
-        if my_car.tyre_age >= 3:  # Don't pit immediately on fresh tyres
+        if my_car.tyre_age >= 3:
             return Decision(pit=True, compound="INTERMEDIATE")
 
     if state.weather == "dry" and my_car.compound == "INTERMEDIATE":
         return Decision(pit=True, compound="MEDIUM" if remaining > 15 else "SOFT")
 
-    # Otherwise, hold out longer than normal (waiting for SC opportunity)
-    hold_threshold = 30 if state.weather == "dry" else 20
+    # Check if many rivals are about to pit (avoid pitting into traffic)
+    rivals_pitting_soon = sum(
+        1 for rival in state.cars
+        if rival.car_id != my_car.car_id and not rival.retired
+        and my_car.beliefs.get(rival.car_id, {}).get("pit_probability_next_5_laps",
+             my_car.beliefs.get(rival.car_id, {}).get("pit_prob", 0)) > 0.6
+    )
+
+    # If many rivals pitting soon, hold out a bit longer to benefit from clear air
+    hold_threshold = 30 if rivals_pitting_soon >= 2 else 25
+    if state.weather != "dry":
+        hold_threshold = 20
+
     if my_car.tyre_age > hold_threshold and remaining > 5:
-        new_compound = "HARD" if remaining > 20 else "MEDIUM"
-        if my_car.pit_count == 0 and new_compound == my_car.compound:
-            new_compound = "SOFT" if remaining <= 15 else "HARD"
-        return Decision(pit=True, compound=new_compound)
+        return Decision(pit=True, compound=_pick_compound(remaining, my_car.compound, my_car.pit_count))
 
     return Decision(pit=False, compound=my_car.compound)
 
@@ -125,35 +134,31 @@ def wxp_23_strategy(state: RaceState, my_car: CarState) -> Decision:
 def eql_44_strategy(state: RaceState, my_car: CarState) -> Decision:
     """EQL-44: Nash equilibrium bot.
 
-    Integrates the full degradation curve and pits when the expected
-    value of pitting exceeds the pit stop delta.
-
-    Uses a simplified integral: sum of projected deg over remaining laps
-    on current tyres vs fresh tyres + pit loss.
+    Uses the full game theory pit window calculation:
+    Integrates degradation curves to compute expected value of pitting
+    now vs later. Also considers rival positions and undercut threats.
     """
     remaining = state.total_laps - state.lap
     if remaining <= 3 or my_car.tyre_age < 5:
         return Decision(pit=False, compound=my_car.compound)
 
-    # Estimate degradation rates
+    # Degradation parameters
     deg_rates = {"SOFT": 0.10, "MEDIUM": 0.065, "HARD": 0.045}
     current_rate = deg_rates.get(my_car.compound, 0.06)
-
-    # Pit loss estimate (from track data, roughly 22s)
     pit_delta = 22.0
 
-    # Integrate remaining deg on current tyres (power law approx)
+    # Integrate remaining deg on current tyres (power law)
     current_cost = sum(
         current_rate * (my_car.tyre_age + k) ** 1.1
         for k in range(1, remaining + 1)
     )
 
-    # Find best alternative compound
+    # Evaluate each alternative compound
     best_alt = None
     best_alt_cost = float("inf")
     for comp, rate in deg_rates.items():
         if comp == my_car.compound and my_car.pit_count == 0:
-            continue  # Must use different compound on first stop
+            continue
         alt_cost = pit_delta + sum(
             rate * k ** 1.1 for k in range(1, remaining + 1)
         )
@@ -167,19 +172,39 @@ def eql_44_strategy(state: RaceState, my_car: CarState) -> Decision:
     delta_ev = current_cost - best_alt_cost
 
     if delta_ev > 0:
-        # Check if waiting 1-2 more laps would be even better
-        future_cost = sum(
-            current_rate * (my_car.tyre_age + 2 + k) ** 1.1
-            for k in range(1, remaining - 1)
-        )
-        future_rate = deg_rates.get(best_alt, 0.06)
-        future_alt = pit_delta + sum(
-            future_rate * k ** 1.1 for k in range(1, remaining - 1)
-        )
-        future_delta = future_cost - future_alt
+        # Check if waiting 1-3 laps yields better EV (Nash timing)
+        should_pit_now = True
+        for offset in range(1, min(4, remaining)):
+            future_remaining = remaining - offset
+            if future_remaining <= 0:
+                break
+            future_cost = sum(
+                current_rate * (my_car.tyre_age + offset + k) ** 1.1
+                for k in range(1, future_remaining + 1)
+            )
+            future_rate = deg_rates.get(best_alt, 0.06)
+            future_alt = pit_delta + sum(
+                future_rate * k ** 1.1 for k in range(1, future_remaining + 1)
+            )
+            future_delta = future_cost - future_alt
+            if future_delta > delta_ev * 1.05:
+                # Future is significantly better - wait
+                should_pit_now = False
+                break
 
-        # Pit now if current delta_ev is >= future (we've hit the sweet spot)
-        if delta_ev >= future_delta:
+        # Also check: is a rival about to undercut us?
+        for rival in state.cars:
+            if rival.car_id == my_car.car_id or rival.retired:
+                continue
+            if rival.position > my_car.position:
+                belief = my_car.beliefs.get(rival.car_id, {})
+                rival_undercut = belief.get("undercut_viable", False)
+                if rival_undercut:
+                    # Rival may undercut - defensive pit
+                    should_pit_now = True
+                    break
+
+        if should_pit_now:
             return Decision(pit=True, compound=best_alt)
 
     return Decision(pit=False, compound=my_car.compound)
@@ -219,7 +244,7 @@ BUILTIN_BOTS = {
     },
     "NXS-07": {
         "strategy": nxs_07_strategy,
-        "description": "Undercut hunter (monitors gap + rival tyre age)",
+        "description": "Undercut hunter (belief-driven undercut detection)",
         "starting_compound": "SOFT",
     },
     "WXP-23": {
@@ -229,7 +254,7 @@ BUILTIN_BOTS = {
     },
     "EQL-44": {
         "strategy": eql_44_strategy,
-        "description": "Nash equilibrium (integrates full deg curve)",
+        "description": "Nash equilibrium (integral-based optimal pit timing)",
         "starting_compound": "MEDIUM",
     },
     "AGR-33": {

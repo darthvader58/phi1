@@ -11,6 +11,7 @@ import LapTimeChart from "@/components/LapTimeChart";
 import TrackMap from "@/components/TrackMap";
 import EventLog from "@/components/EventLog";
 import TyreStrategyChart from "@/components/TyreStrategyChart";
+import BeliefPanel from "@/components/BeliefPanel";
 import { useToast } from "@/components/Toast";
 
 export default function RacePage() {
@@ -291,8 +292,11 @@ export default function RacePage() {
         </div>
 
         {/* Right: Event log */}
-        <div className="lg:col-span-4">
+        <div className="lg:col-span-4 space-y-4">
           <EventLog events={events} />
+          {cars.length > 0 && (
+            <BeliefPanel cars={cars} />
+          )}
         </div>
       </div>
 
