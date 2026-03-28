@@ -5,9 +5,10 @@ import { CarState, getCompoundColor, getCarColor } from "@/lib/types";
 interface Props {
   cars: CarState[];
   highlightCarId?: string;
+  previousPositions?: Record<string, number>;
 }
 
-export default function Leaderboard({ cars, highlightCarId }: Props) {
+export default function Leaderboard({ cars, highlightCarId, previousPositions }: Props) {
   const sorted = [...cars].sort((a, b) => {
     if (a.retired && !b.retired) return 1;
     if (!a.retired && b.retired) return -1;
@@ -41,6 +42,10 @@ export default function Leaderboard({ cars, highlightCarId }: Props) {
           const compoundColor = getCompoundColor(car.compound);
           const carColor = getCarColor(idx);
 
+          // Position delta
+          const prevPos = previousPositions?.[car.car_id];
+          const delta = prevPos !== undefined ? prevPos - car.position : 0;
+
           return (
             <div
               key={car.car_id}
@@ -49,13 +54,22 @@ export default function Leaderboard({ cars, highlightCarId }: Props) {
                          ${isHighlight ? "bg-f1-red/5" : "hover:bg-white/[0.02]"}
                          ${car.retired ? "opacity-30" : ""}`}
             >
-              {/* Position */}
-              <span className={`w-8 font-bold tabular-nums ${
-                car.position === 1 ? "text-f1-red" :
-                car.position <= 3 ? "text-white" : "text-pit-text"
-              }`}>
-                {car.retired ? "RET" : car.position}
-              </span>
+              {/* Position + delta */}
+              <div className="w-8 flex items-center gap-0.5">
+                <span className={`font-bold tabular-nums ${
+                  car.position === 1 ? "text-f1-red" :
+                  car.position <= 3 ? "text-white" : "text-pit-text"
+                }`}>
+                  {car.retired ? "RET" : car.position}
+                </span>
+                {delta !== 0 && !car.retired && (
+                  <span className={`text-[8px] font-bold ${
+                    delta > 0 ? "text-green-400" : "text-red-400"
+                  }`}>
+                    {delta > 0 ? `+${delta}` : delta}
+                  </span>
+                )}
+              </div>
 
               {/* Car color bar + ID */}
               <div className="flex-1 flex items-center gap-2 min-w-0">
@@ -87,7 +101,10 @@ export default function Leaderboard({ cars, highlightCarId }: Props) {
               </div>
 
               {/* Tyre age */}
-              <span className="w-8 text-right text-pit-muted tabular-nums font-mono text-[11px]">
+              <span className={`w-8 text-right tabular-nums font-mono text-[11px] ${
+                car.tyre_age > 20 ? "text-red-400" :
+                car.tyre_age > 12 ? "text-yellow-400" : "text-pit-muted"
+              }`}>
                 {car.tyre_age}
               </span>
 

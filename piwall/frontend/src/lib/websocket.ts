@@ -1,12 +1,17 @@
-/** WebSocket hook for live race streaming. */
+/** WebSocket hook for live race streaming with auto-reconnect. */
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { WsMessage, LapSnapshot, RaceEvent, RaceResult } from "./types";
 
 const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY_MS = 2000;
 
 export function useRaceWebSocket(raceId: string | null) {
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectAttempts = useRef(0);
+  const reconnectTimer = useRef<NodeJS.Timeout | null>(null);
+
   const [connected, setConnected] = useState(false);
   const [currentLap, setCurrentLap] = useState(0);
   const [totalLaps, setTotalLaps] = useState(0);
@@ -15,9 +20,9 @@ export function useRaceWebSocket(raceId: string | null) {
   const [allLapData, setAllLapData] = useState<LapSnapshot[]>([]);
   const [result, setResult] = useState<RaceResult | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
-  const [status, setStatus] = useState<"connecting" | "connected" | "racing" | "finished">("connecting");
+  const [status, setStatus] = useState<"connecting" | "connected" | "racing" | "finished" | "disconnected">("connecting");
 
-  useEffect(() => {
+  const connect = useCallback(() => {
     if (!raceId) return;
 
     const ws = new WebSocket(`${WS_BASE}/ws/race/${raceId}`);
@@ -26,6 +31,7 @@ export function useRaceWebSocket(raceId: string | null) {
     ws.onopen = () => {
       setConnected(true);
       setStatus("connected");
+      reconnectAttempts.current = 0;
     };
 
     ws.onmessage = (event) => {
@@ -62,12 +68,34 @@ export function useRaceWebSocket(raceId: string | null) {
 
     ws.onclose = () => {
       setConnected(false);
+      wsRef.current = null;
+
+      // Don't reconnect if race is finished
+      if (status === "finished") return;
+
+      // Auto-reconnect with backoff
+      if (reconnectAttempts.current < MAX_RECONNECT_ATTEMPTS) {
+        setStatus("disconnected");
+        const delay = RECONNECT_DELAY_MS * Math.pow(1.5, reconnectAttempts.current);
+        reconnectTimer.current = setTimeout(() => {
+          reconnectAttempts.current++;
+          connect();
+        }, delay);
+      }
     };
 
-    return () => {
+    ws.onerror = () => {
       ws.close();
     };
-  }, [raceId]);
+  }, [raceId, status]);
+
+  useEffect(() => {
+    connect();
+    return () => {
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, [raceId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const setSpeed = useCallback((speed: number) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {

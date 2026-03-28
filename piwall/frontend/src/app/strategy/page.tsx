@@ -3,8 +3,10 @@
 import { useState, useEffect } from "react";
 import { api } from "@/lib/api";
 import StrategyEditor from "@/components/StrategyEditor";
+import { useToast } from "@/components/Toast";
 
 export default function StrategyPage() {
+  const { toast } = useToast();
   const [template, setTemplate] = useState("");
   const [testResult, setTestResult] = useState<any>(null);
   const [testTrack, setTestTrack] = useState("bahrain");
@@ -25,6 +27,7 @@ export default function StrategyPage() {
       setTestResult(result);
     } catch (err: any) {
       setMessage(`Test error: ${err.message}`);
+      toast(err.message, "error");
     }
     setTesting(false);
   }
@@ -36,8 +39,10 @@ export default function StrategyPage() {
       const result = await api.testBot(code, testTrack, 10);
       setMessage("Strategy validated successfully! Join a race to use it.");
       setTestResult(result);
+      toast("Strategy validated!", "success");
     } catch (err: any) {
       setMessage(`Error: ${err.message}`);
+      toast(err.message, "error");
     }
     setSubmitting(false);
   }

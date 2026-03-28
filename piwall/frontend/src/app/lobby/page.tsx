@@ -3,8 +3,10 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
+import { useToast } from "@/components/Toast";
 
 export default function LobbyPage() {
+  const { toast } = useToast();
   const [races, setRaces] = useState<any[]>([]);
   const [leaderboard, setLeaderboard] = useState<any[]>([]);
   const [suggestions, setSuggestions] = useState<any[]>([]);
@@ -48,8 +50,10 @@ export default function LobbyPage() {
       localStorage.setItem("piwall_api_key", res.api_key);
       localStorage.setItem("piwall_username", res.username);
       setRegistered(true);
+      toast("Registered successfully!", "success");
     } catch (err: any) {
       setError(err.message);
+      toast(err.message, "error");
     }
   }
 
@@ -60,6 +64,7 @@ export default function LobbyPage() {
       window.location.href = `/race/${res.race_id}`;
     } catch (err: any) {
       setError(err.message);
+      toast(err.message, "error");
     }
   }
 
