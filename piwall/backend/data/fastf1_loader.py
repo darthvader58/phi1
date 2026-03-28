@@ -105,7 +105,7 @@ def extract_stint_data(race_data: dict) -> pd.DataFrame:
     if "TrackStatus" in valid.columns:
         ts = valid["TrackStatus"].astype(str)
         sc_mask = ts.str.contains("[4567]", regex=True, na=False)
-        valid = valid[~sc_mask]
+        valid = valid[~sc_mask].copy()
 
     # Use FastF1's TyreLife if available, otherwise compute
     if "TyreLife" in valid.columns and valid["TyreLife"].notna().sum() > 0:

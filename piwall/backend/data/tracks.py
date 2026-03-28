@@ -135,7 +135,7 @@ TRACKS: Dict[str, TrackConfig] = {
         },
         typical_stint={"SOFT": 16, "MEDIUM": 24, "HARD": 34},
         fastf1_year=2024,
-        fastf1_event="Great Britain",
+        fastf1_event="British Grand Prix",
     ),
     "suzuka": TrackConfig(
         name="suzuka",
