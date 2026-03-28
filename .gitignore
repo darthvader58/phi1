@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+piwall/fastf1_cache/
+piwall/processed_cache/
+node_modules/
+.next/
+.env
+*.egg-info/
+dist/
+build/
