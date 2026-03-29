@@ -728,11 +728,10 @@ async def _run_race(race_id: str):
     if not lobby:
         return
 
-    # Countdown
-    await _broadcast(lobby, {"type": "countdown", "seconds": 5})
-    await asyncio.sleep(3)
-    await _broadcast(lobby, {"type": "countdown", "seconds": 2})
-    await asyncio.sleep(2)
+    # Countdown: 5, 4, 3, 2, 1 — one broadcast per second
+    for seconds in [5, 4, 3, 2, 1]:
+        await _broadcast(lobby, {"type": "countdown", "seconds": seconds})
+        await asyncio.sleep(1.0)
 
     lobby.status = "running"
     db = SessionLocal()
@@ -782,37 +781,35 @@ async def _run_race(race_id: str):
                        bot_info["starting_compound"])
         pos += 1
 
-    # Run lap by lap with broadcasts
-    total_laps = track.total_laps
-    for lap in range(1, total_laps + 1):
-        # Simulate one lap (call internal step logic)
-        # We need to run the race lap-by-lap — refactor to use step mode
-        pass  # Engine runs all at once, we broadcast from lap_data after
-
-    # Run the full race
+    # Run the full race simulation up front
     result = engine.run()
     lobby.result = result
+    total_laps = track.total_laps
 
-    # Broadcast each lap with delay based on speed
+    # Pre-index events by lap for fast lookup
+    events_by_lap: Dict[int, list] = {}
+    for e in result.events:
+        events_by_lap.setdefault(e.lap, []).append(
+            {"lap": e.lap, "type": e.event_type, "car_id": e.car_id, "detail": e.detail}
+        )
+
+    # Broadcast each lap with minimal delay
+    # Speed: 1x = 0.5s/lap, 5x = 0.1s/lap, 20x = 0.025s/lap
     for lap_snapshot in result.lap_data:
         lap_num = lap_snapshot["lap"]
-        events_this_lap = [
-            {"lap": e.lap, "type": e.event_type, "car_id": e.car_id, "detail": e.detail}
-            for e in result.events if e.lap == lap_num
-        ]
 
         state_msg = {
             "type": "lap",
             "lap": lap_num,
             "total_laps": total_laps,
             "data": lap_snapshot,
-            "events": events_this_lap,
+            "events": events_by_lap.get(lap_num, []),
         }
         lobby.current_state = state_msg
         await _broadcast(lobby, state_msg)
 
-        # Delay between laps based on speed setting
-        delay = max(0.05, 1.0 / lobby.speed)
+        # Tight delay: aim for smooth real-time feel
+        delay = max(0.02, 0.5 / lobby.speed)
         await asyncio.sleep(delay)
 
     # Race finished
