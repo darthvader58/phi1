@@ -1,6 +1,6 @@
 /**
  * Accurate F1 circuit coordinate data and path utilities.
- * Each circuit is defined as control points traced from real track layouts.
+ * Each circuit is defined as control points traced from official F1 track maps.
  * Catmull-Rom spline interpolation creates smooth curves through these points.
  */
 
@@ -11,149 +11,270 @@ export interface TrackDef {
 }
 
 // ─── Circuit control points ──────────────────────────────────────────
-// Coordinates in an 800×520 viewport, traced clockwise from start/finish.
+// Coordinates in an 800×520 viewport, traced from official F1 circuit maps.
+// Each track is traced in the direction cars drive, starting from S/F.
 
+// ═══════════════════════════════════════════════════════════════════════
+// MONACO — Circuit de Monaco (Monte Carlo)
+// Shape: S/F at upper-left going up-right. Sector 1 (red) extends right
+// to a tight complex (turns 04-08). Comes back left through the center.
+// Sector 3 descends down the left side. Rascasse at bottom-left.
+// ═══════════════════════════════════════════════════════════════════════
 const MONACO: [number, number][] = [
-  // Start/Finish straight (heading east along the harbor front)
-  [130, 330],
-  [190, 335],
-  // Sainte Devote (sharp right heading uphill/north)
-  [250, 335], [275, 320], [275, 295],
-  // Beau Rivage climb
-  [280, 260], [285, 225], [295, 195],
-  // Massenet curve (right, heading east toward Casino)
-  [310, 170], [335, 150], [365, 140],
-  // Casino Square area
-  [400, 138], [425, 145],
-  // Mirabeau Haute (right, heading south)
-  [440, 160], [448, 180],
-  // Mirabeau Basse
-  [448, 205], [440, 225],
-  // Loews / Fairmont Hairpin (tight U-turn back east)
-  [425, 245], [408, 255], [408, 268], [425, 278], [445, 272],
-  // Portier (heading east toward tunnel)
-  [470, 262], [498, 255],
-  // Tunnel entrance & through tunnel (heading southeast)
-  [530, 252], [565, 255], [598, 268],
-  // Tunnel exit
-  [618, 288], [628, 310],
-  // Nouvelle Chicane
-  [628, 338], [618, 355], [625, 372],
-  // Tabac (heading west along harbor)
-  [615, 392], [590, 405], [555, 412],
-  // Swimming Pool complex (chicane)
-  [520, 415], [498, 402], [478, 412], [455, 420],
-  // La Rascasse (tight right heading north-west)
-  [420, 425], [388, 420], [358, 410],
-  // Anthony Noghes (right heading east back to S/F)
-  [320, 398], [280, 380], [240, 358],
-  [195, 342], [155, 335],
+  // S/F — pit straight heading up-right (left side of circuit)
+  [130, 185], [165, 162], [205, 135], [255, 105], [310, 78],
+  // Turn 01 — Sainte Devote (top of circuit, sharp right heading right-down)
+  [355, 60], [390, 55], [418, 62], [435, 80],
+  // Descending from Sainte Devote into sector 1
+  [448, 108], [455, 140], [462, 170],
+  // Turn 02 — heading right
+  [472, 200], [480, 218],
+  // Turn 03 — continuing right and slightly down
+  [492, 242], [505, 255],
+  // Heading right to the sector 2 complex
+  [525, 248], [548, 230], [575, 205],
+  // Turn 04 — Mirabeau area
+  [600, 185], [622, 170],
+  // Turn 05 — heading further right
+  [645, 160], [660, 155],
+  // Turns 06-07 — tight complex far right
+  [675, 168], [682, 185], [690, 202],
+  [700, 218],
+  // Turn 08 — rightmost point
+  [718, 232], [722, 252],
+  // Heading back left from the far-right complex
+  [718, 272], [705, 292],
+  // Turn 09 — heading back left
+  [685, 315], [660, 332],
+  // Heading back left across the circuit (sector 2 → center)
+  [628, 342], [595, 338],
+  // Turn 10 — center area
+  [548, 310], [525, 298],
+  // Turn 11 — heading left
+  [500, 288], [478, 280],
+  // Heading up-left toward turn 12
+  [450, 258], [428, 238],
+  // Turn 12 — left side, heading down
+  [398, 210], [380, 200],
+  // Turn 13 — heading down-left
+  [355, 218], [335, 235],
+  // Turn 14
+  [318, 258], [308, 275],
+  // Sector 3 — descending down the left side
+  [298, 296], [290, 315],
+  // Turn 15-16 — continuing down
+  [282, 335], [275, 352],
+  [268, 370],
+  // Turn 17 — Rascasse (bottom-left)
+  [248, 388], [235, 400],
+  // Turn 18 — bottom
+  [238, 418], [248, 432],
+  // Turn 19 — heading back up-left
+  [238, 435], [218, 420],
+  // Path curves back up along the left edge to S/F
+  [195, 398], [175, 365],
+  [158, 325], [145, 280],
+  [138, 240], [134, 210],
 ];
 
-const BAHRAIN: [number, number][] = [
-  // Start/Finish straight (heading south on the left side)
-  [195, 90],
-  [195, 145],
-  // Turn 1 (sharp right heading east)
-  [195, 195], [210, 218], [235, 228],
-  // Turn 2 (left, heading north-east)
-  [265, 225], [280, 210],
-  // Turn 3 (right, heading south-east)
-  [295, 208], [310, 218],
-  // Turn 4 (right hairpin heading south)
-  [325, 238], [332, 260], [325, 282],
-  // Turn 5 (left heading east)
-  [315, 298], [310, 315], [318, 332],
-  // Turn 6-7 (esses heading east)
-  [338, 342], [358, 335], [378, 345],
-  // Turn 8 (sharp left heading north)
-  [395, 360], [402, 378], [395, 395],
-  // Turn 9-10 (heading west then south)
-  [378, 408], [358, 412], [342, 420],
-  // Long back straight heading west
-  [318, 432], [275, 440], [235, 440],
-  // Turn 11 (left heading south)
-  [205, 438], [185, 428],
-  // Turn 12 (right heading west)
-  [178, 410], [168, 392],
-  // Turn 13 (left heading south)
-  [162, 372], [158, 348],
-  // Turn 14 (right, heading north back to straight)
-  [155, 318], [158, 285], [165, 248],
-  // Turn 15 (slight left)
-  [172, 215], [178, 178],
-  // Back to S/F straight heading north
-  [182, 140], [188, 110],
-];
-
+// ═══════════════════════════════════════════════════════════════════════
+// MONZA — Autodromo Nazionale Monza
+// Shape: S/F straight at the bottom-right running left. Goes UP through
+// sector 1 (two chicanes) to the top-left. Curves right at top (Curva
+// Grande). Lesmos descend right side. Back straight goes FAR RIGHT to
+// Turn 11 (Parabolica). Returns left to S/F.
+// ═══════════════════════════════════════════════════════════════════════
 const MONZA: [number, number][] = [
-  // Start/Finish straight (heading north, right side of circuit)
-  [420, 440],
-  [415, 390], [410, 340],
-  // Variante del Rettifilo (chicane at north end)
-  [408, 295], [418, 268], [408, 248], [392, 238],
-  // Short straight heading northwest
-  [375, 228], [358, 222],
-  // Curva Grande (long sweeping right heading east)
-  [335, 218], [318, 210], [310, 195], [318, 178],
-  [338, 165], [368, 152], [402, 142], [438, 138],
-  // Variante della Roggia (chicane)
-  [468, 142], [488, 152], [495, 168], [488, 185],
-  // Lesmo 1 (right heading south)
-  [482, 205], [478, 228],
-  // Lesmo 2 (right heading south/southwest)
-  [478, 252], [472, 275], [462, 298],
-  // Straight heading south
-  [455, 325], [452, 355],
-  // Variante Ascari (chicane)
-  [448, 378], [435, 395], [428, 408], [438, 422],
-  // Curva Parabolica (long sweeping right heading west then north)
-  [445, 438], [440, 455], [428, 468],
-  [408, 475], [385, 478], [362, 472],
-  [345, 462], [338, 448],
-  // Pit straight heading north back to S/F
-  [345, 432], [358, 418],
-  [378, 440], [400, 445],
+  // S/F — bottom of circuit, heading LEFT
+  [700, 452],
+  [640, 448], [570, 446],
+  // Turn 01 — Variante del Rettifilo chicane (bottom-center-left)
+  [498, 445], [468, 442], [448, 430],
+  // Turn 02 — just above turn 01
+  [438, 408], [445, 392],
+  // Turn 03 — to the left heading up
+  [435, 375], [415, 362],
+  // Heading up-left through sector 1
+  [390, 348], [362, 328],
+  [330, 300], [298, 268],
+  // Approaching turns 04-05 (top-left area)
+  [268, 238], [245, 208],
+  // Turn 04 — upper-left, heading right
+  [230, 180], [222, 155],
+  // Turn 05 — top-left
+  [218, 132], [222, 112],
+  // Curving right at the top — Curva Grande
+  [232, 95], [252, 80], [278, 72],
+  // Turn 06 — heading right along the top
+  [310, 68], [342, 70],
+  // Turn 07 — continuing right
+  [375, 78], [400, 90],
+  // Descending through Lesmos (sector 2, heading down-right)
+  [418, 108], [428, 132],
+  // Turn 08 — Lesmo 1
+  [435, 158], [438, 182],
+  // Turn 09 — heading down and right
+  [445, 208], [455, 238],
+  // Continuing descent
+  [468, 268], [482, 295],
+  // Turn 10 — transition to back straight (heading right)
+  [498, 318], [518, 335],
+  // Long back straight heading FAR RIGHT (sector 3)
+  [548, 348], [590, 360], [640, 372],
+  [690, 382], [728, 390],
+  // Turn 11 — Parabolica (far right, sweeping right curve heading back left)
+  [752, 398], [765, 412], [768, 432],
+  [762, 450], [748, 462],
+  [728, 470], [705, 472],
+  // Heading back left to S/F
+  [680, 468], [660, 462],
+  // Rejoining S/F straight
+  [720, 455],
 ];
 
+// ═══════════════════════════════════════════════════════════════════════
+// BAHRAIN — Bahrain International Circuit (Sakhir)
+// Shape: S/F straight at the bottom running left-to-right. Left section
+// goes UP to turn 04 at the very top. Complex infield (turns 05-10) in
+// the center. Right section extends far right to a triangular area
+// (turns 11-15). Long straight back at bottom connects to S/F.
+// ═══════════════════════════════════════════════════════════════════════
+const BAHRAIN: [number, number][] = [
+  // S/F — bottom, heading LEFT from right side
+  [720, 468],
+  [660, 465], [590, 462], [520, 460],
+  // Turn 01 — bottom-left, braking from main straight
+  [448, 458], [398, 455], [358, 448],
+  // Heading up after turn 01
+  [338, 435], [328, 412],
+  // Turn 02 — heading up
+  [332, 390], [340, 372],
+  // Turn 03 — left of turn 02
+  [330, 355], [312, 342],
+  // Heading UP along the left side (sector 1)
+  [298, 320], [285, 290],
+  [275, 258], [268, 225],
+  [265, 190], [268, 155],
+  // Turn 04 — very top of circuit
+  [278, 118], [298, 78], [325, 52], [355, 42],
+  // Heading down-right to turns 05-06
+  [375, 48], [388, 62],
+  // Turn 05 — below turn 04
+  [398, 88], [410, 108],
+  // Turn 06 — below turn 05
+  [415, 128], [412, 148],
+  // Turn 07 — heading down
+  [408, 172], [415, 195],
+  // Complex infield section (turns 08-10)
+  // Turn 08
+  [428, 218], [445, 232],
+  // Turn 09
+  [462, 240], [478, 248],
+  // Turn 10 — heading right, then down
+  [490, 258], [492, 278], [482, 298],
+  // Heading into sector 3
+  [472, 312], [462, 328],
+  // Long section heading RIGHT
+  [472, 348], [498, 362],
+  // Turn 11 — right of center
+  [528, 372], [555, 378],
+  // Heading up toward turns 12-13
+  [572, 368], [582, 348],
+  [588, 320], [590, 288],
+  // Turn 12 — upper right area
+  [588, 255], [582, 225],
+  [575, 195], [570, 165],
+  // Turn 13 — top right (topmost point of right section)
+  [565, 130], [558, 98], [555, 72],
+  // Heading right and down from turn 13
+  [568, 65], [595, 72],
+  [628, 95], [660, 135],
+  // Turn 14 — far right
+  [690, 182], [712, 235],
+  [722, 290], [728, 345],
+  // Turn 15 — bottom-right, heading left along the bottom
+  [730, 398], [728, 435], [722, 458],
+  // Back to main straight heading left
+  [720, 468],
+];
+
+// ═══════════════════════════════════════════════════════════════════════
+// SPA — Circuit de Spa-Francorchamps
+// Shape: S/F at bottom-center-left. La Source (turn 01) is a hairpin
+// just left of S/F. Drops to Eau Rouge (turn 02), then climbs UP-RIGHT
+// along the Kemmel Straight. Turn 05 at the very top. Les Combes
+// (turns 06-07) at top-right. Descends right side. Large extension to
+// the far left (Pouhon/Stavelot at turns 13-14). Returns right to S/F.
+// ═══════════════════════════════════════════════════════════════════════
 const SPA: [number, number][] = [
-  // Start/Finish (heading east, at the north end)
-  [115, 118],
-  [155, 118],
-  // La Source hairpin (sharp right, then heading south/downhill)
-  [185, 118], [200, 128], [205, 145], [195, 158], [178, 162],
-  // Drop down to Eau Rouge (heading south-southeast)
-  [168, 178], [162, 205], [165, 232],
-  // Eau Rouge & Raidillon (famous uphill left-right, heading east)
-  [172, 255], [188, 268], [212, 262], [238, 245],
-  // Kemmel Straight (heading east/northeast)
-  [278, 228], [328, 208], [385, 192], [445, 178],
-  // Les Combes (chicane, heading south)
-  [488, 172], [518, 175], [535, 188], [532, 208],
-  // Malmedy (heading south)
-  [525, 228], [522, 252],
-  // Rivage hairpin (right, heading south-west)
-  [518, 275], [508, 295], [492, 308],
-  // Downhill through forest
-  [475, 322], [455, 340], [435, 358],
-  // Pouhon (double-apex left, heading southwest)
-  [412, 378], [388, 395], [362, 405], [338, 398],
-  // Fagnes / Campuget
-  [318, 392], [298, 398], [278, 408],
-  // Stavelot (right-left heading west)
-  [255, 418], [232, 422], [212, 415], [198, 402],
-  // Blanchimont (fast left heading northwest)
-  [185, 382], [172, 355], [158, 322],
-  // Approach to Bus Stop
-  [148, 288], [138, 255],
-  // Bus Stop chicane
-  [132, 225], [125, 198], [128, 175],
-  // Pit straight back to S/F heading north
-  [125, 152], [118, 135],
+  // S/F — bottom area, heading left toward La Source
+  [380, 435],
+  [350, 428], [322, 418],
+  // Turn 01 — La Source hairpin (sharp right U-turn)
+  [295, 408], [278, 395], [272, 378],
+  [278, 362], [292, 355], [308, 358],
+  // Heading slightly down to Eau Rouge (turn 02)
+  [318, 365], [322, 378], [328, 392],
+  // Turn 02 — Eau Rouge dip, then Raidillon heading UP-RIGHT
+  [338, 402], [348, 395], [358, 378],
+  // Raidillon — steep uphill heading up-right
+  [372, 355], [388, 335],
+  // Turn 03-04 — continuing up-right
+  [408, 312], [425, 292],
+  // Kemmel Straight — long straight heading UP-RIGHT to the top
+  [448, 268], [478, 242], [518, 215],
+  [558, 188], [598, 162],
+  // Turn 05 — at the very top of the circuit
+  [638, 132], [665, 105], [685, 78], [698, 58],
+  // Turns 06-07 — Les Combes, heading right then down (top-right area)
+  [715, 62], [732, 78], [742, 98],
+  [745, 122],
+  // Turn 08 — far right, heading down
+  [748, 148], [745, 175],
+  // Turn 09 — continuing down
+  [738, 202], [725, 228],
+  // Turn 10 — heading left and down (right side descent)
+  [708, 252], [690, 272],
+  // Turn 11 — continuing descent
+  [672, 295], [652, 318],
+  // Turn 12 — heading further left and down
+  [628, 340], [600, 358],
+  // Heading far left through the lower portion
+  [572, 372], [540, 385],
+  // Turns 13-14 — Pouhon/Stavelot area (far left extension)
+  [505, 398], [465, 408],
+  [425, 415], [385, 418],
+  [348, 420], [312, 418],
+  [278, 412], [248, 402],
+  // Large sweep at far left
+  [218, 388], [195, 372],
+  [178, 352], [168, 330],
+  // Heading back right (Blanchimont area)
+  [162, 305], [160, 278],
+  // Turn 15-16 — heading right
+  [165, 252], [175, 232],
+  // Turns 17-18 — heading right back toward S/F
+  [192, 218], [215, 210],
+  [245, 208], [280, 215],
+  // Turn 18 — Bus Stop chicane, heading right
+  [318, 225], [348, 240],
+  // Turn 19 — connecting back to S/F
+  [368, 258], [378, 282],
+  [382, 310], [385, 342],
+  [385, 375], [384, 405],
+  // Approaching S/F line
+  [382, 425],
 ];
 
+// ═══════════════════════════════════════════════════════════════════════
+// SILVERSTONE — Silverstone Circuit
+// Shape: S/F at the bottom-center heading right. Copse, then
+// Maggots-Becketts-Chapel esses heading right. Hangar Straight east.
+// Stowe at the right. Comes back left through Club, Village, Loop.
+// Brooklands/Luffield/Woodcote at the left heading back to S/F.
+// ═══════════════════════════════════════════════════════════════════════
 const SILVERSTONE: [number, number][] = [
-  // Start/Finish (heading south, then into Copse)
+  // S/F — bottom-center, heading right
   [258, 248],
   [268, 275],
   // Copse (fast right)
@@ -190,46 +311,73 @@ const SILVERSTONE: [number, number][] = [
   [248, 240],
 ];
 
+// ═══════════════════════════════════════════════════════════════════════
+// SUZUKA — Suzuka International Racing Course (figure-8)
+// Shape: S/F straight on the RIGHT side (vertical). From S/F heading
+// down to turns 1-2 at bottom-right, then S-curves (turns 3-6) wiggle
+// down-left. Turn 7 at center. Sector 2 heads far LEFT through hairpin
+// (turns 11-12) and Spoon (turns 13-14). Back straight (sector 3)
+// heads RIGHT through the CROSSOVER back to 130R and Casio Triangle.
+// ═══════════════════════════════════════════════════════════════════════
 const SUZUKA: [number, number][] = [
-  // Start/Finish (heading west along the south side)
-  [538, 432],
-  [488, 438], [438, 442],
-  // Turn 1 (right heading north)
-  [388, 440], [355, 428], [335, 405],
-  // Turn 2 (left heading north)
-  [325, 378], [328, 348], [338, 322],
-  // S-Curves (heading east through the northern section)
-  [352, 298], [368, 282],
-  [385, 275], [398, 285],
-  [412, 278], [428, 268],
-  [445, 275], [455, 288],
-  // Dunlop curve (right heading south-east)
-  [468, 302], [478, 322],
-  // Degner 1 (right heading south)
-  [482, 348], [480, 372],
-  // Degner 2 (right heading south-west)
-  [472, 392], [455, 405],
-  // ─── CROSSOVER ZONE ─── (the figure-8 crosses here)
-  // Path heads south-west, crossing UNDER the back straight
-  [435, 415], [412, 418],
-  // Hairpin (sharp left heading east)
-  [388, 425], [372, 438], [358, 448],
-  [342, 448], [328, 438],
-  // Spoon curve (heading north/northeast)
-  [318, 418], [308, 395],
-  [302, 368], [298, 342],
-  [298, 318], [305, 298],
-  // 200R & Back straight (heading east)
-  // This passes OVER the Degner→Hairpin section (the crossover bridge)
-  [318, 282], [342, 275],
-  [375, 278], [412, 288],
-  [448, 305], [478, 325],
-  // 130R (fast left heading south-east)
-  [505, 345], [525, 368],
-  // Casio Triangle chicane
-  [538, 392], [548, 408], [545, 425],
+  // S/F — right side of circuit, heading DOWN
+  [738, 228],
+  [742, 268], [745, 310],
+  // Turn 1 — bottom-right, heading down then left
+  [748, 355], [745, 390],
+  // Turn 2 — continuing, heading down-left
+  [738, 418], [725, 445],
+  // S-curves (turns 3-6) — wiggle pattern heading down-left
+  // Turn 3
+  [705, 462], [685, 470],
+  // Turn 4
+  [662, 468], [642, 458],
+  // Turn 5
+  [625, 442], [612, 428],
+  // Turn 6
+  [598, 410], [585, 395],
+  // Heading left toward center
+  [565, 375], [540, 355],
+  // Turn 7 — center of the circuit
+  [512, 335], [488, 320],
+  // Heading left into sector 2
+  [458, 305], [428, 295],
+  // Turn 8-9 — heading further left and slightly up
+  [398, 288], [370, 285],
+  [342, 288], [318, 298],
+  // Turn 10 — left side, heading up-left
+  [295, 312], [278, 328],
+  // Turn 11 — upper-left area
+  [262, 342], [252, 325],
+  [248, 305], [252, 285],
+  // Turn 12 — heading left, opening up to the hairpin
+  [255, 268], [248, 248],
+  [238, 228], [225, 212],
+  // Heading far left to Spoon
+  [208, 198], [188, 185],
+  // Turn 13 — far left
+  [162, 175], [138, 168],
+  // Turn 14 — farthest left point (Spoon apex)
+  [108, 162], [85, 165],
+  [68, 178], [62, 198],
+  [68, 218], [82, 232],
+  // Exiting Spoon, heading right
+  [102, 242], [128, 248],
+  // Turn 15 — back straight starts, heading RIGHT
+  [158, 250], [198, 252],
+  [245, 255],
+  // Back straight heading RIGHT through the CROSSOVER
+  // (passes over/under the turn 7→8 section)
+  [298, 258], [355, 262],
+  [415, 270], [468, 278],
+  [518, 288], [562, 298],
+  // Turn 16-17 — upper-center heading right
+  [598, 305], [628, 298],
+  [652, 282], [672, 262],
+  // Turn 18 — upper-right, approaching S/F
+  [692, 245], [710, 232],
   // Back to S/F
-  [540, 435],
+  [728, 228],
 ];
 
 // ─── Track registry ────────────────────────────────────────────────
