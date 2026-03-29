@@ -28,7 +28,7 @@ export default function RacePage() {
 
   const {
     connected, status, currentLap, totalLaps,
-    lapData, allLapData, events, result, countdown, setSpeed,
+    lapData, allLapData, events, result, countdown, lightsOut, setSpeed,
   } = useRaceWebSocket(raceInfo?.status === "lobby" ? null : raceId);
 
   // Track position changes for delta indicators
@@ -165,10 +165,54 @@ export default function RacePage() {
     return (
       <div className="flex items-center justify-center min-h-[60vh]">
         <div className="text-center">
-          <div className="text-8xl font-black text-f1-red mb-3 tabular-nums animate-pulse-slow">
+          {/* F1-style light panels */}
+          <div className="flex items-center justify-center gap-3 mb-6">
+            {[5, 4, 3, 2, 1].map((n) => (
+              <div
+                key={n}
+                className={`w-10 h-10 rounded-full border-2 transition-all duration-300 ${
+                  countdown <= n
+                    ? "bg-f1-red border-f1-red shadow-[0_0_15px_rgba(225,6,0,0.6)]"
+                    : "bg-transparent border-pit-border"
+                }`}
+              />
+            ))}
+          </div>
+          <div className="text-7xl font-black text-f1-red tabular-nums">
             {countdown}
           </div>
-          <div className="text-pit-muted text-sm uppercase tracking-widest">Lights Out</div>
+          <div className="text-pit-muted text-xs uppercase tracking-[0.3em] mt-2">
+            Lights Out In...
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Lights Out transition
+  if (lightsOut) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="text-center animate-fade-in">
+          {/* All lights off */}
+          <div className="flex items-center justify-center gap-3 mb-6">
+            {[5, 4, 3, 2, 1].map((n) => (
+              <div
+                key={n}
+                className="w-10 h-10 rounded-full border-2 bg-transparent border-pit-border"
+              />
+            ))}
+          </div>
+          <div className="text-3xl sm:text-5xl font-black text-green-500 tracking-tight">
+            LIGHTS OUT
+          </div>
+          <div className="text-lg sm:text-xl font-bold text-pit-light mt-1">
+            AND AWAY WE GO!
+          </div>
+          <div className="mt-4">
+            <div className="w-6 h-6 border-2 border-pit-muted border-t-f1-red rounded-full animate-spin mx-auto" />
+          </div>
+          <div className="text-pit-muted text-xs mt-2">Simulating race...</div>
         </div>
       </div>
     );

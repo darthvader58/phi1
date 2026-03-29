@@ -16,6 +16,7 @@ Endpoints:
 """
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import random
@@ -733,6 +734,9 @@ async def _run_race(race_id: str):
         await _broadcast(lobby, {"type": "countdown", "seconds": seconds})
         await asyncio.sleep(1.0)
 
+    # Immediately broadcast lights out so the frontend transitions
+    await _broadcast(lobby, {"type": "lights_out"})
+
     lobby.status = "running"
     db = SessionLocal()
     try:
@@ -740,7 +744,7 @@ async def _run_race(race_id: str):
     finally:
         db.close()
 
-    # Build track
+    # Build track and engine setup
     track = build_track_physics(lobby.track)
     track_cfg = TRACKS[lobby.track]
 
@@ -781,8 +785,11 @@ async def _run_race(race_id: str):
                        bot_info["starting_compound"])
         pos += 1
 
-    # Run the full race simulation up front
-    result = engine.run()
+    # Run the full race simulation in a thread pool so we don't block the event loop
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        result = await loop.run_in_executor(pool, engine.run)
+
     lobby.result = result
     total_laps = track.total_laps
 

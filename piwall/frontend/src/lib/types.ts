@@ -145,7 +145,7 @@ export interface ActiveSeasonData {
 }
 
 export interface WsMessage {
-  type: "countdown" | "lap" | "finished" | "ping" | "error";
+  type: "countdown" | "lights_out" | "lap" | "finished" | "ping" | "error";
   lap?: number;
   total_laps?: number;
   data?: LapSnapshot;

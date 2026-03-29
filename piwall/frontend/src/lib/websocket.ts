@@ -20,6 +20,7 @@ export function useRaceWebSocket(raceId: string | null) {
   const [allLapData, setAllLapData] = useState<LapSnapshot[]>([]);
   const [result, setResult] = useState<RaceResult | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
+  const [lightsOut, setLightsOut] = useState(false);
   const [status, setStatus] = useState<"connecting" | "connected" | "racing" | "finished" | "disconnected">("connecting");
 
   const connect = useCallback(() => {
@@ -40,11 +41,18 @@ export function useRaceWebSocket(raceId: string | null) {
       switch (msg.type) {
         case "countdown":
           setCountdown(msg.seconds ?? null);
+          setLightsOut(false);
+          break;
+
+        case "lights_out":
+          setCountdown(null);
+          setLightsOut(true);
           break;
 
         case "lap":
           setStatus("racing");
           setCountdown(null);
+          setLightsOut(false);
           setCurrentLap(msg.lap ?? 0);
           setTotalLaps(msg.total_laps ?? 0);
           if (msg.data) {
@@ -113,6 +121,7 @@ export function useRaceWebSocket(raceId: string | null) {
     events,
     result,
     countdown,
+    lightsOut,
     setSpeed,
   };
 }

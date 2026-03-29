@@ -1,7 +1,13 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import { CarState, getCarColor, getCompoundColor } from "@/lib/types";
+import { useEffect, useRef, useCallback } from "react";
+import { CarState, getCarColor, getCompoundColor, CAR_COLORS } from "@/lib/types";
+import {
+  TRACK_DEFS,
+  buildTrackPath,
+  getPointAtFraction,
+  TrackPath,
+} from "@/lib/trackData";
 
 interface Props {
   cars: CarState[];
@@ -10,233 +16,321 @@ interface Props {
   safetyCar: boolean;
 }
 
-// Real F1 circuit outlines as SVG paths (scaled to 320x300 viewBox)
-// Traced from actual circuit maps
-const TRACK_PATHS: Record<string, string> = {
-  // Bahrain International Circuit - Sakhir
-  bahrain:
-    "M 200 30 L 240 30 L 260 45 L 260 80 L 240 95 L 260 110 L 260 140 " +
-    "L 240 155 L 240 180 L 220 195 L 220 230 L 200 250 L 160 260 " +
-    "L 120 250 L 100 230 L 100 200 L 80 180 L 80 140 L 100 110 " +
-    "L 100 80 L 120 60 L 160 40 Z",
+// ─── F1 car polygon (top-down, pointing RIGHT at angle=0) ─────────
+// ~16px long, ~8px wide — will be scaled
+const CAR_BODY: [number, number][] = [
+  [8, 0],    // nose tip
+  [5, -2.2], // front right
+  [3, -3],   // cockpit right
+  [-2, -3.5],// sidepod right
+  [-5, -3.8],// rear right widest
+  [-7, -3],  // rear right
+  [-8, -4],  // rear wing right
+  [-8, 4],   // rear wing left
+  [-7, 3],   // rear left
+  [-5, 3.8], // rear left widest
+  [-2, 3.5], // sidepod left
+  [3, 3],    // cockpit left
+  [5, 2.2],  // front left
+];
 
-  // Circuit de Monaco - Monte Carlo
-  monaco:
-    "M 80 60 L 160 40 L 240 40 L 270 60 L 270 90 L 250 110 " +
-    "L 260 140 L 240 170 L 200 180 L 180 200 L 140 220 " +
-    "L 100 240 L 60 230 L 50 200 L 60 170 L 80 150 " +
-    "L 60 120 L 60 90 Z",
+// Front wing
+const FRONT_WING: [number, number][] = [
+  [6, -4.5], [8, -4.5], [8, 4.5], [6, 4.5],
+];
 
-  // Autodromo Nazionale Monza
-  monza:
-    "M 140 40 L 200 35 L 240 50 L 255 80 L 250 120 " +
-    "L 265 140 L 270 170 L 250 200 L 230 210 L 200 220 " +
-    "L 175 240 L 140 260 L 110 255 L 80 235 L 65 210 " +
-    "L 60 180 L 55 140 L 65 100 L 80 70 L 110 50 Z",
-
-  // Circuit de Spa-Francorchamps (famous layout with Eau Rouge/Raidillon)
-  spa:
-    "M 60 180 L 60 140 L 80 100 L 110 70 L 140 50 L 180 40 " +
-    "L 220 50 L 250 70 L 270 100 L 275 130 L 260 150 " +
-    "L 240 155 L 250 180 L 270 200 L 270 230 L 250 255 " +
-    "L 220 265 L 180 270 L 140 260 L 100 240 L 70 210 Z",
-
-  // Silverstone Circuit (modern layout with Loop/Wellington/Brooklands complex)
-  silverstone:
-    "M 130 40 L 180 35 L 230 50 L 260 75 L 270 110 " +
-    "L 260 140 L 240 155 L 260 180 L 255 210 L 230 230 " +
-    "L 195 250 L 160 260 L 125 255 L 90 240 L 65 215 " +
-    "L 55 180 L 60 145 L 75 115 L 90 90 L 110 60 Z",
-
-  // Suzuka International Racing Course (figure-8 crossover)
-  suzuka:
-    "M 80 140 L 80 100 L 100 70 L 130 50 L 170 40 L 210 50 " +
-    "L 240 75 L 255 110 L 250 140 L 230 160 L 210 150 " +
-    "L 190 165 L 200 190 L 220 210 L 230 240 L 210 260 " +
-    "L 170 270 L 130 265 L 100 245 L 80 215 L 70 180 Z",
-};
-
-// Get a point along the SVG path at parameter t (0-1)
-function getPointOnPath(pathEl: SVGPathElement, t: number): { x: number; y: number } {
-  const len = pathEl.getTotalLength();
-  const pt = pathEl.getPointAtLength(t * len);
-  return { x: pt.x, y: pt.y };
-}
+// Rear wing
+const REAR_WING: [number, number][] = [
+  [-8, -5], [-7, -5], [-7, 5], [-8, 5],
+];
 
 export default function TrackMap({ cars, trackName, weather, safetyCar }: Props) {
-  const pathRef = useRef<SVGPathElement>(null);
-  const carsRef = useRef<SVGGElement>(null);
-  const prevPositions = useRef<Record<string, { x: number; y: number }>>({});
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const trackPathRef = useRef<TrackPath | null>(null);
+  const animFrameRef = useRef<number>(0);
+  const prevPositions = useRef<Record<string, { x: number; y: number; angle: number }>>({});
+  const carsRef = useRef<CarState[]>(cars);
+  const propsRef = useRef({ weather, safetyCar, trackName });
 
-  const path = TRACK_PATHS[trackName] || TRACK_PATHS.bahrain;
-  const activeCars = cars.filter((c) => !c.retired);
+  carsRef.current = cars;
+  propsRef.current = { weather, safetyCar, trackName };
 
-  const trackColor = safetyCar ? "#eab308" : weather === "wet" ? "#1e40af" : "#2a2a2a";
-
-  // Position cars along the actual path based on their race position/gap
+  // Build track path when track changes
   useEffect(() => {
-    if (!pathRef.current || activeCars.length === 0) return;
-    const pathEl = pathRef.current;
+    const def = TRACK_DEFS[trackName] || TRACK_DEFS.bahrain;
+    trackPathRef.current = buildTrackPath(def.points);
+    prevPositions.current = {};
+  }, [trackName]);
 
-    // Distribute cars along the path by position
-    // Leader at front, others spaced proportionally by gap
+  // Rendering
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    const trackPath = trackPathRef.current;
+    if (!canvas || !ctx || !trackPath) return;
+
+    const { weather: wx, safetyCar: sc } = propsRef.current;
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    const W = canvas.clientWidth;
+    const H = canvas.clientHeight;
+
+    if (canvas.width !== W * dpr || canvas.height !== H * dpr) {
+      canvas.width = W * dpr;
+      canvas.height = H * dpr;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Scale factor: track data is 800×520, fit into canvas
+    const scaleX = W / 800;
+    const scaleY = H / 520;
+    const scale = Math.min(scaleX, scaleY) * 0.92;
+    const offsetX = (W - 800 * scale) / 2;
+    const offsetY = (H - 520 * scale) / 2;
+
+    const tx = (x: number) => x * scale + offsetX;
+    const ty = (y: number) => y * scale + offsetY;
+
+    // Clear
+    ctx.clearRect(0, 0, W, H);
+
+    // Background
+    const bgGrad = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, W * 0.7);
+    bgGrad.addColorStop(0, "#141414");
+    bgGrad.addColorStop(1, "#0a0a0a");
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    const pts = trackPath.points;
+
+    // ── Track glow (outer) ──
+    ctx.beginPath();
+    ctx.moveTo(tx(pts[0][0]), ty(pts[0][1]));
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(tx(pts[i][0]), ty(pts[i][1]));
+    }
+    ctx.closePath();
+    ctx.strokeStyle = sc ? "rgba(234,179,8,0.12)" : wx === "wet" ? "rgba(30,64,175,0.15)" : "rgba(50,50,60,0.2)";
+    ctx.lineWidth = 22 * scale;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.stroke();
+
+    // ── Track surface (asphalt) ──
+    ctx.beginPath();
+    ctx.moveTo(tx(pts[0][0]), ty(pts[0][1]));
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(tx(pts[i][0]), ty(pts[i][1]));
+    }
+    ctx.closePath();
+    ctx.strokeStyle = sc ? "#3d3520" : wx === "wet" ? "#1a2540" : "#2a2a2e";
+    ctx.lineWidth = 14 * scale;
+    ctx.stroke();
+
+    // ── Racing line (center stripe) ──
+    ctx.beginPath();
+    ctx.moveTo(tx(pts[0][0]), ty(pts[0][1]));
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(tx(pts[i][0]), ty(pts[i][1]));
+    }
+    ctx.closePath();
+    ctx.strokeStyle = sc ? "#4a4020" : "#1e1e22";
+    ctx.lineWidth = 8 * scale;
+    ctx.stroke();
+
+    // ── Track edge markings ──
+    ctx.beginPath();
+    ctx.moveTo(tx(pts[0][0]), ty(pts[0][1]));
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(tx(pts[i][0]), ty(pts[i][1]));
+    }
+    ctx.closePath();
+    if (sc) {
+      ctx.strokeStyle = "rgba(234,179,8,0.4)";
+      ctx.setLineDash([6 * scale, 4 * scale]);
+    } else {
+      ctx.strokeStyle = "rgba(255,255,255,0.06)";
+      ctx.setLineDash([]);
+    }
+    ctx.lineWidth = 1 * scale;
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // ── Start/Finish line ──
+    const sfPoint = getPointAtFraction(trackPath, 0);
+    const sfAngle = sfPoint.angle + Math.PI / 2;
+    const sfLen = 9 * scale;
+    ctx.beginPath();
+    ctx.moveTo(
+      tx(sfPoint.x) - Math.cos(sfAngle) * sfLen,
+      ty(sfPoint.y) - Math.sin(sfAngle) * sfLen,
+    );
+    ctx.lineTo(
+      tx(sfPoint.x) + Math.cos(sfAngle) * sfLen,
+      ty(sfPoint.y) + Math.sin(sfAngle) * sfLen,
+    );
+    ctx.strokeStyle = "#e10600";
+    ctx.lineWidth = 2.5 * scale;
+    ctx.stroke();
+
+    // ── Draw cars ──
+    const activeCars = carsRef.current.filter((c) => !c.retired);
     const maxGap = Math.max(1, ...activeCars.map((c) => c.gap_to_leader));
 
     activeCars.forEach((car) => {
-      // Map gap to path position: leader near the front, others spread behind
-      // Use modular positioning so cars spread around the whole track
-      const gapFraction = car.gap_to_leader / Math.max(maxGap * 1.5, 30);
-      const t = ((1 - gapFraction) * 0.95 + 0.05) % 1.0;
+      const globalIdx = carsRef.current.findIndex((c) => c.car_id === car.car_id);
+      const color = getCarColor(globalIdx);
+      const compColor = getCompoundColor(car.compound);
 
-      const target = getPointOnPath(pathEl, t);
+      // Map gap to track fraction
+      const gapFrac = car.gap_to_leader / Math.max(maxGap * 1.5, 30);
+      const targetT = ((1 - gapFrac) * 0.95 + 0.02) % 1.0;
+
+      const target = getPointAtFraction(trackPath, targetT);
       const prev = prevPositions.current[car.car_id];
 
-      // Smooth interpolation for animation
-      const lerp = 0.3;
-      const x = prev ? prev.x + (target.x - prev.x) * lerp : target.x;
-      const y = prev ? prev.y + (target.y - prev.y) * lerp : target.y;
+      // Smooth interpolation
+      const lerp = 0.18;
+      let x: number, y: number, angle: number;
+      if (prev) {
+        x = prev.x + (target.x - prev.x) * lerp;
+        y = prev.y + (target.y - prev.y) * lerp;
+        // Angle interpolation (handle wrap-around)
+        let da = target.angle - prev.angle;
+        if (da > Math.PI) da -= 2 * Math.PI;
+        if (da < -Math.PI) da += 2 * Math.PI;
+        angle = prev.angle + da * lerp;
+      } else {
+        x = target.x;
+        y = target.y;
+        angle = target.angle;
+      }
+      prevPositions.current[car.car_id] = { x, y, angle };
 
-      prevPositions.current[car.car_id] = { x, y };
+      const cx = tx(x);
+      const cy = ty(y);
+      const carScale = scale * 1.1;
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(angle);
+
+      // Car shadow
+      ctx.beginPath();
+      ctx.moveTo(CAR_BODY[0][0] * carScale, CAR_BODY[0][1] * carScale);
+      for (let i = 1; i < CAR_BODY.length; i++) {
+        ctx.lineTo(CAR_BODY[i][0] * carScale, CAR_BODY[i][1] * carScale);
+      }
+      ctx.closePath();
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.fill();
+
+      // Front wing
+      ctx.beginPath();
+      ctx.moveTo(FRONT_WING[0][0] * carScale, FRONT_WING[0][1] * carScale);
+      for (let i = 1; i < FRONT_WING.length; i++) {
+        ctx.lineTo(FRONT_WING[i][0] * carScale, FRONT_WING[i][1] * carScale);
+      }
+      ctx.closePath();
+      ctx.fillStyle = "#333";
+      ctx.fill();
+
+      // Rear wing
+      ctx.beginPath();
+      ctx.moveTo(REAR_WING[0][0] * carScale, REAR_WING[0][1] * carScale);
+      for (let i = 1; i < REAR_WING.length; i++) {
+        ctx.lineTo(REAR_WING[i][0] * carScale, REAR_WING[i][1] * carScale);
+      }
+      ctx.closePath();
+      ctx.fillStyle = "#444";
+      ctx.fill();
+
+      // Car body (team color)
+      ctx.beginPath();
+      ctx.moveTo(CAR_BODY[0][0] * carScale, CAR_BODY[0][1] * carScale);
+      for (let i = 1; i < CAR_BODY.length; i++) {
+        ctx.lineTo(CAR_BODY[i][0] * carScale, CAR_BODY[i][1] * carScale);
+      }
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+
+      // Cockpit (dark ellipse)
+      ctx.beginPath();
+      ctx.ellipse(1 * carScale, 0, 2 * carScale, 1.5 * carScale, 0, 0, Math.PI * 2);
+      ctx.fillStyle = "#111";
+      ctx.fill();
+
+      // Compound dot (on the nose)
+      ctx.beginPath();
+      ctx.arc(5 * carScale, 0, 1.5 * carScale, 0, Math.PI * 2);
+      ctx.fillStyle = compColor;
+      ctx.fill();
+
+      ctx.restore();
+
+      // Position number label (above car)
+      ctx.fillStyle = "#ccc";
+      ctx.font = `${Math.max(8, 9 * scale)}px Inter, system-ui, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(`P${car.position}`, cx, cy - 10 * scale);
+
+      // Car ID label (below car)
+      ctx.fillStyle = "#666";
+      ctx.font = `${Math.max(6, 7 * scale)}px Inter, system-ui, sans-serif`;
+      ctx.textBaseline = "top";
+      ctx.fillText(car.car_id, cx, cy + 10 * scale);
     });
-  }, [activeCars, path]);
 
-  // Get positions for rendering (use refs for smoothing)
-  function getCarPosition(car: CarState, idx: number): { x: number; y: number } {
-    if (prevPositions.current[car.car_id]) {
-      return prevPositions.current[car.car_id];
+    // ── Safety Car overlay ──
+    if (sc) {
+      ctx.fillStyle = "rgba(234,179,8,0.08)";
+      ctx.fillRect(W * 0.3, H * 0.42, W * 0.4, H * 0.12);
+      ctx.strokeStyle = "rgba(234,179,8,0.3)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(W * 0.3, H * 0.42, W * 0.4, H * 0.12);
+      ctx.fillStyle = "#eab308";
+      ctx.font = `bold ${14 * scale}px Inter, system-ui, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.letterSpacing = "2px";
+      ctx.fillText("SAFETY CAR", W / 2, H * 0.48);
     }
-    // Fallback: distribute evenly
-    if (!pathRef.current) {
-      const t = idx / (activeCars.length || 1);
-      const angle = t * Math.PI * 2 - Math.PI / 2;
-      return { x: 160 + 100 * Math.cos(angle), y: 150 + 100 * Math.sin(angle) };
-    }
-    const t = idx / (activeCars.length || 1);
-    return getPointOnPath(pathRef.current, t);
-  }
+
+    // ── Track name watermark ──
+    const def = TRACK_DEFS[propsRef.current.trackName] || TRACK_DEFS.bahrain;
+    ctx.fillStyle = "rgba(255,255,255,0.04)";
+    ctx.font = `bold ${12 * scale}px Inter, system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(def.displayName.toUpperCase(), W / 2, H - 8 * scale);
+  }, []);
+
+  // Animation loop
+  useEffect(() => {
+    let running = true;
+
+    const loop = () => {
+      if (!running) return;
+      draw();
+      animFrameRef.current = requestAnimationFrame(loop);
+    };
+
+    loop();
+
+    return () => {
+      running = false;
+      cancelAnimationFrame(animFrameRef.current);
+    };
+  }, [draw]);
 
   return (
-    <div className="card p-4 relative overflow-hidden">
-      {safetyCar && (
-        <div className="absolute inset-0 bg-gradient-radial from-yellow-500/5 to-transparent pointer-events-none" />
-      )}
-
-      <svg viewBox="0 0 320 300" className="w-full h-auto">
-        {/* Track glow */}
-        <path
-          d={path}
-          fill="none"
-          stroke={trackColor}
-          strokeWidth={18}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          opacity={0.2}
-        />
-        {/* Track surface */}
-        <path
-          d={path}
-          fill="none"
-          stroke={trackColor}
-          strokeWidth={12}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          opacity={0.5}
-        />
-        {/* Track center */}
-        <path
-          ref={pathRef}
-          d={path}
-          fill="none"
-          stroke="#161616"
-          strokeWidth={7}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-        {/* Track edge marking */}
-        <path
-          d={path}
-          fill="none"
-          stroke={safetyCar ? "#eab308" : "#333"}
-          strokeWidth={1}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeDasharray={safetyCar ? "4 3" : "none"}
-          opacity={0.6}
-        />
-
-        {/* Start/Finish line */}
-        {pathRef.current && (() => {
-          const pt = getPointOnPath(pathRef.current, 0);
-          return (
-            <line
-              x1={pt.x - 8} y1={pt.y - 8}
-              x2={pt.x + 8} y2={pt.y + 8}
-              stroke="#e10600"
-              strokeWidth={2}
-              opacity={0.6}
-            />
-          );
-        })()}
-
-        {/* Cars */}
-        <g ref={carsRef}>
-          {activeCars.map((car, idx) => {
-            const pos = getCarPosition(car, idx);
-            const carColor = getCarColor(cars.findIndex((c) => c.car_id === car.car_id));
-            const compColor = getCompoundColor(car.compound);
-
-            return (
-              <g key={car.car_id} style={{ transition: "transform 0.3s ease-out" }}>
-                {/* Glow */}
-                <circle cx={pos.x} cy={pos.y} r={12} fill={carColor} opacity={0.1} />
-                {/* Compound ring */}
-                <circle cx={pos.x} cy={pos.y} r={7} fill="none" stroke={compColor} strokeWidth={2} />
-                {/* Car body */}
-                <circle cx={pos.x} cy={pos.y} r={5.5} fill={carColor} />
-                {/* Position number */}
-                <text
-                  x={pos.x} y={pos.y + 2}
-                  textAnchor="middle"
-                  fill="#000"
-                  fontSize="6"
-                  fontFamily="Inter, sans-serif"
-                  fontWeight="900"
-                >
-                  {car.position}
-                </text>
-                {/* Car ID label */}
-                <text
-                  x={pos.x} y={pos.y - 12}
-                  textAnchor="middle"
-                  fill="#888"
-                  fontSize="6"
-                  fontFamily="Inter, sans-serif"
-                  fontWeight="600"
-                >
-                  {car.car_id}
-                </text>
-              </g>
-            );
-          })}
-        </g>
-
-        {/* SC overlay */}
-        {safetyCar && (
-          <g>
-            <rect x="110" y="135" width="100" height="26" rx="5" fill="#eab308" opacity={0.12} />
-            <text x="160" y="153" textAnchor="middle" fill="#eab308"
-                  fontSize="10" fontFamily="Inter, sans-serif" fontWeight="800" letterSpacing="0.12em">
-              SAFETY CAR
-            </text>
-          </g>
-        )}
-
-        {/* Track name watermark */}
-        <text x="160" y="290" textAnchor="middle" fill="#1a1a1a"
-              fontSize="8" fontFamily="Inter, sans-serif" fontWeight="700" letterSpacing="0.2em">
-          {trackName.toUpperCase()}
-        </text>
-      </svg>
+    <div className="card overflow-hidden relative">
+      <canvas
+        ref={canvasRef}
+        className="w-full"
+        style={{ aspectRatio: "800 / 520" }}
+      />
     </div>
   );
 }
