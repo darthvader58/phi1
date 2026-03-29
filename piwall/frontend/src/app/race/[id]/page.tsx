@@ -354,7 +354,11 @@ export default function RacePage() {
               <span className="section-label">Race Complete</span>
             </div>
             <div className="p-5 space-y-1">
-              {result.standings.map((car, idx) => (
+              {[...result.standings].sort((a, b) => {
+                if (a.retired && !b.retired) return 1;
+                if (!a.retired && b.retired) return -1;
+                return a.position - b.position;
+              }).map((car, idx) => (
                 <div key={car.car_id}
                      className={`flex items-center gap-4 text-sm px-3 py-2.5 rounded-lg
                                 ${idx === 0 ? "bg-f1-red/5" : "hover:bg-white/[0.02]"} transition-colors`}>

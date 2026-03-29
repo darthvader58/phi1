@@ -32,13 +32,20 @@ export default function GapChart({ lapHistory, width = 600, height = 220 }: Prop
     const plotW = width - padding.left - padding.right;
     const plotH = height - padding.top - padding.bottom;
 
-    const carIds = lapHistory[0].cars
-      .filter((c) => !c.retired)
-      .map((c) => c.car_id);
+    // Collect all car IDs that appear in the race
+    const allCarIds = Array.from(
+      new Set(lapHistory.flatMap((snap) => snap.cars.map((c) => c.car_id)))
+    );
 
     const maxLap = lapHistory[lapHistory.length - 1].lap;
     const gapData: Record<string, { lap: number; gap: number }[]> = {};
-    for (const id of carIds) gapData[id] = [];
+    for (const id of allCarIds) gapData[id] = [];
+
+    // Track which cars retired at any point
+    const lastSnap = lapHistory[lapHistory.length - 1];
+    const retiredCarIds = lastSnap.cars
+      .filter((c) => c.retired)
+      .map((c) => c.car_id);
 
     let maxGap = 5;
     for (const snap of lapHistory) {
@@ -49,6 +56,12 @@ export default function GapChart({ lapHistory, width = 600, height = 220 }: Prop
         }
       }
     }
+
+    // Remove cars that retired — they shouldn't appear in the chart
+    retiredCarIds.forEach((id) => { delete gapData[id]; });
+
+    // Only chart cars that have data and finished the race
+    const carIds = allCarIds.filter((id) => gapData[id] && gapData[id].length >= 2);
     maxGap = Math.ceil(maxGap / 5) * 5;
 
     const xScale = (lap: number) => padding.left + (lap / maxLap) * plotW;
@@ -79,11 +92,13 @@ export default function GapChart({ lapHistory, width = 600, height = 220 }: Prop
     }
 
     // Lines
-    carIds.forEach((id, idx) => {
+    carIds.forEach((id) => {
       const points = gapData[id];
       if (points.length < 2) return;
 
-      const color = getCarColor(idx);
+      // Use original car index for consistent colors
+      const origIdx = lapHistory[0].cars.findIndex((c) => c.car_id === id);
+      const color = getCarColor(origIdx >= 0 ? origIdx : 0);
 
       // Line
       ctx.strokeStyle = color;

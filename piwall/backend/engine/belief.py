@@ -19,6 +19,16 @@ COMPOUND_DEG_RATES = {
     "WET": 0.04,
 }
 
+# Compound base offsets (alpha): constant time penalty independent of tyre age
+# These must be subtracted from delta before inferring age
+COMPOUND_BASE_OFFSETS = {
+    "SOFT": 0.6,
+    "MEDIUM": 0.4,
+    "HARD": 0.3,
+    "INTERMEDIATE": 0.5,
+    "WET": 0.4,
+}
+
 # Weather correction: wet laps are naturally slower, don't confuse with tyre deg
 WEATHER_LAP_CORRECTION = {
     "dry": 0.0,
@@ -115,14 +125,21 @@ class BeliefModel:
             self._update_pit_probability(belief)
             return
 
-        # Weather-corrected delta
+        # Weather-corrected delta (fuel should already be included in expected_fresh_pace)
         weather_correction = WEATHER_LAP_CORRECTION.get(weather, 0.0)
         delta = observed_lap_time - expected_fresh_pace - weather_correction
 
         if delta > 0:
+            # Subtract compound base offset (alpha) — it's constant, not age-dependent
+            base_offset = COMPOUND_BASE_OFFSETS.get(belief.estimated_compound, 0.4)
+            age_delta = max(0, delta - base_offset)
+
             # Use compound-specific deg rate for more accurate age inference
             deg_rate = COMPOUND_DEG_RATES.get(belief.estimated_compound, 0.065)
-            implied_age = delta / max(deg_rate, 0.02)
+            implied_age = age_delta / max(deg_rate, 0.02)
+            # Cap implied age to avoid runaway from noisy observations
+            typical = self.typical_stints.get(belief.estimated_compound, 20)
+            implied_age = min(implied_age, typical * 2.5)
 
             # Bayesian blend with adaptive learning rate
             # More observations → trust observations more

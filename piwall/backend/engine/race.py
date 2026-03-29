@@ -190,8 +190,12 @@ class RaceEngine:
             car.position = pos
             car.gap_to_leader = round(car.total_time - leader_time, 3)
 
-        # Retired cars get positions after active
-        retired = [c for c in self.cars if c.retired]
+        # Retired cars get positions after active, ordered by total_time (more = retired later = better)
+        retired = sorted(
+            [c for c in self.cars if c.retired],
+            key=lambda c: c.total_time,
+            reverse=True,
+        )
         for i, car in enumerate(retired):
             car.position = len(active) + i + 1
 
@@ -292,12 +296,16 @@ class RaceEngine:
                     continue
                 # Check if rival just pitted
                 rival_pitted = lap in rival.pit_laps
-                # Expected fresh pace
+                # Expected fresh pace — must include fuel effect to isolate tyre deg
                 best_model = None
                 for m in self.track.tyre_models.values():
                     if best_model is None or m.base_lap_time < best_model.base_lap_time:
                         best_model = m
-                expected_fresh = best_model.base_lap_time if best_model else 90.0
+                base_fresh = best_model.base_lap_time if best_model else 90.0
+                # Add current fuel penalty so delta reflects tyre deg only
+                fuel_kg = max(0, self.track.fuel_load_kg - (lap - 1) * self.track.fuel_per_lap)
+                fuel_penalty = 0.032 * fuel_kg
+                expected_fresh = base_fresh + fuel_penalty
 
                 bm.update(
                     rival_id=rival.car_id,
