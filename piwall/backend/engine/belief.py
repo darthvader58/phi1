@@ -53,7 +53,8 @@ class RivalBelief:
         self.estimated_tyre_age = 0.0
         self.estimated_compound = compound
         self.pit_probability_next_5_laps = 0.0
-        self.confidence = 0.95
+        # After a pit: we know the compound but haven't observed pace yet
+        self.confidence = 0.4
         self.estimated_deg_rate = COMPOUND_DEG_RATES.get(compound, 0.065)
         self.undercut_viable = False
         self.undercut_gain = 0.0
@@ -129,7 +130,9 @@ class BeliefModel:
             belief.estimated_tyre_age = (
                 (1 - alpha) * belief.estimated_tyre_age + alpha * implied_age
             )
-            belief.confidence = min(0.95, belief.confidence + 0.015)
+            # Confidence grows faster early, slows as it approaches cap
+            gain = 0.04 / (1.0 + belief.observation_count * 0.1)
+            belief.confidence = min(0.98, belief.confidence + gain)
 
             # Track delta for compound identification
             history = self._delta_history.setdefault(rival_id, [])
@@ -150,7 +153,7 @@ class BeliefModel:
                 self._infer_compound(belief)
         else:
             # Faster than expected — maybe fresher tyres than estimated
-            belief.confidence = max(0.1, belief.confidence - 0.03)
+            belief.confidence = max(0.1, belief.confidence - 0.05)
 
         # Update pit probability
         self._update_pit_probability(belief)
