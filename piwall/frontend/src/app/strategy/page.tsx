@@ -128,7 +128,7 @@ export default function StrategyPage() {
                       {car.retired ? "DNF" : `+${car.gap_to_leader.toFixed(1)}s`}
                     </span>
                     <span className="text-pit-muted text-[10px] ml-auto">
-                      {car.pit_count}s
+                      {car.pit_count} stop{car.pit_count !== 1 ? "s" : ""}
                     </span>
                   </div>
                 ))}
