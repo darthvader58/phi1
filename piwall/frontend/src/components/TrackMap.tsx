@@ -110,7 +110,7 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
     }
     ctx.closePath();
     ctx.strokeStyle = sc ? "rgba(234,179,8,0.12)" : wx === "wet" ? "rgba(30,64,175,0.15)" : "rgba(50,50,60,0.2)";
-    ctx.lineWidth = 22 * scale;
+    ctx.lineWidth = 36 * scale;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.stroke();
@@ -123,7 +123,7 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
     }
     ctx.closePath();
     ctx.strokeStyle = sc ? "#3d3520" : wx === "wet" ? "#1a2540" : "#2a2a2e";
-    ctx.lineWidth = 14 * scale;
+    ctx.lineWidth = 24 * scale;
     ctx.stroke();
 
     // ── Racing line (center stripe) ──
@@ -134,7 +134,7 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
     }
     ctx.closePath();
     ctx.strokeStyle = sc ? "#4a4020" : "#1e1e22";
-    ctx.lineWidth = 8 * scale;
+    ctx.lineWidth = 14 * scale;
     ctx.stroke();
 
     // ── Track edge markings ──
@@ -151,14 +151,14 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
       ctx.strokeStyle = "rgba(255,255,255,0.06)";
       ctx.setLineDash([]);
     }
-    ctx.lineWidth = 1 * scale;
+    ctx.lineWidth = 1.5 * scale;
     ctx.stroke();
     ctx.setLineDash([]);
 
     // ── Start/Finish line ──
     const sfPoint = getPointAtFraction(trackPath, 0);
     const sfAngle = sfPoint.angle + Math.PI / 2;
-    const sfLen = 9 * scale;
+    const sfLen = 15 * scale;
     ctx.beginPath();
     ctx.moveTo(
       tx(sfPoint.x) - Math.cos(sfAngle) * sfLen,
@@ -208,7 +208,7 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
 
       const cx = tx(x);
       const cy = ty(y);
-      const carScale = scale * 1.1;
+      const carScale = scale * 1.5;
 
       ctx.save();
       ctx.translate(cx, cy);
@@ -329,7 +329,7 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
       <canvas
         ref={canvasRef}
         className="w-full"
-        style={{ aspectRatio: "800 / 520" }}
+        style={{ aspectRatio: "16 / 9" }}
       />
     </div>
   );

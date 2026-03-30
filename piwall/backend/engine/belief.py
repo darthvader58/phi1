@@ -19,16 +19,6 @@ COMPOUND_DEG_RATES = {
     "WET": 0.04,
 }
 
-# Compound base offsets (alpha): constant time penalty independent of tyre age
-# These must be subtracted from delta before inferring age
-COMPOUND_BASE_OFFSETS = {
-    "SOFT": 0.6,
-    "MEDIUM": 0.4,
-    "HARD": 0.3,
-    "INTERMEDIATE": 0.5,
-    "WET": 0.4,
-}
-
 # Weather correction: wet laps are naturally slower, don't confuse with tyre deg
 WEATHER_LAP_CORRECTION = {
     "dry": 0.0,
@@ -63,7 +53,6 @@ class RivalBelief:
         self.estimated_tyre_age = 0.0
         self.estimated_compound = compound
         self.pit_probability_next_5_laps = 0.0
-        # After a pit: we know the compound but haven't observed pace yet
         self.confidence = 0.4
         self.estimated_deg_rate = COMPOUND_DEG_RATES.get(compound, 0.065)
         self.undercut_viable = False
@@ -98,17 +87,7 @@ class BeliefModel:
         weather: str = "dry",
         safety_car: bool = False,
     ):
-        """Update beliefs about a rival based on observed lap time.
-
-        Args:
-            rival_id: The rival car ID
-            observed_lap_time: Their observed lap time this lap
-            expected_fresh_pace: Expected lap time on fresh tyres
-            rival_pitted: Whether they pitted this lap
-            pit_compound: If they pitted, what compound they took
-            weather: Current weather condition
-            safety_car: Whether safety car is out
-        """
+        """Update beliefs about a rival based on observed lap time."""
         belief = self.get_belief(rival_id)
 
         if rival_pitted and pit_compound:
@@ -116,7 +95,7 @@ class BeliefModel:
             self._delta_history[rival_id] = []
             return
 
-        # Increment estimated tyre age
+        # Age is purely a counter — increment each lap, reset on pit
         belief.estimated_tyre_age += 1.0
         belief.observation_count += 1
 
@@ -125,72 +104,79 @@ class BeliefModel:
             self._update_pit_probability(belief)
             return
 
-        # Weather-corrected delta (fuel should already be included in expected_fresh_pace)
+        # Weather-corrected delta (fuel already included in expected_fresh_pace)
         weather_correction = WEATHER_LAP_CORRECTION.get(weather, 0.0)
         delta = observed_lap_time - expected_fresh_pace - weather_correction
 
         if delta > 0:
-            # Subtract compound base offset (alpha) — it's constant, not age-dependent
-            base_offset = COMPOUND_BASE_OFFSETS.get(belief.estimated_compound, 0.4)
-            age_delta = max(0, delta - base_offset)
-
-            # Use compound-specific deg rate for more accurate age inference
-            deg_rate = COMPOUND_DEG_RATES.get(belief.estimated_compound, 0.065)
-            implied_age = age_delta / max(deg_rate, 0.02)
-            # Cap implied age to avoid runaway from noisy observations
-            typical = self.typical_stints.get(belief.estimated_compound, 20)
-            implied_age = min(implied_age, typical * 2.5)
-
-            # Bayesian blend with adaptive learning rate
-            # More observations → trust observations more
-            alpha = min(0.5, 0.2 + belief.observation_count * 0.02)
-            belief.estimated_tyre_age = (
-                (1 - alpha) * belief.estimated_tyre_age + alpha * implied_age
-            )
-            # Confidence grows faster early, slows as it approaches cap
-            gain = 0.04 / (1.0 + belief.observation_count * 0.1)
-            belief.confidence = min(0.98, belief.confidence + gain)
-
             # Track delta for compound identification
             history = self._delta_history.setdefault(rival_id, [])
             history.append(delta)
 
-            # Update estimated degradation rate from recent observations
-            if len(history) >= 3:
-                recent = history[-5:]
-                # Degradation rate ≈ how much delta increases per lap
-                if len(recent) >= 2:
-                    slope = (recent[-1] - recent[0]) / max(len(recent) - 1, 1)
-                    # Blend with compound prior
-                    belief.estimated_deg_rate = (
-                        0.7 * belief.estimated_deg_rate + 0.3 * max(0.01, slope)
-                    )
+            # Infer compound from degradation trend (need 5+ observations)
+            if len(history) >= 5:
+                self._infer_compound_from_trend(belief, history)
 
-                # Compound inference from deg rate
-                self._infer_compound(belief)
+            # Confidence grows with observations
+            gain = 0.04 / (1.0 + belief.observation_count * 0.1)
+            belief.confidence = min(0.98, belief.confidence + gain)
         else:
-            # Faster than expected — maybe fresher tyres than estimated
-            belief.confidence = max(0.1, belief.confidence - 0.05)
+            # Faster than expected — could indicate a pit we missed
+            # If consistently faster, reduce confidence
+            belief.confidence = max(0.1, belief.confidence - 0.03)
+
+            # Sudden large improvement may indicate undetected pit stop
+            if delta < -1.5 and belief.estimated_tyre_age > 5:
+                belief.estimated_tyre_age = 1.0
+                belief.confidence = 0.3
+                self._delta_history[rival_id] = []
 
         # Update pit probability
         self._update_pit_probability(belief)
 
-    def _infer_compound(self, belief: RivalBelief):
-        """Infer likely compound from observed degradation rate."""
+    def _infer_compound_from_trend(self, belief: RivalBelief, history: List[float]):
+        """Infer compound from the per-lap increase in lap time delta.
+
+        COMPOUND_DEG_RATES represent how much the delta grows per lap.
+        SOFT degrades ~0.10s more each lap, MEDIUM ~0.065s, HARD ~0.045s.
+        We measure the actual per-lap increase and match to the closest compound.
+        """
+        if len(history) < 5:
+            return
+
+        # Calculate per-lap delta differences (how much worse each lap vs previous)
+        recent = history[-10:]
+        if len(recent) < 3:
+            return
+
+        lap_diffs = [recent[i] - recent[i - 1] for i in range(1, len(recent))]
+
+        # Median filter to reduce noise from DRS/traffic/etc
+        lap_diffs_sorted = sorted(lap_diffs)
+        n = len(lap_diffs_sorted)
+        median_diff = lap_diffs_sorted[n // 2] if n % 2 == 1 else (
+            lap_diffs_sorted[n // 2 - 1] + lap_diffs_sorted[n // 2]) / 2
+
+        # Clamp to reasonable range (negative means improving, cap at 0)
+        effective_rate = max(0.01, min(0.20, median_diff))
+
+        # Blend with prior
+        belief.estimated_deg_rate = 0.6 * belief.estimated_deg_rate + 0.4 * effective_rate
+
+        # Match deg rate to closest compound
         rate = belief.estimated_deg_rate
         best_compound = belief.estimated_compound
         best_diff = float("inf")
 
         for compound, expected_rate in COMPOUND_DEG_RATES.items():
             if compound in ("INTERMEDIATE", "WET"):
-                continue  # Skip wet compounds for dry-weather inference
+                continue
             diff = abs(rate - expected_rate)
             if diff < best_diff:
                 best_diff = diff
                 best_compound = compound
 
-        # Only update if confident enough
-        if belief.confidence > 0.4:
+        if belief.confidence > 0.5:
             belief.estimated_compound = best_compound
 
     def _update_pit_probability(self, belief: RivalBelief):

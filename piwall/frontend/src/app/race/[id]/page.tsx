@@ -282,6 +282,16 @@ export default function RacePage() {
         </div>
       </div>
 
+      {/* Track map — full width for maximum visual impact */}
+      {cars.length > 0 && (
+        <TrackMap
+          cars={cars}
+          trackName={trackName}
+          weather={weather}
+          safetyCar={safetyCar}
+        />
+      )}
+
       {/* Main grid - responsive */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
         {/* Leaderboard */}
@@ -294,17 +304,8 @@ export default function RacePage() {
           )}
         </div>
 
-        {/* Center: Track + Charts */}
+        {/* Center: Charts */}
         <div className="lg:col-span-5 space-y-4">
-          {cars.length > 0 && (
-            <TrackMap
-              cars={cars}
-              trackName={trackName}
-              weather={weather}
-              safetyCar={safetyCar}
-            />
-          )}
-
           {/* Chart tabs */}
           {allLapData.length > 1 && (
             <div>

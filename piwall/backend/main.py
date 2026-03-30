@@ -800,8 +800,8 @@ async def _run_race(race_id: str):
             {"lap": e.lap, "type": e.event_type, "car_id": e.car_id, "detail": e.detail}
         )
 
-    # Broadcast each lap with minimal delay
-    # Speed: 1x = 0.5s/lap, 5x = 0.1s/lap, 20x = 0.025s/lap
+    # Broadcast each lap with pacing for an enjoyable viewing experience
+    # Speed: 1x = 3.75s/lap, 5x = 0.75s/lap, 20x = 0.1875s/lap
     for lap_snapshot in result.lap_data:
         lap_num = lap_snapshot["lap"]
 
@@ -815,8 +815,8 @@ async def _run_race(race_id: str):
         lobby.current_state = state_msg
         await _broadcast(lobby, state_msg)
 
-        # Tight delay: aim for smooth real-time feel
-        delay = max(0.02, 0.5 / lobby.speed)
+        # Watchable pacing: 7.5x slower than original
+        delay = max(0.05, 3.75 / lobby.speed)
         await asyncio.sleep(delay)
 
     # Race finished
