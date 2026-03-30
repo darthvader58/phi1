@@ -40,7 +40,9 @@ export default function Leaderboard({ cars, highlightCarId, previousPositions }:
         {sorted.map((car, idx) => {
           const isHighlight = car.car_id === highlightCarId;
           const compoundColor = getCompoundColor(car.compound);
-          const carColor = getCarColor(idx);
+          // Use original array index for stable colors (not sorted position)
+          const origIdx = cars.findIndex((c) => c.car_id === car.car_id);
+          const carColor = getCarColor(origIdx >= 0 ? origIdx : idx);
 
           // Position delta
           const prevPos = previousPositions?.[car.car_id];

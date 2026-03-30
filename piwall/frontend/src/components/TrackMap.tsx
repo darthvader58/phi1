@@ -14,6 +14,7 @@ interface Props {
   trackName: string;
   weather: string;
   safetyCar: boolean;
+  raceFinished?: boolean;
 }
 
 // ─── F1 car polygon (top-down, pointing RIGHT at angle=0) ─────────
@@ -51,13 +52,13 @@ interface CarAnimState {
   initialized: boolean;
 }
 
-export default function TrackMap({ cars, trackName, weather, safetyCar }: Props) {
+export default function TrackMap({ cars, trackName, weather, safetyCar, raceFinished }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const trackPathRef = useRef<TrackPath | null>(null);
   const animFrameRef = useRef<number>(0);
   const lastFrameRef = useRef<number>(0);
   const carsRef = useRef<CarState[]>(cars);
-  const propsRef = useRef({ weather, safetyCar, trackName });
+  const propsRef = useRef({ weather, safetyCar, trackName, raceFinished });
 
   // Animation state per car — persists across renders
   const carAnimRef = useRef<Record<string, CarAnimState>>({});
@@ -65,7 +66,7 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
   const leaderTRef = useRef<number>(0);
 
   carsRef.current = cars;
-  propsRef.current = { weather, safetyCar, trackName };
+  propsRef.current = { weather, safetyCar, trackName, raceFinished };
 
   // Update target gaps when car data changes
   useEffect(() => {
@@ -139,9 +140,12 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
     // Base speed: ~1 lap every 3 seconds for smooth visual motion
     const baseSpeed = 0.33; // track fraction per second
     const scSpeed = sc ? 0.20 : baseSpeed; // slower under safety car
+    const finished = propsRef.current.raceFinished;
 
-    // Advance leader position
-    leaderTRef.current = (leaderTRef.current + scSpeed * dt) % 1.0;
+    // Advance leader position (freeze when race is done)
+    if (!finished) {
+      leaderTRef.current = (leaderTRef.current + scSpeed * dt) % 1.0;
+    }
     const leaderT = leaderTRef.current;
 
     // Update each car's position

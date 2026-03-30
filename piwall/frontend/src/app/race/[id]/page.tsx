@@ -289,6 +289,7 @@ export default function RacePage() {
           trackName={trackName}
           weather={weather}
           safetyCar={safetyCar}
+          raceFinished={status === "finished"}
         />
       )}
 
