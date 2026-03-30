@@ -815,8 +815,8 @@ async def _run_race(race_id: str):
         lobby.current_state = state_msg
         await _broadcast(lobby, state_msg)
 
-        # Watchable pacing: 7.5x slower than original
-        delay = max(0.05, 3.75 / lobby.speed)
+        # Cinematic pacing: ~11s per lap at 1x, ~2.2s at 5x, ~0.55s at 20x
+        delay = max(0.05, 11.0 / lobby.speed)
         await asyncio.sleep(delay)
 
     # Race finished
