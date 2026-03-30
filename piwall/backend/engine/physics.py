@@ -32,8 +32,8 @@ TRAFFIC_PENALTY = 0.3  # seconds per lap
 DRS_GAIN_PER_ZONE = 0.22  # seconds per DRS zone
 
 # DNF probability per lap per car
-DNF_PROB_DRY = 0.004
-DNF_PROB_WET = 0.006
+DNF_PROB_DRY = 0.001
+DNF_PROB_WET = 0.002
 
 # Safety car field compression factor
 SC_GAP_COMPRESSION = 0.82
