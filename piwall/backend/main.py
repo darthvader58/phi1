@@ -132,7 +132,7 @@ class SubmitBotRequest(BaseModel):
 class TestBotRequest(BaseModel):
     code: str
     track: str = "bahrain"
-    laps: int = 20
+    laps: int = 0  # 0 = use full race distance
 
 class CreateSeasonRequest(BaseModel):
     name: str
@@ -419,8 +419,8 @@ def test_bot(req: TestBotRequest, x_api_key: str = Header()):
     track = build_track_physics(req.track)
     track_cfg = TRACKS[req.track]
 
-    # Override total laps for quick test
-    track.total_laps = min(req.laps, track_cfg.total_laps)
+    # Override total laps for quick test (0 = full race distance)
+    track.total_laps = track_cfg.total_laps if req.laps <= 0 else min(req.laps, track_cfg.total_laps)
 
     engine = RaceEngine(
         track=track,

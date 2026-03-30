@@ -70,7 +70,7 @@ export const api = {
 
   // Strategy
   getTemplate: () => apiFetch("/api/strategy/template"),
-  testBot: (code: string, track = "bahrain", laps = 20) =>
+  testBot: (code: string, track = "bahrain", laps = 0) =>
     apiFetch("/api/test-bot", {
       method: "POST",
       body: JSON.stringify({ code, track, laps }),

@@ -23,7 +23,7 @@ export default function StrategyPage() {
     setTestResult(null);
     setMessage("");
     try {
-      const result = await api.testBot(code, testTrack, 20);
+      const result = await api.testBot(code, testTrack);
       setTestResult(result);
     } catch (err: any) {
       setMessage(`Test error: ${err.message}`);
@@ -36,7 +36,7 @@ export default function StrategyPage() {
     setSubmitting(true);
     setMessage("");
     try {
-      const result = await api.testBot(code, testTrack, 10);
+      const result = await api.testBot(code, testTrack);
       setMessage("Strategy validated successfully! Join a race to use it.");
       setTestResult(result);
       toast("Strategy validated!", "success");
