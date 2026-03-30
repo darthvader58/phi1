@@ -41,14 +41,14 @@ SC_GAP_COMPRESSION = 0.82
 # Tyre cliff: degradation accelerates past typical compound life
 # cliff_age = lap count where cliff begins for each compound
 TYRE_CLIFF_AGE = {
-    "SOFT": 18,
-    "MEDIUM": 28,
-    "HARD": 38,
-    "INTERMEDIATE": 35,
-    "WET": 30,
+    "SOFT": 14,
+    "MEDIUM": 22,
+    "HARD": 34,
+    "INTERMEDIATE": 30,
+    "WET": 25,
 }
-CLIFF_RATE = 0.02       # Base cliff penalty coefficient
-CLIFF_EXPONENT = 1.6    # How aggressively degradation ramps past cliff
+CLIFF_RATE = 0.025      # Base cliff penalty coefficient
+CLIFF_EXPONENT = 1.7    # How aggressively degradation ramps past cliff
 
 # Wet weather lap time penalties
 WEATHER_PENALTIES = {
