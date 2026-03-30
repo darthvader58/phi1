@@ -240,19 +240,41 @@ def my_strategy(state, my_car):
     """
     remaining = state.total_laps - state.lap
 
+    # Switch to intermediates in wet conditions
+    if state.weather == "wet" and my_car.compound in ("SOFT", "MEDIUM", "HARD"):
+        if my_car.tyre_age >= 3 and remaining > 5:
+            return {"pit": True, "compound": "INTERMEDIATE"}
+
+    # Switch back to slicks when dry
+    if state.weather == "dry" and my_car.compound == "INTERMEDIATE":
+        new_compound = "MEDIUM" if remaining > 15 else "SOFT"
+        return {"pit": True, "compound": new_compound}
+
+    # Free pit stop under safety car
+    if state.safety_car and my_car.tyre_age >= 10 and remaining > 5:
+        if remaining > 25:
+            new_compound = "HARD"
+        elif remaining > 15:
+            new_compound = "MEDIUM"
+        else:
+            new_compound = "SOFT"
+        return {"pit": True, "compound": new_compound}
+
     # Check for undercut opportunities using the belief system
     for rival in state.cars:
         if rival.car_id == my_car.car_id or rival.retired:
             continue
         belief = my_car.beliefs.get(rival.car_id, {})
-        if belief.get("undercut_viable") and belief.get("undercut_gain", 0) > 1.0:
-            if remaining > 10 and my_car.tyre_age > 8:
+        if belief.get("undercut_viable") and belief.get("undercut_gain", 0) > 2.0:
+            if remaining > 10 and my_car.tyre_age > 10 and my_car.pit_count < 2:
                 new_compound = "HARD" if remaining > 20 else "MEDIUM"
                 return {"pit": True, "compound": new_compound}
 
-    # Example: pit when tyre age > 20 and enough laps remain
-    if my_car.tyre_age > 20 and remaining > 5:
-        # Choose compound based on remaining distance
+    # Pit based on tyre degradation cliff zones
+    # SOFT cliff ~14 laps, MEDIUM cliff ~22 laps, HARD cliff ~34 laps
+    cliff_ages = {"SOFT": 14, "MEDIUM": 22, "HARD": 34}
+    cliff = cliff_ages.get(my_car.compound, 22)
+    if my_car.tyre_age >= cliff and remaining > 5:
         if remaining > 25:
             new_compound = "HARD"
         elif remaining > 15:
