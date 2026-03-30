@@ -171,24 +171,12 @@ export default function TrackMap({ cars, trackName, weather, safetyCar }: Props)
         anim.trackT = ((anim.trackT + speed * dt) % 1 + 1) % 1;
       }
 
-      // Get position on track
+      // Get position on track — directly from trackT, no XY lerp
+      // (XY lerp would cut corners and go off-track)
       const point = getPointAtFraction(trackPath, anim.trackT);
-
-      // Smooth render position (extra smoothing for visual polish)
-      const posLerp = 0.15;
-      if (anim.renderX === 0 && anim.renderY === 0) {
-        anim.renderX = point.x;
-        anim.renderY = point.y;
-        anim.renderAngle = point.angle;
-      } else {
-        anim.renderX += (point.x - anim.renderX) * posLerp;
-        anim.renderY += (point.y - anim.renderY) * posLerp;
-        // Angle with wrap-around
-        let da = point.angle - anim.renderAngle;
-        if (da > Math.PI) da -= 2 * Math.PI;
-        if (da < -Math.PI) da += 2 * Math.PI;
-        anim.renderAngle += da * posLerp;
-      }
+      anim.renderX = point.x;
+      anim.renderY = point.y;
+      anim.renderAngle = point.angle;
     });
 
     // ── Clear & Background ──
