@@ -38,6 +38,18 @@ DNF_PROB_WET = 0.006
 # Safety car field compression factor
 SC_GAP_COMPRESSION = 0.82
 
+# Tyre cliff: degradation accelerates past typical compound life
+# cliff_age = lap count where cliff begins for each compound
+TYRE_CLIFF_AGE = {
+    "SOFT": 18,
+    "MEDIUM": 28,
+    "HARD": 38,
+    "INTERMEDIATE": 35,
+    "WET": 30,
+}
+CLIFF_RATE = 0.02       # Base cliff penalty coefficient
+CLIFF_EXPONENT = 1.6    # How aggressively degradation ramps past cliff
+
 # Wet weather lap time penalties
 WEATHER_PENALTIES = {
     "dry": 0.0,
@@ -120,6 +132,12 @@ def compute_lap_time(
     else:
         delta_tyre = tyre_model.degradation(tyre_age)
         base = tyre_model.base_lap_time
+
+    # Tyre cliff: degradation accelerates past compound's expected life
+    cliff_age = TYRE_CLIFF_AGE.get(compound, 30)
+    if tyre_age > cliff_age:
+        over = tyre_age - cliff_age
+        delta_tyre += CLIFF_RATE * math.pow(over, CLIFF_EXPONENT)
 
     # Fuel effect: fuel decreases linearly over the race
     fuel_kg = max(0, track.fuel_load_kg - (lap_number - 1) * track.fuel_per_lap)
