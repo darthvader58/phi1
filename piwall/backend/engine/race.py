@@ -190,8 +190,12 @@ class RaceEngine:
             car.position = pos
             car.gap_to_leader = round(car.total_time - leader_time, 3)
 
-        # Retired cars get positions after active
-        retired = [c for c in self.cars if c.retired]
+        # Retired cars get positions after active, ordered by total_time (more = retired later = better)
+        retired = sorted(
+            [c for c in self.cars if c.retired],
+            key=lambda c: c.total_time,
+            reverse=True,
+        )
         for i, car in enumerate(retired):
             car.position = len(active) + i + 1
 
@@ -282,7 +286,7 @@ class RaceEngine:
         ))
 
     def _update_beliefs(self, lap: int):
-        """Update each car's beliefs about rivals."""
+        """Update each car's beliefs about rivals, including undercut opportunities."""
         for car in self.cars:
             if car.retired:
                 continue
@@ -292,12 +296,16 @@ class RaceEngine:
                     continue
                 # Check if rival just pitted
                 rival_pitted = lap in rival.pit_laps
-                # Expected fresh pace
+                # Expected fresh pace — must include fuel effect to isolate tyre deg
                 best_model = None
                 for m in self.track.tyre_models.values():
                     if best_model is None or m.base_lap_time < best_model.base_lap_time:
                         best_model = m
-                expected_fresh = best_model.base_lap_time if best_model else 90.0
+                base_fresh = best_model.base_lap_time if best_model else 90.0
+                # Add current fuel penalty so delta reflects tyre deg only
+                fuel_kg = max(0, self.track.fuel_load_kg - (lap - 1) * self.track.fuel_per_lap)
+                fuel_penalty = 0.032 * fuel_kg
+                expected_fresh = base_fresh + fuel_penalty
 
                 bm.update(
                     rival_id=rival.car_id,
@@ -305,7 +313,92 @@ class RaceEngine:
                     expected_fresh_pace=expected_fresh,
                     rival_pitted=rival_pitted,
                     pit_compound=rival.compound if rival_pitted else None,
+                    weather=self.weather.weather,
+                    safety_car=self.safety_car,
                 )
+
+            # Evaluate undercut opportunities against cars directly ahead
+            self._evaluate_undercuts(car, lap)
+
+    def _evaluate_undercuts(self, car: CarState, lap: int):
+        """Evaluate undercut opportunities for a car against nearby rivals."""
+        remaining = self.track.total_laps - lap
+        if remaining < 5 or car.tyre_age < 3:
+            return
+
+        bm = self.belief_models[car.car_id]
+        current_model = self.track.tyre_models.get(car.compound)
+        if not current_model:
+            return
+
+        # Find best fresh tyre model for undercut
+        best_fresh = None
+        best_fresh_name = "MEDIUM"
+        for name, model in self.track.tyre_models.items():
+            if name in ("INTERMEDIATE", "WET"):
+                continue
+            if best_fresh is None or model.base_lap_time < best_fresh.base_lap_time:
+                best_fresh = model
+                best_fresh_name = name
+
+        if not best_fresh:
+            return
+
+        for rival in self.cars:
+            if rival.car_id == car.car_id or rival.retired:
+                continue
+            # Only evaluate undercuts on cars ahead
+            if rival.position >= car.position:
+                continue
+
+            gap = car.total_time - rival.total_time
+            if gap <= 0 or gap > 30:
+                continue
+
+            belief = bm.get_belief(rival.car_id)
+
+            result = detect_undercut(
+                my_gap_to_rival=gap,
+                my_tyre=current_model,
+                my_tyre_age=car.tyre_age,
+                rival_estimated_tyre_age=belief.estimated_tyre_age,
+                rival_estimated_compound=belief.estimated_compound,
+                new_tyre=best_fresh,
+                pit_delta=self.track.pit_loss_seconds,
+                rival_id=rival.car_id,
+            )
+
+            bm.update_undercut_info(
+                rival_id=rival.car_id,
+                undercut_viable=result.is_viable,
+                undercut_gain=result.undercut_gain,
+            )
+
+            # Log undercut events for spectators
+            if result.is_viable and result.undercut_gain > 1.0:
+                self.events.append(RaceEvent(
+                    lap, "undercut", car.car_id,
+                    f"{car.car_id} undercut window on {rival.car_id} "
+                    f"(gain={result.undercut_gain:.1f}s, gap={gap:.1f}s)",
+                ))
+
+    def _summarize_beliefs(self, car_id: str) -> dict:
+        """Create a compact belief summary for WebSocket broadcast."""
+        bm = self.belief_models.get(car_id)
+        if not bm:
+            return {}
+        # Only include top undercut targets and rivals with high pit probability
+        summary = {}
+        for rival_id, belief in bm.beliefs.items():
+            summary[rival_id] = {
+                "age": round(belief.estimated_tyre_age, 1),
+                "compound": belief.estimated_compound,
+                "pit_prob": round(belief.pit_probability_next_5_laps, 2),
+                "confidence": round(belief.confidence, 2),
+                "undercut": belief.undercut_viable,
+                "uc_gain": belief.undercut_gain,
+            }
+        return summary
 
     def run(self, lap_callback: Optional[Callable[[RaceState], None]] = None) -> RaceResult:
         """Run the complete race.
@@ -405,7 +498,7 @@ class RaceEngine:
             # 10. Update beliefs
             self._update_beliefs(lap)
 
-            # 11. Snapshot lap data
+            # 11. Snapshot lap data (include belief summaries for frontend visualization)
             self.lap_data.append({
                 "lap": lap,
                 "weather": self.weather.weather,
@@ -422,6 +515,10 @@ class RaceEngine:
                         "total_time": round(c.total_time, 3),
                         "retired": c.retired,
                         "drs": c.drs_available,
+                        "pit_count": c.pit_count,
+                        "fuel_kg": round(c.fuel_kg, 1),
+                        "compounds_used": c.compounds_used,
+                        "beliefs": self._summarize_beliefs(c.car_id) if not c.retired else {},
                     }
                     for c in self.cars
                 ],

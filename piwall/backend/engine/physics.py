@@ -32,11 +32,23 @@ TRAFFIC_PENALTY = 0.3  # seconds per lap
 DRS_GAIN_PER_ZONE = 0.22  # seconds per DRS zone
 
 # DNF probability per lap per car
-DNF_PROB_DRY = 0.004
-DNF_PROB_WET = 0.006
+DNF_PROB_DRY = 0.001
+DNF_PROB_WET = 0.002
 
 # Safety car field compression factor
 SC_GAP_COMPRESSION = 0.82
+
+# Tyre cliff: degradation accelerates past typical compound life
+# cliff_age = lap count where cliff begins for each compound
+TYRE_CLIFF_AGE = {
+    "SOFT": 12,
+    "MEDIUM": 20,
+    "HARD": 30,
+    "INTERMEDIATE": 28,
+    "WET": 22,
+}
+CLIFF_RATE = 0.08       # Base cliff penalty coefficient
+CLIFF_EXPONENT = 1.7    # How aggressively degradation ramps past cliff
 
 # Wet weather lap time penalties
 WEATHER_PENALTIES = {
@@ -71,8 +83,13 @@ class TyreModel:
     base_lap_time: float
 
     def degradation(self, age: int) -> float:
-        """Calculate tyre degradation delta at given age."""
-        return self.alpha + self.k * math.pow(max(age, 1), self.e)
+        """Calculate tyre degradation delta at given age (includes cliff)."""
+        base_deg = self.alpha + self.k * math.pow(max(age, 1), self.e)
+        cliff_age = TYRE_CLIFF_AGE.get(self.compound, 30)
+        if age > cliff_age:
+            over = age - cliff_age
+            base_deg += CLIFF_RATE * math.pow(over, CLIFF_EXPONENT)
+        return base_deg
 
     def lap_time_tyre_only(self, age: int) -> float:
         """Base + tyre deg (no fuel, no weather)."""
@@ -118,7 +135,7 @@ def compute_lap_time(
         delta_tyre = 0.5 + 0.04 * tyre_age
         base = track.base_lap_time
     else:
-        delta_tyre = tyre_model.degradation(tyre_age)
+        delta_tyre = tyre_model.degradation(tyre_age)  # includes cliff
         base = tyre_model.base_lap_time
 
     # Fuel effect: fuel decreases linearly over the race

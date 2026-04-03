@@ -1,0 +1,287 @@
+"""Sandboxed bot executor for PIT WALL.
+
+Runs user-submitted Python strategy functions in a restricted environment:
+- No imports except math, random, dataclasses
+- 50ms CPU time limit
+- No file/network/system access
+- Returns a Decision object
+"""
+
+import math
+import random
+import signal
+import textwrap
+import traceback
+from dataclasses import dataclass
+from typing import Optional
+
+from RestrictedPython import compile_restricted, safe_globals
+from RestrictedPython.Eval import default_guarded_getattr
+from RestrictedPython.Guards import (
+    guarded_unpack_sequence,
+    safer_getattr,
+)
+
+
+# Re-export these so user code can reference them
+@dataclass
+class SandboxDecision:
+    pit: bool
+    compound: str
+
+
+# Allowed builtins for user code
+ALLOWED_BUILTINS = {
+    "abs": abs,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "float": float,
+    "int": int,
+    "len": len,
+    "list": list,
+    "max": max,
+    "min": min,
+    "print": lambda *a, **kw: None,  # Silenced print
+    "range": range,
+    "round": round,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "zip": zip,
+    "True": True,
+    "False": False,
+    "None": None,
+    "isinstance": isinstance,
+    "getattr": getattr,
+    "hasattr": hasattr,
+}
+
+# Timeout handler
+class TimeoutError(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError("Strategy function exceeded 50ms CPU time limit")
+
+
+def compile_strategy(code: str) -> Optional[str]:
+    """Compile and validate user strategy code.
+
+    Returns error message if compilation fails, None if successful.
+    """
+    # Wrap user code to ensure it defines my_strategy
+    try:
+        byte_code = compile_restricted(
+            code,
+            filename="<user_strategy>",
+            mode="exec",
+        )
+        if byte_code is None:
+            return "Compilation failed: RestrictedPython rejected the code"
+        return None
+    except SyntaxError as e:
+        return f"Syntax error: {e}"
+    except Exception as e:
+        return f"Compilation error: {e}"
+
+
+def execute_strategy(
+    code: str,
+    state_dict: dict,
+    my_car_dict: dict,
+    timeout_ms: int = 50,
+) -> dict:
+    """Execute a user strategy function in a sandboxed environment.
+
+    Args:
+        code: User's Python code (must define `my_strategy(state, my_car)`)
+        state_dict: Serialized RaceState as dict
+        my_car_dict: Serialized CarState as dict
+        timeout_ms: CPU time limit in milliseconds
+
+    Returns:
+        {"pit": bool, "compound": str} or {"error": str}
+    """
+    try:
+        byte_code = compile_restricted(
+            code,
+            filename="<user_strategy>",
+            mode="exec",
+        )
+        if byte_code is None:
+            return {"error": "Compilation failed"}
+    except Exception as e:
+        return {"error": f"Compilation error: {e}"}
+
+    # Build restricted globals
+    restricted_globals = safe_globals.copy()
+    restricted_globals["__builtins__"] = ALLOWED_BUILTINS
+    restricted_globals["_getattr_"] = safer_getattr
+    restricted_globals["_getiter_"] = iter
+    restricted_globals["_getitem_"] = lambda obj, key: obj[key]
+    restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
+    restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
+    restricted_globals["_iter_unpack_sequence_"] = guarded_unpack_sequence
+    restricted_globals["_write_"] = lambda x: x
+
+    # Inject math and random modules (safe)
+    restricted_globals["math"] = math
+    restricted_globals["random"] = random
+
+    # Make state and car available as simple namespace objects
+    class Namespace:
+        def __init__(self, d):
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    setattr(self, k, Namespace(v))
+                elif isinstance(v, list):
+                    setattr(self, k, [
+                        Namespace(item) if isinstance(item, dict) else item
+                        for item in v
+                    ])
+                else:
+                    setattr(self, k, v)
+
+        def __getitem__(self, key):
+            return getattr(self, key, None)
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    restricted_globals["state"] = Namespace(state_dict)
+    restricted_globals["my_car"] = Namespace(my_car_dict)
+
+    # Execute with timeout
+    restricted_locals = {}
+
+    # Set alarm for timeout (Unix only)
+    old_handler = None
+    try:
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        # Convert ms to microseconds for setitimer
+        signal.setitimer(signal.ITIMER_REAL, timeout_ms / 1000.0)
+    except (ValueError, AttributeError):
+        pass  # Signal not available (Windows, or not main thread)
+
+    try:
+        exec(byte_code, restricted_globals, restricted_locals)
+
+        # Find and call my_strategy
+        strategy_fn = restricted_locals.get("my_strategy")
+        if strategy_fn is None:
+            return {"error": "Code must define a function called 'my_strategy'"}
+
+        result = strategy_fn(
+            restricted_globals["state"],
+            restricted_globals["my_car"],
+        )
+
+        # Parse result
+        if isinstance(result, dict):
+            return {
+                "pit": bool(result.get("pit", False)),
+                "compound": str(result.get("compound", "MEDIUM")),
+            }
+        elif hasattr(result, "pit"):
+            return {
+                "pit": bool(result.pit),
+                "compound": str(getattr(result, "compound", "MEDIUM")),
+            }
+        else:
+            return {"error": f"my_strategy must return a dict with 'pit' and 'compound' keys"}
+
+    except TimeoutError:
+        return {"error": "Strategy exceeded 50ms CPU time limit"}
+    except Exception as e:
+        return {"error": f"Runtime error: {type(e).__name__}: {e}"}
+    finally:
+        # Cancel alarm
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            if old_handler is not None:
+                signal.signal(signal.SIGALRM, old_handler)
+        except (ValueError, AttributeError):
+            pass
+
+
+# Default user strategy template
+STRATEGY_TEMPLATE = '''\
+def my_strategy(state, my_car):
+    """Your strategy function.
+
+    Args:
+        state: RaceState with fields:
+            .lap (int), .total_laps (int), .track (str),
+            .weather (str: 'dry'|'damp'|'wet'|'drying'),
+            .safety_car (bool), .safety_car_laps_left (int),
+            .track_temp (float), .cars (list of CarState)
+
+        my_car: CarState with fields:
+            .car_id (str), .position (int), .gap_to_leader (float),
+            .compound (str), .tyre_age (int), .fuel_kg (float),
+            .pit_count (int), .pit_laps (list), .last_lap_time (float),
+            .total_time (float), .retired (bool), .drs_available (bool),
+            .compounds_used (list),
+            .beliefs (dict of rival_id -> belief):
+                .estimated_tyre_age (float) - Bayesian estimate of rival tyre laps
+                .estimated_compound (str) - Inferred compound from deg rate
+                .pit_probability_next_5_laps (float) - Logistic pit probability
+                .confidence (float) - Belief certainty (0-1)
+                .estimated_deg_rate (float) - Learned deg rate (s/lap)
+                .undercut_viable (bool) - Is undercut feasible?
+                .undercut_gain (float) - Estimated time gain from undercut
+                .optimal_pit_in (int) - Est. laps until rival pits
+
+    Returns:
+        dict with keys: pit (bool), compound (str)
+    """
+    remaining = state.total_laps - state.lap
+
+    # Switch to intermediates in wet conditions
+    if state.weather == "wet" and my_car.compound in ("SOFT", "MEDIUM", "HARD"):
+        if my_car.tyre_age >= 3 and remaining > 5:
+            return {"pit": True, "compound": "INTERMEDIATE"}
+
+    # Switch back to slicks when dry
+    if state.weather == "dry" and my_car.compound == "INTERMEDIATE":
+        new_compound = "MEDIUM" if remaining > 15 else "SOFT"
+        return {"pit": True, "compound": new_compound}
+
+    # Free pit stop under safety car
+    if state.safety_car and my_car.tyre_age >= 10 and remaining > 5:
+        if remaining > 25:
+            new_compound = "HARD"
+        elif remaining > 15:
+            new_compound = "MEDIUM"
+        else:
+            new_compound = "SOFT"
+        return {"pit": True, "compound": new_compound}
+
+    # Check for undercut opportunities using the belief system
+    for rival in state.cars:
+        if rival.car_id == my_car.car_id or rival.retired:
+            continue
+        belief = my_car.beliefs.get(rival.car_id, {})
+        if belief.get("undercut_viable") and belief.get("undercut_gain", 0) > 2.0:
+            if remaining > 10 and my_car.tyre_age > 10 and my_car.pit_count < 2:
+                new_compound = "HARD" if remaining > 20 else "MEDIUM"
+                return {"pit": True, "compound": new_compound}
+
+    # Pit based on tyre degradation cliff zones
+    # SOFT cliff ~12 laps, MEDIUM cliff ~20 laps, HARD cliff ~30 laps
+    cliff_ages = {"SOFT": 12, "MEDIUM": 20, "HARD": 30}
+    cliff = cliff_ages.get(my_car.compound, 20)
+    if my_car.tyre_age >= cliff and remaining > 5:
+        if remaining > 25:
+            new_compound = "HARD"
+        elif remaining > 15:
+            new_compound = "MEDIUM"
+        else:
+            new_compound = "SOFT"
+        return {"pit": True, "compound": new_compound}
+
+    return {"pit": False, "compound": my_car.compound}
+'''
