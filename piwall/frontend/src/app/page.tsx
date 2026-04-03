@@ -18,6 +18,104 @@ const STATS = [
   { label: "From FastF1", value: "2024", sub: "Season telemetry" },
 ];
 
+/* Inline F1 car SVG for section headers — races left to right */
+function F1AccentCar({ className = "" }: { className?: string }) {
+  return (
+    <div className={`relative flex items-center ${className}`}>
+      <svg viewBox="0 0 56 16" className="w-10 h-3.5 animate-f1-accent" fill="none">
+        {/* Speed lines */}
+        <line x1="0" y1="6" x2="6" y2="6" stroke="#e10600" strokeWidth="1" opacity="0.4" className="animate-speed-line-1" />
+        <line x1="1" y1="9" x2="8" y2="9" stroke="#e10600" strokeWidth="0.7" opacity="0.25" className="animate-speed-line-2" />
+        <line x1="0" y1="12" x2="5" y2="12" stroke="#e10600" strokeWidth="0.5" opacity="0.15" className="animate-speed-line-3" />
+        {/* Car body */}
+        <path d="M14 4 L24 2 L34 2 L40 4 L44 6 L44 10 L42 11 L36 11 L34 9.5 L32 11 L22 11 L20 9.5 L18 11 L12 11 L12 7 L14 4Z" fill="#e10600" />
+        {/* Cockpit */}
+        <path d="M25 3 L29 3 L31 5 L26 5Z" fill="#0a0a0a" />
+        {/* Front wing */}
+        <path d="M41 5 L46 4 L46 7 L44 6Z" fill="#e10600" />
+        {/* Rear wing */}
+        <path d="M12 3 L16 3 L16 4.5 L12 5Z" fill="#cc0500" />
+        <path d="M12 1 L16 1 L16 2.5 L12 2.5Z" fill="#e10600" />
+        {/* Wheels */}
+        <circle cx="20" cy="11.5" r="2.2" fill="#1a1a1a" stroke="#3a3a3a" strokeWidth="0.4" />
+        <circle cx="20" cy="11.5" r="0.9" fill="#3a3a3a" />
+        <circle cx="37" cy="11.5" r="2.2" fill="#1a1a1a" stroke="#3a3a3a" strokeWidth="0.4" />
+        <circle cx="37" cy="11.5" r="0.9" fill="#3a3a3a" />
+        {/* Trail gradient */}
+        <rect x="0" y="5" width="12" height="0.5" fill="url(#trailGrad)" rx="0.25" />
+        <defs>
+          <linearGradient id="trailGrad" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stopColor="#e10600" stopOpacity="0" />
+            <stop offset="100%" stopColor="#e10600" stopOpacity="0.6" />
+          </linearGradient>
+        </defs>
+      </svg>
+    </div>
+  );
+}
+
+/* Large F1 car for the hero banner — races across the screen */
+function HeroRacingCar() {
+  return (
+    <div className="absolute bottom-8 left-0 right-0 overflow-hidden pointer-events-none h-16 opacity-60">
+      {/* Track line */}
+      <div className="absolute bottom-2 left-0 right-0 h-px bg-pit-border/40" />
+      {/* Racing car — continuous left-to-right animation */}
+      <div className="animate-f1-race absolute bottom-3">
+        <svg viewBox="0 0 120 32" className="w-24 h-10" fill="none">
+          {/* Speed lines */}
+          <line x1="0" y1="12" x2="16" y2="12" stroke="#e10600" strokeWidth="1.2" opacity="0.5">
+            <animate attributeName="x2" values="16;12;16" dur="0.3s" repeatCount="indefinite" />
+          </line>
+          <line x1="2" y1="16" x2="18" y2="16" stroke="#e10600" strokeWidth="0.8" opacity="0.3">
+            <animate attributeName="x2" values="18;14;18" dur="0.4s" repeatCount="indefinite" />
+          </line>
+          <line x1="4" y1="20" x2="14" y2="20" stroke="#e10600" strokeWidth="0.6" opacity="0.2">
+            <animate attributeName="x2" values="14;10;14" dur="0.35s" repeatCount="indefinite" />
+          </line>
+          {/* Main body */}
+          <path d="M24 8 L44 4 L68 4 L80 8 L88 12 L88 22 L84 24 L70 24 L67 20 L64 24 L42 24 L39 20 L36 24 L22 24 L22 16 L24 8Z" fill="#e10600" />
+          {/* Body highlight */}
+          <path d="M30 9 L50 6 L70 6 L78 9Z" fill="#ff1801" opacity="0.4" />
+          {/* Cockpit */}
+          <path d="M48 6 L56 6 L60 10 L50 10Z" fill="#0a0a0a" />
+          {/* Halo */}
+          <path d="M49 7 Q53 3 58 7" stroke="#555" strokeWidth="1.2" fill="none" />
+          {/* Driver helmet */}
+          <ellipse cx="53" cy="7.5" rx="2" ry="1.8" fill="#e10600" />
+          <ellipse cx="53.5" cy="7" rx="1" ry="0.8" fill="#222" />
+          {/* Front wing */}
+          <path d="M82 9 L92 7 L92 14 L88 12Z" fill="#e10600" />
+          <path d="M92 6 L96 5 L96 8 L92 8Z" fill="#cc0500" />
+          {/* Endplates */}
+          <rect x="95" y="4" width="1.5" height="10" rx="0.5" fill="#cc0500" />
+          {/* Rear wing */}
+          <path d="M22 6 L30 6 L30 8 L22 9Z" fill="#cc0500" />
+          <path d="M20 2 L30 2 L30 4 L20 5Z" fill="#e10600" />
+          {/* Rear wing endplates */}
+          <rect x="19" y="1" width="1.5" height="9" rx="0.5" fill="#cc0500" />
+          {/* Wheels with spin animation */}
+          <circle cx="38" cy="24" r="5" fill="#1a1a1a" stroke="#3a3a3a" strokeWidth="0.8" />
+          <circle cx="38" cy="24" r="2" fill="#3a3a3a" />
+          <line x1="35" y1="24" x2="41" y2="24" stroke="#2a2a2a" strokeWidth="0.5">
+            <animateTransform attributeName="transform" type="rotate" from="0 38 24" to="360 38 24" dur="0.15s" repeatCount="indefinite" />
+          </line>
+          <circle cx="72" cy="24" r="5" fill="#1a1a1a" stroke="#3a3a3a" strokeWidth="0.8" />
+          <circle cx="72" cy="24" r="2" fill="#3a3a3a" />
+          <line x1="69" y1="24" x2="75" y2="24" stroke="#2a2a2a" strokeWidth="0.5">
+            <animateTransform attributeName="transform" type="rotate" from="0 72 24" to="360 72 24" dur="0.15s" repeatCount="indefinite" />
+          </line>
+          {/* Exhaust glow */}
+          <ellipse cx="20" cy="14" rx="4" ry="2" fill="#e10600" opacity="0.15">
+            <animate attributeName="rx" values="4;6;4" dur="0.2s" repeatCount="indefinite" />
+            <animate attributeName="opacity" values="0.15;0.25;0.15" dur="0.2s" repeatCount="indefinite" />
+          </ellipse>
+        </svg>
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   return (
     <div className="relative">
@@ -33,7 +131,7 @@ export default function Home() {
           <div className="max-w-3xl">
             {/* Eyebrow */}
             <div className="flex items-center gap-3 mb-6 animate-fade-in">
-              <div className="accent-line w-8" />
+              <F1AccentCar />
               <span className="section-label text-f1-red">Algorithmic Race Strategy</span>
             </div>
 
@@ -64,6 +162,9 @@ export default function Home() {
           </div>
         </div>
 
+        {/* Racing car animation across the hero */}
+        <HeroRacingCar />
+
         {/* Bottom fade */}
         <div className="absolute bottom-0 left-0 right-0 h-24 gradient-fade-b" />
       </section>
@@ -86,7 +187,7 @@ export default function Home() {
       {/* How it works */}
       <section className="max-w-7xl mx-auto px-6 py-20">
         <div className="flex items-center gap-3 mb-10">
-          <div className="accent-line w-8" />
+          <F1AccentCar />
           <span className="section-label">How It Works</span>
         </div>
 
@@ -174,7 +275,7 @@ export default function Home() {
       {/* Circuit Rotation */}
       <section className="max-w-7xl mx-auto px-6 pb-20">
         <div className="flex items-center gap-3 mb-8">
-          <div className="accent-line w-8" />
+          <F1AccentCar />
           <span className="section-label">Circuit Rotation</span>
         </div>
 
