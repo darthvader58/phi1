@@ -33,10 +33,12 @@ def vel_01_strategy(state: RaceState, my_car: CarState) -> Decision:
     Uses a rough deg model: ~0.08s/lap for soft, ~0.05s/lap for hard.
     """
     deg_rates = {"SOFT": 0.10, "MEDIUM": 0.065, "HARD": 0.045}
+    cliff_ages = {"SOFT": 12, "MEDIUM": 20, "HARD": 30}
     rate = deg_rates.get(my_car.compound, 0.06)
+    cliff = cliff_ages.get(my_car.compound, 20)
     estimated_deg = rate * my_car.tyre_age
 
-    if estimated_deg > 2.2 and my_car.tyre_age >= 8:
+    if (estimated_deg > 2.0 or my_car.tyre_age >= cliff) and my_car.tyre_age >= 8:
         remaining = state.total_laps - state.lap
         if remaining > 5:
             return Decision(pit=True, compound=_pick_compound(remaining, my_car.compound, my_car.pit_count))
@@ -84,8 +86,10 @@ def nxs_07_strategy(state: RaceState, my_car: CarState) -> Decision:
     if has_undercut and remaining > 8:
         return Decision(pit=True, compound=_pick_compound(remaining, my_car.compound, my_car.pit_count))
 
-    # Fallback: pit on heavy degradation
-    if my_car.tyre_age > 25:
+    # Fallback: pit when approaching cliff
+    cliff_ages = {"SOFT": 12, "MEDIUM": 20, "HARD": 30}
+    cliff = cliff_ages.get(my_car.compound, 20)
+    if my_car.tyre_age >= cliff:
         return Decision(pit=True, compound=_pick_compound(remaining, my_car.compound, my_car.pit_count))
 
     return Decision(pit=False, compound=my_car.compound)
@@ -104,8 +108,8 @@ def wxp_23_strategy(state: RaceState, my_car: CarState) -> Decision:
     if state.safety_car and my_car.tyre_age >= 8 and remaining > 5:
         return Decision(pit=True, compound=_pick_compound(remaining, my_car.compound, my_car.pit_count))
 
-    # Weather change: switch to appropriate tyres
-    if state.weather in ("wet", "damp") and my_car.compound in ("SOFT", "MEDIUM", "HARD"):
+    # Weather change: switch to appropriate tyres (only react to full wet, not damp)
+    if state.weather == "wet" and my_car.compound in ("SOFT", "MEDIUM", "HARD"):
         if my_car.tyre_age >= 3:
             return Decision(pit=True, compound="INTERMEDIATE")
 

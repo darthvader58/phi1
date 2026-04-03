@@ -39,12 +39,12 @@ TRACKS: Dict[str, TrackConfig] = {
         safety_car_prob_wet=0.045,
         overtake_difficulty=0.3,
         fuel_load_kg=110.0,
-        # Bahrain = desert, rain is very rare
+        # Bahrain = desert, rain is extremely rare
         weather_transitions={
-            "dry": {"dry": 0.985, "damp": 0.013, "wet": 0.002},
-            "damp": {"dry": 0.40, "damp": 0.45, "wet": 0.15},
-            "wet": {"dry": 0.05, "damp": 0.30, "wet": 0.65},
-            "drying": {"dry": 0.45, "damp": 0.40, "wet": 0.02, "drying": 0.13},
+            "dry": {"dry": 0.998, "damp": 0.002, "wet": 0.000},
+            "damp": {"dry": 0.50, "damp": 0.40, "wet": 0.10},
+            "wet": {"dry": 0.10, "damp": 0.35, "wet": 0.55},
+            "drying": {"dry": 0.55, "damp": 0.35, "wet": 0.02, "drying": 0.08},
         },
         typical_stint={"SOFT": 15, "MEDIUM": 25, "HARD": 35},
         fastf1_year=2024,

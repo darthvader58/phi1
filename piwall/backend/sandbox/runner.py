@@ -271,9 +271,9 @@ def my_strategy(state, my_car):
                 return {"pit": True, "compound": new_compound}
 
     # Pit based on tyre degradation cliff zones
-    # SOFT cliff ~14 laps, MEDIUM cliff ~22 laps, HARD cliff ~34 laps
-    cliff_ages = {"SOFT": 14, "MEDIUM": 22, "HARD": 34}
-    cliff = cliff_ages.get(my_car.compound, 22)
+    # SOFT cliff ~12 laps, MEDIUM cliff ~20 laps, HARD cliff ~30 laps
+    cliff_ages = {"SOFT": 12, "MEDIUM": 20, "HARD": 30}
+    cliff = cliff_ages.get(my_car.compound, 20)
     if my_car.tyre_age >= cliff and remaining > 5:
         if remaining > 25:
             new_compound = "HARD"
