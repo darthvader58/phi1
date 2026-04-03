@@ -15,37 +15,15 @@ export default function NavBar() {
   return (
     <nav className="fixed top-0 left-0 right-0 z-50 bg-pit-black/80 backdrop-blur-xl border-b border-pit-border">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 flex items-center gap-4 sm:gap-8">
-        {/* Logo */}
+        {/* Logo — F1 car that revs forward on hover */}
         <Link href="/" className="flex items-center gap-2.5 group flex-shrink-0">
-          <div className="relative w-8 h-7 flex items-center justify-center overflow-hidden">
-            {/* F1 car SVG with animation */}
-            <svg
-              viewBox="0 0 40 20"
-              className="w-8 h-5 group-hover:animate-f1-rev transition-transform duration-300"
-              fill="none"
-            >
-              {/* Speed lines behind the car */}
-              <line x1="0" y1="8" x2="8" y2="8" stroke="#e10600" strokeWidth="0.8" opacity="0.3" className="animate-speed-line-1" />
-              <line x1="2" y1="11" x2="10" y2="11" stroke="#e10600" strokeWidth="0.6" opacity="0.2" className="animate-speed-line-2" />
-              <line x1="1" y1="14" x2="7" y2="14" stroke="#e10600" strokeWidth="0.5" opacity="0.15" className="animate-speed-line-3" />
-              {/* Car body */}
-              <path d="M12 6 L22 4 L30 4 L35 6 L38 8 L38 13 L36 14 L30 14 L28 12 L26 14 L18 14 L16 12 L14 14 L10 14 L10 10 L12 6Z" fill="#e10600" />
-              {/* Cockpit */}
-              <path d="M22 5 L26 5 L28 7 L23 7Z" fill="#0a0a0a" />
-              {/* Front wing */}
-              <path d="M35 7 L40 6 L40 9 L38 8Z" fill="#e10600" />
-              {/* Rear wing */}
-              <path d="M10 5 L14 5 L14 7 L10 8Z" fill="#cc0500" />
-              <path d="M10 3 L14 3 L14 4.5 L10 4.5Z" fill="#e10600" />
-              {/* Wheels */}
-              <circle cx="16" cy="14" r="2.8" fill="#1a1a1a" stroke="#3a3a3a" strokeWidth="0.5" />
-              <circle cx="16" cy="14" r="1.2" fill="#3a3a3a" />
-              <circle cx="32" cy="14" r="2.8" fill="#1a1a1a" stroke="#3a3a3a" strokeWidth="0.5" />
-              <circle cx="32" cy="14" r="1.2" fill="#3a3a3a" />
-              {/* Halo */}
-              <path d="M22 5.5 Q24 3.5 27 5.5" stroke="#555" strokeWidth="0.8" fill="none" />
-            </svg>
-          </div>
+          <img
+            src="/f1-car.svg"
+            alt=""
+            className="w-10 h-4 group-hover:animate-f1-rev transition-transform duration-300
+                       drop-shadow-[0_0_6px_rgba(225,6,0,0.3)]
+                       group-hover:drop-shadow-[0_0_12px_rgba(225,6,0,0.5)]"
+          />
           <span className="text-white font-bold text-sm tracking-tight hidden sm:inline">
             PIT WALL
           </span>
