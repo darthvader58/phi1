@@ -18,6 +18,32 @@ const STATS = [
   { label: "From FastF1", value: "2024", sub: "Season telemetry" },
 ];
 
+/* Small F1 car accent — replaces the old red line before section labels */
+function F1AccentCar() {
+  return (
+    <img
+      src="/f1-car.svg"
+      alt=""
+      className="w-8 h-3 animate-f1-accent drop-shadow-[0_0_4px_rgba(225,6,0,0.3)]"
+    />
+  );
+}
+
+/* Large F1 car racing across the hero banner — one-time sweep left to right, then fades */
+function HeroRacingCar() {
+  return (
+    <div className="absolute inset-0 overflow-hidden pointer-events-none">
+      <div className="animate-f1-hero-race absolute top-1/2 -translate-y-1/2">
+        <img
+          src="/f1-car.svg"
+          alt=""
+          className="w-[500px] h-auto opacity-[0.04]"
+        />
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   return (
     <div className="relative">
@@ -33,7 +59,7 @@ export default function Home() {
           <div className="max-w-3xl">
             {/* Eyebrow */}
             <div className="flex items-center gap-3 mb-6 animate-fade-in">
-              <div className="accent-line w-8" />
+              <F1AccentCar />
               <span className="section-label text-f1-red">Algorithmic Race Strategy</span>
             </div>
 
@@ -64,6 +90,9 @@ export default function Home() {
           </div>
         </div>
 
+        {/* Racing car animation across the hero */}
+        <HeroRacingCar />
+
         {/* Bottom fade */}
         <div className="absolute bottom-0 left-0 right-0 h-24 gradient-fade-b" />
       </section>
@@ -86,7 +115,7 @@ export default function Home() {
       {/* How it works */}
       <section className="max-w-7xl mx-auto px-6 py-20">
         <div className="flex items-center gap-3 mb-10">
-          <div className="accent-line w-8" />
+          <F1AccentCar />
           <span className="section-label">How It Works</span>
         </div>
 
@@ -174,7 +203,7 @@ export default function Home() {
       {/* Circuit Rotation */}
       <section className="max-w-7xl mx-auto px-6 pb-20">
         <div className="flex items-center gap-3 mb-8">
-          <div className="accent-line w-8" />
+          <F1AccentCar />
           <span className="section-label">Circuit Rotation</span>
         </div>
 

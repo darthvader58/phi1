@@ -15,12 +15,15 @@ export default function NavBar() {
   return (
     <nav className="fixed top-0 left-0 right-0 z-50 bg-pit-black/80 backdrop-blur-xl border-b border-pit-border">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 flex items-center gap-4 sm:gap-8">
-        {/* Logo */}
+        {/* Logo — F1 car that revs forward on hover */}
         <Link href="/" className="flex items-center gap-2.5 group flex-shrink-0">
-          <div className="w-7 h-7 bg-f1-red rounded-md flex items-center justify-center
-                          group-hover:shadow-glow-red transition-shadow duration-300">
-            <span className="text-white text-xs font-black">PW</span>
-          </div>
+          <img
+            src="/f1-car.svg"
+            alt=""
+            className="w-10 h-4 group-hover:animate-f1-rev transition-transform duration-300
+                       drop-shadow-[0_0_6px_rgba(225,6,0,0.3)]
+                       group-hover:drop-shadow-[0_0_12px_rgba(225,6,0,0.5)]"
+          />
           <span className="text-white font-bold text-sm tracking-tight hidden sm:inline">
             PIT WALL
           </span>
