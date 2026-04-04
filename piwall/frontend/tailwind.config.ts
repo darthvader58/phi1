@@ -64,7 +64,7 @@ const config: Config = {
         'fade-in': 'fadeIn 0.5s ease-out',
         'slide-up': 'slideUp 0.4s ease-out',
         'f1-rev': 'f1Rev 0.3s ease-in-out',
-        'f1-race': 'f1Race 8s linear infinite',
+        'f1-hero-race': 'f1HeroRace 3s cubic-bezier(0.25, 0.1, 0.25, 1) 0.3s forwards',
         'f1-accent': 'f1AccentBounce 2s ease-in-out infinite',
         'speed-line-1': 'speedLine 0.6s ease-in-out infinite',
         'speed-line-2': 'speedLine 0.8s ease-in-out infinite 0.1s',
@@ -84,9 +84,11 @@ const config: Config = {
           '50%': { transform: 'translateX(3px)' },
           '100%': { transform: 'translateX(0)' },
         },
-        f1Race: {
-          '0%': { transform: 'translateX(-120px)' },
-          '100%': { transform: 'translateX(calc(100vw + 120px))' },
+        f1HeroRace: {
+          '0%': { transform: 'translateX(-550px) translateY(-50%)', opacity: '0' },
+          '10%': { opacity: '1' },
+          '70%': { opacity: '1' },
+          '100%': { transform: 'translateX(100vw) translateY(-50%)', opacity: '0' },
         },
         f1AccentBounce: {
           '0%, 100%': { transform: 'translateX(0)' },

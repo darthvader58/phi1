@@ -29,24 +29,15 @@ function F1AccentCar() {
   );
 }
 
-/* Large F1 car racing across the hero banner — left to right loop */
+/* Large F1 car racing across the hero banner — one-time sweep left to right, then fades */
 function HeroRacingCar() {
   return (
-    <div className="absolute bottom-6 left-0 right-0 overflow-hidden pointer-events-none h-20">
-      {/* Track surface line */}
-      <div className="absolute bottom-3 left-0 right-0 h-px bg-pit-border/30" />
-      {/* The racing car */}
-      <div className="animate-f1-race absolute bottom-4 flex items-end">
-        {/* Speed trail lines behind the car */}
-        <div className="flex flex-col gap-[3px] mr-1 opacity-60">
-          <div className="h-[2px] w-8 bg-gradient-to-r from-transparent to-f1-red/60 animate-speed-line-1 rounded-full" />
-          <div className="h-[1.5px] w-6 bg-gradient-to-r from-transparent to-f1-red/40 animate-speed-line-2 rounded-full" />
-          <div className="h-[1px] w-10 bg-gradient-to-r from-transparent to-f1-red/30 animate-speed-line-3 rounded-full" />
-        </div>
+    <div className="absolute inset-0 overflow-hidden pointer-events-none">
+      <div className="animate-f1-hero-race absolute top-1/2 -translate-y-1/2">
         <img
           src="/f1-car.svg"
           alt=""
-          className="w-28 h-11 drop-shadow-[0_0_16px_rgba(225,6,0,0.35)]"
+          className="w-[500px] h-auto opacity-[0.04]"
         />
       </div>
     </div>
