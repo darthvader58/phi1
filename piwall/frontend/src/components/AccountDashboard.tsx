@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type DashboardData = {
   profile: {
@@ -68,12 +68,21 @@ function formatDate(input: string | null) {
   }).format(new Date(input));
 }
 
-function IconButton({ label, children }: { label: string; children: React.ReactNode }) {
+function IconButton({
+  label,
+  children,
+  onClick
+}: {
+  label: string;
+  children: React.ReactNode;
+  onClick?: () => void;
+}) {
   return (
     <button
       type="button"
       aria-label={label}
       title={`${label} coming later`}
+      onClick={onClick}
       className="w-10 h-10 rounded-full border border-pit-border bg-pit-surface/70 text-pit-text
                  hover:text-white hover:border-white/20 transition-colors flex items-center justify-center"
     >
@@ -208,9 +217,50 @@ function EloChart({ history, currentElo }: { history: DashboardData["eloHistory"
 }
 
 export default function AccountDashboard({ data }: AccountDashboardProps) {
-  const primaryName = data.backendProfile?.username || data.profile?.name || "pit-wall-driver";
+  const [username, setUsername] = useState(data.backendProfile?.username || data.profile?.name || "pit-wall-driver");
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameValue, setRenameValue] = useState(data.backendProfile?.username || "");
+  const [renameError, setRenameError] = useState("");
+  const [renaming, setRenaming] = useState(false);
+
+  const primaryName = username;
   const secondaryLabel = data.backendProfile?.team || "Pit Wall";
   const elo = data.backendProfile?.elo ?? 1200;
+
+  useEffect(() => {
+    setUsername(data.backendProfile?.username || data.profile?.name || "pit-wall-driver");
+    setRenameValue(data.backendProfile?.username || "");
+  }, [data.backendProfile?.username, data.profile?.name]);
+
+  async function handleRenameSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setRenaming(true);
+    setRenameError("");
+
+    try {
+      const response = await fetch("/api/account/username", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: renameValue })
+      });
+
+      const payload = (await response.json().catch(() => ({}))) as { error?: string; username?: string };
+
+      if (!response.ok || !payload.username) {
+        throw new Error(payload.error || "Unable to update username.");
+      }
+
+      setUsername(payload.username);
+      setRenameValue(payload.username);
+      localStorage.setItem("piwall_username", payload.username);
+      window.dispatchEvent(new Event("piwall-backend-auth-changed"));
+      setRenameOpen(false);
+    } catch (error) {
+      setRenameError(error instanceof Error ? error.message : "Unable to update username.");
+    } finally {
+      setRenaming(false);
+    }
+  }
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-10">
@@ -222,7 +272,7 @@ export default function AccountDashboard({ data }: AccountDashboardProps) {
               <div className="flex items-center gap-3 flex-wrap">
                 <h1 className="text-4xl font-extrabold text-white tracking-tight">{primaryName}</h1>
                 <div className="flex items-center gap-2">
-                  <IconButton label="Change username">
+                  <IconButton label="Change username" onClick={() => setRenameOpen(true)}>
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
                       <path d="M12 20h9" />
                       <path d="M16.5 3.5a2.1 2.1 0 1 1 3 3L7 19l-4 1 1-4Z" />
@@ -396,6 +446,56 @@ export default function AccountDashboard({ data }: AccountDashboardProps) {
           </div>
         </section>
       </div>
+
+      {renameOpen ? (
+        <div className="fixed inset-0 z-[90] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="card w-full max-w-md p-6 relative">
+            <button
+              className="absolute top-3 right-3 text-pit-muted hover:text-white text-xl"
+              onClick={() => {
+                setRenameOpen(false);
+                setRenameError("");
+                setRenameValue(username);
+              }}
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+
+            <div className="mb-5">
+              <p className="section-label text-f1-red mb-2">Driver Identity</p>
+              <h2 className="text-2xl font-extrabold text-white">Change username</h2>
+              <p className="text-sm text-pit-text mt-2">
+                This updates your race profile, leaderboard identity, and account header.
+              </p>
+            </div>
+
+            <form className="space-y-4" onSubmit={handleRenameSubmit}>
+              <div>
+                <label className="text-[10px] text-pit-muted uppercase tracking-wider block mb-1.5">Username</label>
+                <input
+                  className="input"
+                  value={renameValue}
+                  onChange={(event) => setRenameValue(event.target.value)}
+                  placeholder="shashwat-raj"
+                  required
+                  minLength={3}
+                  maxLength={24}
+                  pattern="[a-zA-Z0-9-]+"
+                  type="text"
+                />
+              </div>
+
+              {renameError ? <p className="text-f1-red text-xs">{renameError}</p> : null}
+
+              <button className="btn-primary w-full" disabled={renaming} type="submit">
+                {renaming ? "Updating..." : "Save Username"}
+              </button>
+            </form>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

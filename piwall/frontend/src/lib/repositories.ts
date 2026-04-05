@@ -104,6 +104,64 @@ async function resolveBackendPlayer(db: Awaited<ReturnType<typeof getDb>>, profi
   return null;
 }
 
+export async function updateBackendUsernameForUser(userId: string, requestedUsername: string) {
+  if (!isMongoConfigured()) {
+    throw new Error("MongoDB is not configured.");
+  }
+
+  const username = requestedUsername
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+
+  if (username.length < 3) {
+    throw new Error("Username must be at least 3 characters.");
+  }
+
+  if (username.length > 24) {
+    throw new Error("Username must be 24 characters or fewer.");
+  }
+
+  const db = await getDb();
+  const normalizedUserId = normalizeUserId(userId);
+  const profile = await db.collection("playerProfiles").findOne({ userId: normalizedUserId });
+  const backendPlayer = await resolveBackendPlayer(db, profile);
+
+  if (!backendPlayer?.id) {
+    throw new Error("No linked race profile exists for this account yet.");
+  }
+
+  const takenBy = await db.collection("players").findOne({ username });
+  if (takenBy && String(takenBy.id) !== String(backendPlayer.id)) {
+    throw new Error("Username already taken");
+  }
+
+  await db.collection("players").updateOne(
+    { id: backendPlayer.id },
+    {
+      $set: {
+        username
+      }
+    }
+  );
+
+  await db.collection("playerProfiles").updateOne(
+    { userId: normalizedUserId },
+    {
+      $set: {
+        backendUsername: username,
+        updatedAt: new Date()
+      }
+    }
+  );
+
+  return {
+    username
+  };
+}
+
 async function getLinkedBackendRaceRecords(db: Awaited<ReturnType<typeof getDb>>, profile: any) {
   const backendPlayer = await resolveBackendPlayer(db, profile);
   const resolvedPlayerId = typeof backendPlayer?.id === "string" ? backendPlayer.id : null;
