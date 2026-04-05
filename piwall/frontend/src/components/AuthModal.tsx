@@ -20,10 +20,7 @@ export default function AuthModal({ defaultOpen = false, googleEnabled, triggerL
   const [pending, setPending] = useState(false);
 
   const buttonLabel = useMemo(() => {
-    if (triggerLabel) {
-      return triggerLabel;
-    }
-
+    if (triggerLabel) return triggerLabel;
     return googleEnabled ? "Continue with Google" : "Login / Signup";
   }, [googleEnabled, triggerLabel]);
 
@@ -41,17 +38,11 @@ export default function AuthModal({ defaultOpen = false, googleEnabled, triggerL
       if (mode === "signup") {
         const response = await fetch("/api/signup", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name, email, password })
         });
-
         const payload = (await response.json()) as { error?: string };
-
-        if (!response.ok) {
-          throw new Error(payload.error || "Unable to create account.");
-        }
+        if (!response.ok) throw new Error(payload.error || "Unable to create account.");
       }
 
       const result = await signIn("credentials", {
@@ -75,33 +66,47 @@ export default function AuthModal({ defaultOpen = false, googleEnabled, triggerL
 
   return (
     <>
-      <button className="button button-primary" onClick={() => setOpen(true)} type="button">
+      <button className="btn-primary" onClick={() => setOpen(true)} type="button">
         {buttonLabel}
       </button>
 
       {open ? (
-        <div className="modal-shell" role="dialog" aria-modal="true" aria-label="Login or signup">
-          <div className="modal-card">
-            <div className="modal-header">
-              <div>
-                <p className="eyebrow">Driver Authentication</p>
-                <h2>{mode === "login" ? "Jump back into the pit wall." : "Create your paddock account."}</h2>
-              </div>
-              <button className="icon-button" onClick={() => setOpen(false)} type="button" aria-label="Close">
-                ×
-              </button>
+        <div className="fixed inset-0 z-[70] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="card w-full max-w-md p-6 relative">
+            <button
+              className="absolute top-3 right-3 text-pit-muted hover:text-white text-xl"
+              onClick={() => setOpen(false)}
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+
+            <div className="mb-5">
+              <p className="section-label text-f1-red mb-2">Driver Authentication</p>
+              <h2 className="text-2xl font-extrabold text-white">
+                {mode === "login" ? "Jump back into the pit wall." : "Create your paddock account."}
+              </h2>
             </div>
 
-            <div className="segmented-control" role="tablist" aria-label="Authentication mode">
+            <div className="grid grid-cols-2 gap-2 mb-4">
               <button
-                className={mode === "login" ? "active" : ""}
+                className={`rounded-lg px-4 py-2 text-sm font-semibold border transition-colors ${
+                  mode === "login"
+                    ? "border-f1-red/40 bg-f1-red/10 text-white"
+                    : "border-pit-border text-pit-muted hover:text-white"
+                }`}
                 onClick={() => setMode("login")}
                 type="button"
               >
                 Login
               </button>
               <button
-                className={mode === "signup" ? "active" : ""}
+                className={`rounded-lg px-4 py-2 text-sm font-semibold border transition-colors ${
+                  mode === "signup"
+                    ? "border-f1-red/40 bg-f1-red/10 text-white"
+                    : "border-pit-border text-pit-muted hover:text-white"
+                }`}
                 onClick={() => setMode("signup")}
                 type="button"
               >
@@ -111,7 +116,7 @@ export default function AuthModal({ defaultOpen = false, googleEnabled, triggerL
 
             {googleEnabled ? (
               <button
-                className="button button-secondary auth-google"
+                className="btn-secondary w-full mb-4"
                 disabled={pending}
                 onClick={() => signIn("google", { callbackUrl: "/" })}
                 type="button"
@@ -120,27 +125,29 @@ export default function AuthModal({ defaultOpen = false, googleEnabled, triggerL
               </button>
             ) : null}
 
-            <form className="auth-form" onSubmit={handleSubmit}>
+            <form className="space-y-4" onSubmit={handleSubmit}>
               {mode === "signup" ? (
-                <label>
-                  Display name
-                  <input name="name" placeholder="Charles Strategy" required type="text" />
-                </label>
+                <div>
+                  <label className="text-[10px] text-pit-muted uppercase tracking-wider block mb-1.5">
+                    Display name
+                  </label>
+                  <input className="input" name="name" placeholder="Charles Strategy" required type="text" />
+                </div>
               ) : null}
 
-              <label>
-                Email
-                <input name="email" placeholder="driver@pitwall.dev" required type="email" />
-              </label>
+              <div>
+                <label className="text-[10px] text-pit-muted uppercase tracking-wider block mb-1.5">Email</label>
+                <input className="input" name="email" placeholder="driver@pitwall.dev" required type="email" />
+              </div>
 
-              <label>
-                Password
-                <input name="password" placeholder="Minimum 8 characters" required type="password" />
-              </label>
+              <div>
+                <label className="text-[10px] text-pit-muted uppercase tracking-wider block mb-1.5">Password</label>
+                <input className="input" name="password" placeholder="Minimum 8 characters" required type="password" />
+              </div>
 
-              {error ? <p className="form-error">{error}</p> : null}
+              {error ? <p className="text-f1-red text-xs">{error}</p> : null}
 
-              <button className="button button-primary" disabled={pending} type="submit">
+              <button className="btn-primary w-full" disabled={pending} type="submit">
                 {pending ? "Working..." : mode === "login" ? "Login" : "Create account"}
               </button>
             </form>

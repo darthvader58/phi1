@@ -21,24 +21,30 @@ export default function UserMenu({ name, image }: UserMenuProps) {
   }, [name]);
 
   return (
-    <div className="user-menu">
-      <button className="avatar-button" onClick={() => setOpen((value) => !value)} type="button">
-        {image ? <img alt={name || "User"} className="avatar-image" src={image} /> : <span>{initials}</span>}
+    <div className="relative">
+      <button
+        className="w-10 h-10 rounded-full border border-pit-border bg-pit-surface text-white font-bold overflow-hidden"
+        onClick={() => setOpen((value) => !value)}
+        type="button"
+      >
+        {image ? <img alt={name || "User"} className="w-full h-full object-cover" src={image} /> : <span>{initials}</span>}
       </button>
 
       {open ? (
-        <div className="user-menu-popover">
-          <p className="user-menu-name">{name || "Driver"}</p>
-          <Link href="/account" onClick={() => setOpen(false)}>
-            Account
-          </Link>
-          <button
-            className="button button-secondary"
-            onClick={() => signOut({ callbackUrl: "/" })}
-            type="button"
-          >
-            Logout
-          </button>
+        <div className="absolute right-0 top-[calc(100%+0.75rem)] min-w-56 p-4 rounded-xl border border-pit-border bg-pit-card shadow-card z-[80]">
+          <p className="text-white font-bold mb-3">{name || "Driver"}</p>
+          <div className="space-y-2">
+            <Link
+              href="/account"
+              onClick={() => setOpen(false)}
+              className="block text-sm text-pit-text hover:text-white transition-colors"
+            >
+              Account
+            </Link>
+            <button className="btn-secondary w-full" onClick={() => signOut({ callbackUrl: "/" })} type="button">
+              Logout
+            </button>
+          </div>
         </div>
       ) : null}
     </div>

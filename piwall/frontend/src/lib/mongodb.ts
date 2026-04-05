@@ -29,3 +29,7 @@ export function getMongoClientPromise() {
 export function getDatabaseName() {
   return process.env.MONGODB_DB || new URL(getMongoUri()).pathname.replace("/", "") || "pitwall";
 }
+
+export function isMongoConfigured() {
+  return Boolean(process.env.MONGODB_URI);
+}

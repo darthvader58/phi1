@@ -1,5 +1,5 @@
 import { ObjectId } from "mongodb";
-import { getDatabaseName, getMongoClientPromise } from "@/lib/mongodb";
+import { getDatabaseName, getMongoClientPromise, isMongoConfigured } from "@/lib/mongodb";
 
 export type SubmissionInput = {
   track: string;
@@ -35,6 +35,10 @@ export async function upsertPlayerProfile(user: {
   email?: string | null;
   image?: string | null;
 }) {
+  if (!isMongoConfigured()) {
+    return;
+  }
+
   const db = await getDb();
 
   await db.collection("playerProfiles").updateOne(
@@ -55,6 +59,10 @@ export async function upsertPlayerProfile(user: {
 }
 
 export async function createSubmission(userId: string, input: SubmissionInput) {
+  if (!isMongoConfigured()) {
+    throw new Error("MongoDB is not configured.");
+  }
+
   const db = await getDb();
   const now = new Date();
   const result = await db.collection("strategySubmissions").insertOne({
@@ -68,6 +76,10 @@ export async function createSubmission(userId: string, input: SubmissionInput) {
 }
 
 export async function createRaceRecord(userId: string, input: RaceRecordInput) {
+  if (!isMongoConfigured()) {
+    throw new Error("MongoDB is not configured.");
+  }
+
   const db = await getDb();
   const now = new Date();
   const result = await db.collection("raceRecords").insertOne({
@@ -81,6 +93,21 @@ export async function createRaceRecord(userId: string, input: RaceRecordInput) {
 }
 
 export async function getUserDashboard(userId: string) {
+  if (!isMongoConfigured()) {
+    return {
+      profile: null,
+      stats: {
+        totalSubmissions: 0,
+        totalRaces: 0,
+        wins: 0,
+        podiums: 0,
+        averageFinish: null
+      },
+      submissions: [],
+      raceRecords: []
+    };
+  }
+
   const db = await getDb();
   const objectId = toObjectId(userId);
 
@@ -149,6 +176,10 @@ export async function getUserDashboard(userId: string) {
 }
 
 export async function getRaceRecord(recordId: string) {
+  if (!isMongoConfigured()) {
+    return null;
+  }
+
   if (!ObjectId.isValid(recordId)) {
     return null;
   }
@@ -175,6 +206,14 @@ export async function getRaceRecord(recordId: string) {
 }
 
 export async function getSeasonSnapshot() {
+  if (!isMongoConfigured()) {
+    return {
+      totalEntries: 0,
+      averageFinish: null,
+      recentRaces: []
+    };
+  }
+
   const db = await getDb();
   const raceRecords = await db.collection("raceRecords").find({}).sort({ createdAt: -1 }).limit(25).toArray();
 

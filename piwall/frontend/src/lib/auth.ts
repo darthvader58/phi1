@@ -5,12 +5,14 @@ import Google from "next-auth/providers/google";
 import { MongoDBAdapter } from "@auth/mongodb-adapter";
 import { compare } from "bcryptjs";
 import { ObjectId } from "mongodb";
-import { getDatabaseName, getMongoClientPromise } from "@/lib/mongodb";
+import { getDatabaseName, getMongoClientPromise, isMongoConfigured } from "@/lib/mongodb";
 import { upsertPlayerProfile } from "@/lib/repositories";
 
 const googleEnabled = Boolean(process.env.AUTH_GOOGLE_ID && process.env.AUTH_GOOGLE_SECRET);
 
 export { googleEnabled };
+
+const mongoEnabled = isMongoConfigured();
 
 const providers: Provider[] = [
   Credentials({
@@ -63,10 +65,10 @@ if (googleEnabled) {
 }
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
-  adapter: MongoDBAdapter(getMongoClientPromise()),
+  adapter: mongoEnabled ? MongoDBAdapter(getMongoClientPromise()) : undefined,
   secret: process.env.AUTH_SECRET,
   session: {
-    strategy: "database"
+    strategy: mongoEnabled ? "database" : "jwt"
   },
   providers,
   pages: {
