@@ -1,8 +1,9 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { signIn } from "next-auth/react";
+import { createPortal } from "react-dom";
 
 type AuthModalProps = {
   defaultOpen?: boolean;
@@ -26,11 +27,25 @@ export default function AuthModal({
   const [mode, setMode] = useState<Mode>("login");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [mounted, setMounted] = useState(false);
 
   const buttonLabel = useMemo(() => {
     if (triggerLabel) return triggerLabel;
     return googleEnabled ? "Continue with Google" : "Login / Signup";
   }, [googleEnabled, triggerLabel]);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    function handleOpenAuthModal() {
+      setOpen(true);
+    }
+
+    window.addEventListener("pitwall-open-auth", handleOpenAuthModal);
+    return () => window.removeEventListener("pitwall-open-auth", handleOpenAuthModal);
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -80,9 +95,10 @@ export default function AuthModal({
         </button>
       )}
 
-      {open ? (
-        <div className="fixed inset-0 z-[70] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="card w-full max-w-md p-6 relative">
+      {mounted && open
+        ? createPortal(
+        <div className="fixed inset-0 z-[70] bg-black/75 backdrop-blur-sm flex items-start sm:items-center justify-center p-4 pt-20 sm:pt-4 overflow-y-auto">
+          <div className="card w-full max-w-md p-6 relative max-h-[calc(100vh-2rem)] overflow-y-auto">
             <button
               className="absolute top-3 right-3 text-pit-muted hover:text-white text-xl"
               onClick={() => setOpen(false)}
@@ -126,12 +142,32 @@ export default function AuthModal({
 
             {googleEnabled ? (
               <button
-                className="btn-secondary w-full mb-4"
+                className="w-full mb-4 h-11 rounded-md border border-[#dadce0] bg-white text-[#3c4043]
+                           hover:bg-[#f8f9fa] transition-colors flex items-center justify-center gap-3
+                           text-sm font-medium shadow-none"
                 disabled={pending}
                 onClick={() => signIn("google", { callbackUrl: "/" })}
                 type="button"
               >
-                Google OAuth
+                <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+                  <path
+                    fill="#4285F4"
+                    d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.92c1.7-1.56 2.68-3.86 2.68-6.62Z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.81.54-1.84.86-3.04.86-2.34 0-4.32-1.58-5.03-3.7H.96v2.33A9 9 0 0 0 9 18Z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M3.97 10.72A5.41 5.41 0 0 1 3.69 9c0-.6.1-1.18.28-1.72V4.95H.96A9 9 0 0 0 0 9c0 1.45.35 2.82.96 4.05l3.01-2.33Z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M9 3.58c1.32 0 2.5.45 3.44 1.33l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.95l3.01 2.33c.71-2.12 2.69-3.7 5.03-3.7Z"
+                  />
+                </svg>
+                <span>Sign in with Google</span>
               </button>
             ) : null}
 
@@ -163,7 +199,10 @@ export default function AuthModal({
             </form>
           </div>
         </div>
-      ) : null}
+            ,
+            document.body
+          )
+        : null}
     </>
   );
 }

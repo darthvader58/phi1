@@ -1,6 +1,6 @@
 import Link from "next/link";
-import AuthModal from "@/components/AuthModal";
-import { auth, googleEnabled } from "@/lib/auth";
+import OpenAuthOnMount from "@/components/OpenAuthOnMount";
+import { auth } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -49,7 +49,7 @@ export default async function HomePage() {
 
   return (
     <div className="relative">
-      {!session?.user ? <AuthModal defaultOpen googleEnabled={googleEnabled} hideTrigger /> : null}
+      {!session?.user ? <OpenAuthOnMount /> : null}
 
       <section className="relative overflow-hidden">
         <div className="absolute inset-0 bg-grid opacity-50" />
