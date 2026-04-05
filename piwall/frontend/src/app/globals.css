@@ -176,3 +176,26 @@ textarea {
   display: inline-block;
   flex-shrink: 0;
 }
+
+@keyframes f1-hero-arrive {
+  0% {
+    transform: translateX(-38vw) translateY(-50%);
+    opacity: 0.08;
+    filter: drop-shadow(0 0 10px rgba(225, 6, 0, 0.04));
+  }
+  65% {
+    transform: translateX(8vw) translateY(-50%);
+    opacity: 0.3;
+    filter: drop-shadow(0 0 14px rgba(225, 6, 0, 0.07));
+  }
+  100% {
+    transform: translateX(11vw) translateY(-50%);
+    opacity: 0.46;
+    filter: drop-shadow(0 0 16px rgba(225, 6, 0, 0.08));
+  }
+}
+
+.animate-f1-hero-race {
+  animation: f1-hero-arrive 2.8s cubic-bezier(0.18, 0.8, 0.2, 1) forwards;
+  will-change: transform, opacity, filter;
+}

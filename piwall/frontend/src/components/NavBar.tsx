@@ -27,7 +27,7 @@ export default function NavBar({ session, googleEnabled }: NavBarProps) {
           <img
             src="/f1-car.svg"
             alt=""
-            className="w-10 h-4 group-hover:animate-f1-rev transition-transform duration-300
+            className="w-14 h-5 group-hover:animate-f1-rev transition-transform duration-300
                        drop-shadow-[0_0_6px_rgba(225,6,0,0.3)]
                        group-hover:drop-shadow-[0_0_12px_rgba(225,6,0,0.5)]"
           />

@@ -33,8 +33,12 @@ function F1AccentCar() {
 function HeroRacingCar() {
   return (
     <div className="absolute inset-0 overflow-hidden pointer-events-none">
-      <div className="animate-f1-hero-race absolute top-1/2 -translate-y-1/2">
-        <img src="/f1-car.svg" alt="" className="w-[500px] h-auto opacity-[0.04]" />
+      <div className="animate-f1-hero-race absolute top-1/2 left-1/2">
+        <img
+          src="/f1-car.svg"
+          alt=""
+          className="w-[500px] h-auto"
+        />
       </div>
     </div>
   );
