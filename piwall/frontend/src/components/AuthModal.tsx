@@ -8,12 +8,19 @@ type AuthModalProps = {
   defaultOpen?: boolean;
   googleEnabled: boolean;
   hideTrigger?: boolean;
+  buttonClassName?: string;
   triggerLabel?: string;
 };
 
 type Mode = "login" | "signup";
 
-export default function AuthModal({ defaultOpen = false, googleEnabled, hideTrigger = false, triggerLabel }: AuthModalProps) {
+export default function AuthModal({
+  defaultOpen = false,
+  googleEnabled,
+  hideTrigger = false,
+  buttonClassName,
+  triggerLabel
+}: AuthModalProps) {
   const router = useRouter();
   const [open, setOpen] = useState(defaultOpen);
   const [mode, setMode] = useState<Mode>("login");
@@ -68,7 +75,7 @@ export default function AuthModal({ defaultOpen = false, googleEnabled, hideTrig
   return (
     <>
       {hideTrigger ? null : (
-        <button className="btn-primary" onClick={() => setOpen(true)} type="button">
+        <button className={buttonClassName || "btn-primary"} onClick={() => setOpen(true)} type="button">
           {buttonLabel}
         </button>
       )}

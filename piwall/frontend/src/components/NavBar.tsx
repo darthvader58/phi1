@@ -27,7 +27,7 @@ export default function NavBar({ session, googleEnabled }: NavBarProps) {
           <img
             src="/f1-car.svg"
             alt=""
-            className="w-14 h-5 group-hover:animate-f1-rev transition-transform duration-300
+            className="w-20 h-7 group-hover:animate-f1-rev transition-transform duration-300
                        drop-shadow-[0_0_6px_rgba(225,6,0,0.3)]
                        group-hover:drop-shadow-[0_0_12px_rgba(225,6,0,0.5)]"
           />
@@ -54,7 +54,11 @@ export default function NavBar({ session, googleEnabled }: NavBarProps) {
             <UserMenu image={session.user.image} name={session.user.name} />
           ) : (
             <div className="hidden sm:block">
-              <AuthModal googleEnabled={googleEnabled} triggerLabel="Login / Signup" />
+              <AuthModal
+                googleEnabled={googleEnabled}
+                triggerLabel="Login / Signup"
+                buttonClassName="px-4 py-2 text-sm rounded-lg border border-pit-border bg-pit-surface text-pit-text hover:text-white hover:bg-white/5 transition-colors"
+              />
             </div>
           )}
 
@@ -96,7 +100,11 @@ export default function NavBar({ session, googleEnabled }: NavBarProps) {
                 </Link>
               ) : (
                 <div className="px-3 py-2.5">
-                  <AuthModal googleEnabled={googleEnabled} triggerLabel="Login / Signup" />
+                  <AuthModal
+                    googleEnabled={googleEnabled}
+                    triggerLabel="Login / Signup"
+                    buttonClassName="w-full px-4 py-2 text-sm rounded-lg border border-pit-border bg-pit-surface text-pit-text hover:text-white hover:bg-white/5 transition-colors"
+                  />
                 </div>
               )}
             </div>
