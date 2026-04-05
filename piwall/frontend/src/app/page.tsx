@@ -83,7 +83,7 @@ export default async function HomePage() {
               <Link href="/lobby" className="btn-secondary text-base px-8 py-3">
                 Start Racing
               </Link>
-              <Link href="/strategy" className="btn-secondary text-base px-8 py-3">
+              <Link href="/strategy" className="btn-primary text-base px-8 py-3">
                 Write a Bot
               </Link>
             </div>

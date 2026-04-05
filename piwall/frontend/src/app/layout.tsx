@@ -3,6 +3,7 @@ import "./globals.css";
 import NavBar from "@/components/NavBar";
 import AuthProviders from "@/components/AuthProviders";
 import BackendPlayerSync from "@/components/BackendPlayerSync";
+import Footer from "@/components/Footer";
 import { ToastProvider } from "@/components/Toast";
 import { auth, googleEnabled } from "@/lib/auth";
 
@@ -26,6 +27,7 @@ export default async function RootLayout({
             <BackendPlayerSync />
             <NavBar googleEnabled={googleEnabled} session={session} />
             <main className="pt-14">{children}</main>
+            <Footer />
           </ToastProvider>
         </AuthProviders>
       </body>

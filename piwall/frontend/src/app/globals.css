@@ -62,7 +62,7 @@ textarea {
 
 .btn-primary {
   padding: 0.625rem 1.25rem;
-  background-color: #e10600;
+  background-color: #b81f16;
   color: #fff;
   font-weight: 600;
   font-size: 0.875rem;
@@ -72,8 +72,8 @@ textarea {
   cursor: pointer;
 }
 .btn-primary:hover {
-  background-color: #ff1801;
-  box-shadow: 0 0 20px rgba(225, 6, 0, 0.15);
+  background-color: #cb281d;
+  box-shadow: 0 0 18px rgba(184, 31, 22, 0.14);
 }
 .btn-primary:active {
   transform: scale(0.97);
