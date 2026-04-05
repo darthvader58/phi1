@@ -7,12 +7,13 @@ import { signIn } from "next-auth/react";
 type AuthModalProps = {
   defaultOpen?: boolean;
   googleEnabled: boolean;
+  hideTrigger?: boolean;
   triggerLabel?: string;
 };
 
 type Mode = "login" | "signup";
 
-export default function AuthModal({ defaultOpen = false, googleEnabled, triggerLabel }: AuthModalProps) {
+export default function AuthModal({ defaultOpen = false, googleEnabled, hideTrigger = false, triggerLabel }: AuthModalProps) {
   const router = useRouter();
   const [open, setOpen] = useState(defaultOpen);
   const [mode, setMode] = useState<Mode>("login");
@@ -66,9 +67,11 @@ export default function AuthModal({ defaultOpen = false, googleEnabled, triggerL
 
   return (
     <>
-      <button className="btn-primary" onClick={() => setOpen(true)} type="button">
-        {buttonLabel}
-      </button>
+      {hideTrigger ? null : (
+        <button className="btn-primary" onClick={() => setOpen(true)} type="button">
+          {buttonLabel}
+        </button>
+      )}
 
       {open ? (
         <div className="fixed inset-0 z-[70] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">

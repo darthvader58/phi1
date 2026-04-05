@@ -45,7 +45,7 @@ export default async function HomePage() {
 
   return (
     <div className="relative">
-      {!session?.user ? <AuthModal defaultOpen googleEnabled={googleEnabled} /> : null}
+      {!session?.user ? <AuthModal defaultOpen googleEnabled={googleEnabled} hideTrigger /> : null}
 
       <section className="relative overflow-hidden">
         <div className="absolute inset-0 bg-grid opacity-50" />
@@ -71,19 +71,11 @@ export default async function HomePage() {
               className="text-lg text-pit-text max-w-xl mb-10 leading-relaxed animate-slide-up"
               style={{ animationDelay: "0.1s" }}
             >
-              Write strategy bots that compete in physics-accurate F1 simulations. The account layer stores
-              submissions, race finishes, and recent performance in MongoDB, and unsigned visitors land
-              directly in the login/signup flow.
+              Write strategy bots that compete in physics-accurate F1 simulations. Build a race plan, test it
+              against the field, and refine it across real-world circuits and evolving conditions.
             </p>
 
             <div className="flex items-center gap-4 animate-slide-up flex-wrap" style={{ animationDelay: "0.2s" }}>
-              {session?.user ? (
-                <Link href="/account" className="btn-primary text-base px-8 py-3">
-                  Open Account
-                </Link>
-              ) : (
-                <AuthModal googleEnabled={googleEnabled} triggerLabel="Login / Signup" />
-              )}
               <Link href="/lobby" className="btn-secondary text-base px-8 py-3">
                 Start Racing
               </Link>
@@ -181,14 +173,14 @@ export default async function HomePage() {
           <div className="card p-6 relative overflow-hidden">
             <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-radial from-f1-blue/10 to-transparent" />
             <div className="relative">
-              <span className="section-label text-f1-blue">Account Layer</span>
-              <h3 className="text-xl font-bold text-white mt-2 mb-3">Signed-In Progress</h3>
+              <span className="section-label text-f1-blue">Race Intelligence</span>
+              <h3 className="text-xl font-bold text-white mt-2 mb-3">Decision Pressure</h3>
               <div className="space-y-2 text-sm">
                 {[
-                  "Landing page forces login/signup when no session exists",
-                  "Navbar shows Google OAuth or your avatar on the right edge",
-                  "Account page records submissions, wins, podiums, and race positions",
-                  "MongoDB-backed records are available to season and profile views"
+                  "Track weather swings, degradation curves, and safety-car timing",
+                  "Balance undercuts, stint length, and compound windows lap by lap",
+                  "Compare your choices against built-in bots with different risk profiles",
+                  "Move from quick races into season play across the full circuit rotation"
                 ].map((item, i) => (
                   <div key={i} className="flex items-start gap-2 text-pit-text">
                     <span className="text-f1-blue mt-0.5 text-xs">▸</span>
@@ -230,10 +222,10 @@ export default async function HomePage() {
         <div className="max-w-7xl mx-auto px-6 py-16 text-center">
           <h2 className="text-title text-white mb-4">Ready to strategize?</h2>
           <p className="text-pit-text mb-8 max-w-md mx-auto">
-            Your first race is one function away. Write it, test it, race it, and keep the record on your account.
+            Your first race is one function away. Write it, test it, and see how it survives against the field.
           </p>
-          <Link href={session?.user ? "/account" : "/lobby"} className="btn-primary text-base px-10 py-3.5">
-            {session?.user ? "View Your Account" : "Enter the Pit Wall"}
+          <Link href="/lobby" className="btn-primary text-base px-10 py-3.5">
+            Enter the Pit Wall
           </Link>
         </div>
       </section>

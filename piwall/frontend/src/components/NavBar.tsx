@@ -3,7 +3,6 @@
 import { useState } from "react";
 import Link from "next/link";
 import type { Session } from "next-auth";
-import AuthModal from "@/components/AuthModal";
 import UserMenu from "@/components/UserMenu";
 
 const NAV_LINKS = [
@@ -51,16 +50,7 @@ export default function NavBar({ session, googleEnabled }: NavBarProps) {
         <div className="ml-auto flex items-center gap-3">
           <span className="text-[11px] text-pit-muted font-mono hidden sm:inline">v0.1</span>
           <div className="w-px h-4 bg-pit-border hidden sm:block" />
-          {session?.user ? (
-            <UserMenu image={session.user.image} name={session.user.name} />
-          ) : (
-            <div className="hidden sm:block">
-              <AuthModal
-                googleEnabled={googleEnabled}
-                triggerLabel={googleEnabled ? "Google OAuth" : "Login / Signup"}
-              />
-            </div>
-          )}
+          {session?.user ? <UserMenu image={session.user.image} name={session.user.name} /> : null}
 
           <button
             onClick={() => setMenuOpen(!menuOpen)}
@@ -98,14 +88,7 @@ export default function NavBar({ session, googleEnabled }: NavBarProps) {
                 >
                   Signed in as {session.user.name || "Driver"}
                 </Link>
-              ) : (
-                <div className="px-3 py-2.5">
-                  <AuthModal
-                    googleEnabled={googleEnabled}
-                    triggerLabel={googleEnabled ? "Google OAuth" : "Login / Signup"}
-                  />
-                </div>
-              )}
+              ) : null}
             </div>
           </div>
         </div>
