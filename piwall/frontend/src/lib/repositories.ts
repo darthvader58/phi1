@@ -28,8 +28,19 @@ type DashboardRaceRecord = {
   finishPosition: number;
   lapsCompleted: number;
   fieldSize: number;
+  points: number;
+  pitCount: number;
+  compoundsUsed: string[];
   notes: string;
   status: string;
+  createdAt: string | null;
+};
+
+type DashboardEloEntry = {
+  raceId: string;
+  eloBefore: number;
+  eloAfter: number;
+  delta: number;
   createdAt: string | null;
 };
 
@@ -55,28 +66,47 @@ function mapManualRaceRecord(record: any): DashboardRaceRecord {
     finishPosition: Number(record.finishPosition),
     lapsCompleted: Number(record.lapsCompleted),
     fieldSize: Number(record.fieldSize),
+    points: Number(record.points ?? 0),
+    pitCount: Number(record.pitCount ?? 0),
+    compoundsUsed: Array.isArray(record.compoundsUsed) ? record.compoundsUsed.map(String) : [],
     notes: String(record.notes ?? ""),
     status: String(record.status),
     createdAt: toIsoString(record.createdAt)
   };
 }
 
-async function getLinkedBackendRaceRecords(db: Awaited<ReturnType<typeof getDb>>, profile: any) {
+async function resolveBackendPlayer(db: Awaited<ReturnType<typeof getDb>>, profile: any) {
   const backendPlayerId = typeof profile?.backendPlayerId === "string" ? profile.backendPlayerId : null;
   const backendUsername = typeof profile?.backendUsername === "string" ? profile.backendUsername : null;
   const backendApiKey = typeof profile?.backendApiKey === "string" ? profile.backendApiKey : null;
 
-  let resolvedPlayerId = backendPlayerId;
+  if (backendPlayerId) {
+    const backendPlayer = await db.collection("players").findOne({ id: backendPlayerId });
+    if (backendPlayer) {
+      return backendPlayer;
+    }
+  }
 
-  if (!resolvedPlayerId && backendUsername) {
+  if (backendUsername) {
     const backendPlayer = await db.collection("players").findOne({ username: backendUsername });
-    resolvedPlayerId = typeof backendPlayer?.id === "string" ? backendPlayer.id : null;
+    if (backendPlayer) {
+      return backendPlayer;
+    }
   }
 
-  if (!resolvedPlayerId && backendApiKey) {
+  if (backendApiKey) {
     const backendPlayer = await db.collection("players").findOne({ api_key: backendApiKey });
-    resolvedPlayerId = typeof backendPlayer?.id === "string" ? backendPlayer.id : null;
+    if (backendPlayer) {
+      return backendPlayer;
+    }
   }
+
+  return null;
+}
+
+async function getLinkedBackendRaceRecords(db: Awaited<ReturnType<typeof getDb>>, profile: any) {
+  const backendPlayer = await resolveBackendPlayer(db, profile);
+  const resolvedPlayerId = typeof backendPlayer?.id === "string" ? backendPlayer.id : null;
 
   if (!resolvedPlayerId) {
     return [] as DashboardRaceRecord[];
@@ -105,11 +135,33 @@ async function getLinkedBackendRaceRecords(db: Awaited<ReturnType<typeof getDb>>
       finishPosition,
       lapsCompleted: 0,
       fieldSize: 0,
+      points: Number(result.points ?? 0),
+      pitCount: pitLaps.length,
+      compoundsUsed: Array.isArray(result.compounds_used) ? result.compounds_used.map(String) : [],
       notes: pitLaps.length ? `${pitLaps.length} stop${pitLaps.length === 1 ? "" : "s"}` : "",
       status,
       createdAt: toIsoString(race?.finished_at) ?? toIsoString(race?.created_at)
     };
   });
+}
+
+async function getLinkedBackendEloHistory(db: Awaited<ReturnType<typeof getDb>>, profile: any) {
+  const backendPlayer = await resolveBackendPlayer(db, profile);
+  const resolvedPlayerId = typeof backendPlayer?.id === "string" ? backendPlayer.id : null;
+
+  if (!resolvedPlayerId) {
+    return [] as DashboardEloEntry[];
+  }
+
+  const history = await db.collection("elo_history").find({ player_id: resolvedPlayerId }).sort({ created_at: 1 }).limit(24).toArray();
+
+  return history.map((entry) => ({
+    raceId: String(entry.race_id),
+    eloBefore: Number(entry.elo_before),
+    eloAfter: Number(entry.elo_after),
+    delta: Number(entry.delta),
+    createdAt: toIsoString(entry.created_at)
+  }));
 }
 
 export async function upsertPlayerProfile(user: {
@@ -228,8 +280,12 @@ export async function getUserDashboard(userId: string) {
         totalRaces: 0,
         wins: 0,
         podiums: 0,
+        dnfs: 0,
+        winRate: 0,
         averageFinish: null
       },
+      backendProfile: null,
+      eloHistory: [],
       submissions: [],
       raceRecords: []
     };
@@ -250,7 +306,12 @@ export async function getUserDashboard(userId: string) {
     db.collection("raceRecords").find({ userId: normalizedUserId }).sort({ createdAt: -1 }).limit(12).toArray()
   ]);
 
-  const linkedBackendRaceRecords = await getLinkedBackendRaceRecords(db, profile);
+  const [backendPlayer, linkedBackendRaceRecords, eloHistory] = await Promise.all([
+    resolveBackendPlayer(db, profile),
+    getLinkedBackendRaceRecords(db, profile),
+    getLinkedBackendEloHistory(db, profile)
+  ]);
+
   const raceRecords = [
     ...manualRaceRecords.map(mapManualRaceRecord),
     ...linkedBackendRaceRecords
@@ -262,6 +323,8 @@ export async function getUserDashboard(userId: string) {
 
   const wins = raceRecords.filter((record) => record.finishPosition === 1).length;
   const podiums = raceRecords.filter((record) => record.finishPosition <= 3).length;
+  const dnfs = raceRecords.filter((record) => record.status === "DNF").length;
+  const winRate = totalRaces === 0 ? 0 : Number(((wins / totalRaces) * 100).toFixed(1));
   const averageFinish =
     totalRaces === 0
       ? null
@@ -285,8 +348,18 @@ export async function getUserDashboard(userId: string) {
       totalRaces,
       wins,
       podiums,
+      dnfs,
+      winRate,
       averageFinish
     },
+    backendProfile: backendPlayer
+      ? {
+          username: String(backendPlayer.username ?? ""),
+          team: String(backendPlayer.team_name ?? "Pit Wall"),
+          elo: Number(backendPlayer.elo ?? 1200)
+        }
+      : null,
+    eloHistory,
     submissions: submissions.map((submission) => ({
       id: submission._id.toString(),
       track: String(submission.track),
