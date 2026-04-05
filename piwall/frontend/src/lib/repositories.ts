@@ -20,13 +20,96 @@ export type RaceRecordInput = {
   status: string;
 };
 
+type DashboardRaceRecord = {
+  id: string;
+  track: string;
+  seasonLabel: string;
+  gridPosition: number;
+  finishPosition: number;
+  lapsCompleted: number;
+  fieldSize: number;
+  notes: string;
+  status: string;
+  createdAt: string | null;
+};
+
 async function getDb() {
   const client = await getMongoClientPromise();
   return client.db(getDatabaseName());
 }
 
-function toObjectId(id: string) {
-  return new ObjectId(id);
+function normalizeUserId(id: string) {
+  return id.trim();
+}
+
+function toIsoString(value: unknown) {
+  return value instanceof Date ? value.toISOString() : null;
+}
+
+function mapManualRaceRecord(record: any): DashboardRaceRecord {
+  return {
+    id: record._id.toString(),
+    track: String(record.track),
+    seasonLabel: String(record.seasonLabel),
+    gridPosition: Number(record.gridPosition),
+    finishPosition: Number(record.finishPosition),
+    lapsCompleted: Number(record.lapsCompleted),
+    fieldSize: Number(record.fieldSize),
+    notes: String(record.notes ?? ""),
+    status: String(record.status),
+    createdAt: toIsoString(record.createdAt)
+  };
+}
+
+async function getLinkedBackendRaceRecords(db: Awaited<ReturnType<typeof getDb>>, profile: any) {
+  const backendPlayerId = typeof profile?.backendPlayerId === "string" ? profile.backendPlayerId : null;
+  const backendUsername = typeof profile?.backendUsername === "string" ? profile.backendUsername : null;
+  const backendApiKey = typeof profile?.backendApiKey === "string" ? profile.backendApiKey : null;
+
+  let resolvedPlayerId = backendPlayerId;
+
+  if (!resolvedPlayerId && backendUsername) {
+    const backendPlayer = await db.collection("players").findOne({ username: backendUsername });
+    resolvedPlayerId = typeof backendPlayer?.id === "string" ? backendPlayer.id : null;
+  }
+
+  if (!resolvedPlayerId && backendApiKey) {
+    const backendPlayer = await db.collection("players").findOne({ api_key: backendApiKey });
+    resolvedPlayerId = typeof backendPlayer?.id === "string" ? backendPlayer.id : null;
+  }
+
+  if (!resolvedPlayerId) {
+    return [] as DashboardRaceRecord[];
+  }
+
+  const results = await db.collection("race_results").find({ player_id: resolvedPlayerId }).sort({ id: -1 }).limit(20).toArray();
+  if (results.length === 0) {
+    return [] as DashboardRaceRecord[];
+  }
+
+  const raceIds = [...new Set(results.map((result) => String(result.race_id)))];
+  const races = await db.collection("races").find({ id: { $in: raceIds } }).toArray();
+  const raceLookup = new Map(races.map((race) => [String(race.id), race]));
+
+  return results.map((result) => {
+    const race = raceLookup.get(String(result.race_id));
+    const pitLaps = Array.isArray(result.pit_laps) ? result.pit_laps : [];
+    const finishPosition = Number(result.position);
+    const status = result.retired ? "DNF" : "Finished";
+
+    return {
+      id: String(result.id ?? result._id?.toString?.() ?? result.race_id),
+      track: String(race?.track ?? "Unknown"),
+      seasonLabel: race?.race_type === "season" ? "Season Race" : "Quick Race",
+      gridPosition: 0,
+      finishPosition,
+      lapsCompleted: 0,
+      fieldSize: 0,
+      notes: pitLaps.length ? `${pitLaps.length} stop${pitLaps.length === 1 ? "" : "s"}` : "",
+      status,
+      createdAt: toIsoString(race?.finished_at) ?? toIsoString(race?.created_at)
+    };
+  });
 }
 
 export async function upsertPlayerProfile(user: {
@@ -40,14 +123,58 @@ export async function upsertPlayerProfile(user: {
   }
 
   const db = await getDb();
+  const normalizedUserId = normalizeUserId(user.id);
 
   await db.collection("playerProfiles").updateOne(
-    { userId: toObjectId(user.id) },
+    { userId: normalizedUserId },
     {
       $set: {
+        userId: normalizedUserId,
         name: user.name ?? "Pit Wall Driver",
         email: user.email ?? null,
         image: user.image ?? null,
+        updatedAt: new Date()
+      },
+      $setOnInsert: {
+        createdAt: new Date()
+      }
+    },
+    { upsert: true }
+  );
+}
+
+export async function getPlayerProfileByUserId(userId: string) {
+  if (!isMongoConfigured()) {
+    return null;
+  }
+
+  const db = await getDb();
+  return db.collection("playerProfiles").findOne({ userId: normalizeUserId(userId) });
+}
+
+export async function saveBackendPlayerCredentials(
+  userId: string,
+  credentials: {
+    backendUsername: string;
+    backendApiKey: string;
+    backendPlayerId?: string | null;
+  }
+) {
+  if (!isMongoConfigured()) {
+    return;
+  }
+
+  const db = await getDb();
+  const normalizedUserId = normalizeUserId(userId);
+
+  await db.collection("playerProfiles").updateOne(
+    { userId: normalizedUserId },
+    {
+      $set: {
+        userId: normalizedUserId,
+        backendUsername: credentials.backendUsername,
+        backendApiKey: credentials.backendApiKey,
+        backendPlayerId: credentials.backendPlayerId ?? null,
         updatedAt: new Date()
       },
       $setOnInsert: {
@@ -66,7 +193,7 @@ export async function createSubmission(userId: string, input: SubmissionInput) {
   const db = await getDb();
   const now = new Date();
   const result = await db.collection("strategySubmissions").insertOne({
-    userId: toObjectId(userId),
+    userId: normalizeUserId(userId),
     ...input,
     createdAt: now,
     updatedAt: now
@@ -83,7 +210,7 @@ export async function createRaceRecord(userId: string, input: RaceRecordInput) {
   const db = await getDb();
   const now = new Date();
   const result = await db.collection("raceRecords").insertOne({
-    userId: toObjectId(userId),
+    userId: normalizeUserId(userId),
     ...input,
     createdAt: now,
     updatedAt: now
@@ -109,20 +236,29 @@ export async function getUserDashboard(userId: string) {
   }
 
   const db = await getDb();
-  const objectId = toObjectId(userId);
+  const normalizedUserId = normalizeUserId(userId);
 
-  const [profile, totalSubmissions, totalRaces, submissions, raceRecords] = await Promise.all([
-    db.collection("playerProfiles").findOne({ userId: objectId }),
-    db.collection("strategySubmissions").countDocuments({ userId: objectId }),
-    db.collection("raceRecords").countDocuments({ userId: objectId }),
+  const [profile, totalSubmissions, submissions, manualRaceRecords] = await Promise.all([
+    db.collection("playerProfiles").findOne({ userId: normalizedUserId }),
+    db.collection("strategySubmissions").countDocuments({ userId: normalizedUserId }),
     db
       .collection("strategySubmissions")
-      .find({ userId: objectId })
+      .find({ userId: normalizedUserId })
       .sort({ createdAt: -1 })
       .limit(8)
       .toArray(),
-    db.collection("raceRecords").find({ userId: objectId }).sort({ createdAt: -1 }).limit(12).toArray()
+    db.collection("raceRecords").find({ userId: normalizedUserId }).sort({ createdAt: -1 }).limit(12).toArray()
   ]);
+
+  const linkedBackendRaceRecords = await getLinkedBackendRaceRecords(db, profile);
+  const raceRecords = [
+    ...manualRaceRecords.map(mapManualRaceRecord),
+    ...linkedBackendRaceRecords
+  ]
+    .sort((a, b) => new Date(b.createdAt ?? 0).getTime() - new Date(a.createdAt ?? 0).getTime())
+    .slice(0, 12);
+
+  const totalRaces = raceRecords.length;
 
   const wins = raceRecords.filter((record) => record.finishPosition === 1).length;
   const podiums = raceRecords.filter((record) => record.finishPosition <= 3).length;
@@ -141,7 +277,7 @@ export async function getUserDashboard(userId: string) {
           name: String(profile.name ?? ""),
           email: String(profile.email ?? ""),
           image: profile.image ? String(profile.image) : null,
-          createdAt: profile.createdAt instanceof Date ? profile.createdAt.toISOString() : null
+          createdAt: toIsoString(profile.createdAt)
         }
       : null,
     stats: {
@@ -158,20 +294,9 @@ export async function getUserDashboard(userId: string) {
       stintPlan: String(submission.stintPlan),
       riskLevel: String(submission.riskLevel),
       notes: String(submission.notes),
-      createdAt: submission.createdAt instanceof Date ? submission.createdAt.toISOString() : null
+      createdAt: toIsoString(submission.createdAt)
     })),
-    raceRecords: raceRecords.map((record) => ({
-      id: record._id.toString(),
-      track: String(record.track),
-      seasonLabel: String(record.seasonLabel),
-      gridPosition: Number(record.gridPosition),
-      finishPosition: Number(record.finishPosition),
-      lapsCompleted: Number(record.lapsCompleted),
-      fieldSize: Number(record.fieldSize),
-      notes: String(record.notes ?? ""),
-      status: String(record.status),
-      createdAt: record.createdAt instanceof Date ? record.createdAt.toISOString() : null
-    }))
+    raceRecords
   };
 }
 
@@ -185,7 +310,7 @@ export async function getRaceRecord(recordId: string) {
   }
 
   const db = await getDb();
-  const record = await db.collection("raceRecords").findOne({ _id: toObjectId(recordId) });
+  const record = await db.collection("raceRecords").findOne({ _id: new ObjectId(recordId) });
 
   if (!record) {
     return null;

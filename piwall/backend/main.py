@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel
 
 from .db.models import create_db_engine, init_db
@@ -64,7 +65,7 @@ active_lobbies: Dict[str, RaceLobby] = {}
 
 # ─── Database setup ──────────────────────────────────────────────────
 
-DB_URL = os.environ.get("DATABASE_URL", "sqlite:///piwall.db")
+DB_URL = os.environ.get("MONGODB_URI") or os.environ.get("DATABASE_URL") or "mongodb://127.0.0.1:27017/phi1"
 db_engine = create_db_engine(DB_URL)
 SessionLocal = init_db(db_engine)
 
@@ -148,7 +149,10 @@ def register(req: RegisterRequest):
         existing = crud.get_player_by_username(db, req.username)
         if existing:
             raise HTTPException(400, "Username already taken")
-        player = crud.create_player(db, req.username, req.team_name)
+        try:
+            player = crud.create_player(db, req.username, req.team_name)
+        except DuplicateKeyError:
+            raise HTTPException(400, "Username already taken")
         return {
             "id": player.id,
             "username": player.username,
@@ -274,9 +278,7 @@ def get_race(race_id: str):
         race = crud.get_race(db, race_id)
         if not race:
             raise HTTPException(404, "Race not found")
-        results = db.query(crud.RaceResultRow).filter(
-            crud.RaceResultRow.race_id == race_id
-        ).order_by(crud.RaceResultRow.position).all()
+        results = crud.get_race_results(db, race_id)
         return {
             "race_id": race_id,
             "track": race.track,
@@ -657,7 +659,7 @@ def suggest_match(x_api_key: str = Header()):
         try:
             elos = []
             for pid in lobby.players:
-                p = db.query(crud.Player).filter(crud.Player.id == pid).first()
+                p = crud.get_player_by_id(db, pid)
                 if p:
                     elos.append(p.elo)
             avg_elo = sum(elos) / len(elos) if elos else 1200.0
@@ -835,29 +837,18 @@ async def _run_race(race_id: str):
         ]
         current_ratings = {}
         for pid, _, _ in standings_tuples:
-            player = db.query(crud.Player).filter(crud.Player.id == pid).first()
-            if player:
-                current_ratings[pid] = player.elo
-            else:
-                current_ratings[pid] = 1200.0
+            player = crud.get_player_by_id(db, pid)
+            current_ratings[pid] = player.elo if player else 1200.0
 
         k_factor = 48.0 if lobby.race_type == "season" else 32.0
         new_ratings = compute_elo_updates(standings_tuples, current_ratings, k_factor)
 
         for pid, new_elo in new_ratings.items():
-            player = db.query(crud.Player).filter(crud.Player.id == pid).first()
+            player = crud.get_player_by_id(db, pid)
             if player:
                 old_elo = player.elo
-                player.elo = new_elo
-                elo_hist = crud.EloHistory(
-                    player_id=pid,
-                    race_id=race_id,
-                    elo_before=old_elo,
-                    elo_after=new_elo,
-                    delta=new_elo - old_elo,
-                )
-                db.add(elo_hist)
-        db.commit()
+                crud.update_player_elo(db, pid, new_elo)
+                crud.save_elo_history(db, pid, race_id, old_elo, new_elo)
     finally:
         db.close()
 

@@ -1,203 +1,229 @@
-"""CRUD operations for PIT WALL database."""
+"""CRUD operations for PIT WALL database backed by MongoDB."""
 
+import datetime
 import hashlib
 import secrets
-import datetime
+import uuid
 from typing import List, Optional
 
-from sqlalchemy.orm import Session
-
-from .models import Player, Season, Race, RaceResultRow, BotSubmission, EloHistory
+from .models import to_namespace
 
 
-# ─── Players ──────────────────────────────────────────────────────────
+def _now():
+    return datetime.datetime.utcnow()
 
-def create_player(db: Session, username: str, team_name: str = "Independent") -> Player:
-    api_key = f"pw_{secrets.token_hex(24)}"
-    player = Player(username=username, api_key=api_key, team_name=team_name)
-    db.add(player)
-    db.commit()
-    db.refresh(player)
+
+def _id():
+    return str(uuid.uuid4())
+
+
+def _player_doc(player):
+    return {
+        "id": player.id,
+        "username": player.username,
+        "api_key": player.api_key,
+        "elo": player.elo,
+        "team_name": player.team_name,
+        "created_at": player.created_at,
+    }
+
+
+def create_player(db, username: str, team_name: str = "Independent"):
+    player = to_namespace({
+        "id": _id(),
+        "username": username,
+        "api_key": f"pw_{secrets.token_hex(24)}",
+        "elo": 1200.0,
+        "team_name": team_name,
+        "created_at": _now(),
+    })
+    db.db.players.insert_one(_player_doc(player))
     return player
 
 
-def get_player_by_api_key(db: Session, api_key: str) -> Optional[Player]:
-    return db.query(Player).filter(Player.api_key == api_key).first()
+def get_player_by_api_key(db, api_key: str):
+    return to_namespace(db.db.players.find_one({"api_key": api_key}))
 
 
-def get_player_by_username(db: Session, username: str) -> Optional[Player]:
-    return db.query(Player).filter(Player.username == username).first()
+def get_player_by_username(db, username: str):
+    return to_namespace(db.db.players.find_one({"username": username}))
 
 
-def get_leaderboard(db: Session, limit: int = 50) -> List[Player]:
-    return db.query(Player).order_by(Player.elo.desc()).limit(limit).all()
+def get_player_by_id(db, player_id: str):
+    return to_namespace(db.db.players.find_one({"id": player_id}))
 
 
-# ─── Races ────────────────────────────────────────────────────────────
+def update_player_elo(db, player_id: str, new_elo: float):
+    db.db.players.update_one({"id": player_id}, {"$set": {"elo": new_elo}})
 
-def create_race(
-    db: Session,
-    track: str,
-    race_type: str = "quick",
-    season_id: Optional[str] = None,
-    weather_seed: Optional[int] = None,
-) -> Race:
-    race = Race(
-        track=track,
-        race_type=race_type,
-        season_id=season_id,
-        weather_seed=weather_seed,
+
+def get_leaderboard(db, limit: int = 50):
+    return [to_namespace(doc) for doc in db.db.players.find({}).sort("elo", -1).limit(limit)]
+
+
+def create_race(db, track: str, race_type: str = "quick", season_id: Optional[str] = None, weather_seed: Optional[int] = None):
+    race = {
+        "id": _id(),
+        "season_id": season_id,
+        "track": track,
+        "race_type": race_type,
+        "status": "lobby",
+        "weather_seed": weather_seed,
+        "created_at": _now(),
+        "started_at": None,
+        "finished_at": None,
+        "lap_data_json": None,
+        "events_json": None,
+    }
+    db.db.races.insert_one(race)
+    return to_namespace(race)
+
+
+def get_race(db, race_id: str):
+    return to_namespace(db.db.races.find_one({"id": race_id}))
+
+
+def get_race_results(db, race_id: str):
+    docs = db.db.race_results.find({"race_id": race_id}).sort("position", 1)
+    return [to_namespace(doc) for doc in docs]
+
+
+def get_active_races(db):
+    docs = db.db.races.find({"status": {"$in": ["lobby", "countdown", "running"]}}).sort("created_at", -1)
+    return [to_namespace(doc) for doc in docs]
+
+
+def update_race_status(db, race_id: str, status: str):
+    updates = {"status": status}
+    if status == "running":
+        updates["started_at"] = _now()
+    elif status == "finished":
+        updates["finished_at"] = _now()
+    db.db.races.update_one({"id": race_id}, {"$set": updates})
+
+
+def save_race_data(db, race_id: str, lap_data: list, events: list):
+    db.db.races.update_one(
+        {"id": race_id},
+        {
+            "$set": {
+                "lap_data_json": lap_data,
+                "events_json": [
+                    {"lap": e.lap, "type": e.event_type, "car_id": e.car_id, "detail": e.detail}
+                    for e in events
+                ],
+            }
+        },
     )
-    db.add(race)
-    db.commit()
-    db.refresh(race)
-    return race
 
-
-def get_race(db: Session, race_id: str) -> Optional[Race]:
-    return db.query(Race).filter(Race.id == race_id).first()
-
-
-def get_active_races(db: Session) -> List[Race]:
-    return db.query(Race).filter(
-        Race.status.in_(["lobby", "countdown", "running"])
-    ).order_by(Race.created_at.desc()).all()
-
-
-def update_race_status(db: Session, race_id: str, status: str):
-    race = get_race(db, race_id)
-    if race:
-        race.status = status
-        if status == "running":
-            race.started_at = datetime.datetime.utcnow()
-        elif status == "finished":
-            race.finished_at = datetime.datetime.utcnow()
-        db.commit()
-
-
-def save_race_data(db: Session, race_id: str, lap_data: list, events: list):
-    race = get_race(db, race_id)
-    if race:
-        race.lap_data_json = lap_data
-        race.events_json = [
-            {"lap": e.lap, "type": e.event_type, "car_id": e.car_id, "detail": e.detail}
-            for e in events
-        ]
-        db.commit()
-
-
-# ─── Race Results ─────────────────────────────────────────────────────
 
 POINTS_TABLE = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
 
 
-def save_race_results(db: Session, race_id: str, standings: list) -> List[RaceResultRow]:
-    results = []
+def save_race_results(db, race_id: str, standings: list):
+    rows = []
     for car in standings:
-        points = POINTS_TABLE.get(car.position, 0) if not car.retired else 0
-        row = RaceResultRow(
-            race_id=race_id,
-            player_id=car.player_id,
-            car_id=car.car_id,
-            position=car.position,
-            points=points,
-            total_time=car.total_time if not car.retired else None,
-            pit_laps=car.pit_laps,
-            compounds_used=car.compounds_used,
-            retired=car.retired,
-        )
-        db.add(row)
-        results.append(row)
-    db.commit()
-    return results
+        row = {
+            "id": _id(),
+            "race_id": race_id,
+            "player_id": car.player_id,
+            "car_id": car.car_id,
+            "position": car.position,
+            "points": POINTS_TABLE.get(car.position, 0) if not car.retired else 0,
+            "total_time": car.total_time if not car.retired else None,
+            "pit_laps": car.pit_laps,
+            "compounds_used": car.compounds_used,
+            "strategy_json": None,
+            "retired": car.retired,
+        }
+        db.db.race_results.insert_one(row)
+        rows.append(to_namespace(row))
+    return rows
 
 
-# ─── Bot Submissions ─────────────────────────────────────────────────
-
-def save_bot_submission(
-    db: Session, player_id: str, code: str, race_id: Optional[str] = None,
-) -> BotSubmission:
-    code_hash = hashlib.sha256(code.encode()).hexdigest()[:16]
-    sub = BotSubmission(
-        player_id=player_id,
-        race_id=race_id,
-        code=code,
-        code_hash=code_hash,
-    )
-    db.add(sub)
-    db.commit()
-    db.refresh(sub)
-    return sub
+def save_bot_submission(db, player_id: str, code: str, race_id: Optional[str] = None):
+    sub = {
+        "id": _id(),
+        "player_id": player_id,
+        "race_id": race_id,
+        "code": code,
+        "code_hash": hashlib.sha256(code.encode()).hexdigest()[:16],
+        "submitted_at": _now(),
+    }
+    db.db.bot_submissions.insert_one(sub)
+    return to_namespace(sub)
 
 
-def get_player_submissions(db: Session, player_id: str, limit: int = 20) -> List[BotSubmission]:
-    return (
-        db.query(BotSubmission)
-        .filter(BotSubmission.player_id == player_id)
-        .order_by(BotSubmission.submitted_at.desc())
-        .limit(limit)
-        .all()
-    )
+def get_player_submissions(db, player_id: str, limit: int = 20):
+    docs = db.db.bot_submissions.find({"player_id": player_id}).sort("submitted_at", -1).limit(limit)
+    return [to_namespace(doc) for doc in docs]
 
 
-# ─── Seasons ──────────────────────────────────────────────────────────
-
-def create_season(db: Session, name: str, tracks: List[str]) -> Season:
-    season = Season(name=name, track_rotation=tracks)
-    db.add(season)
-    db.commit()
-    db.refresh(season)
-    return season
-
-
-def get_active_season(db: Session) -> Optional[Season]:
-    return db.query(Season).filter(Season.active == True).first()
-
-
-def get_all_seasons(db: Session) -> List[Season]:
-    return db.query(Season).order_by(Season.start_date.desc()).all()
+def create_season(db, name: str, tracks: List[str]):
+    season = {
+        "id": _id(),
+        "name": name,
+        "start_date": _now(),
+        "end_date": None,
+        "track_rotation": tracks,
+        "active": True,
+    }
+    db.db.seasons.insert_one(season)
+    season_obj = to_namespace(season)
+    season_obj.races = []
+    return season_obj
 
 
-def get_season(db: Session, season_id: str) -> Optional[Season]:
-    return db.query(Season).filter(Season.id == season_id).first()
-
-
-def end_season(db: Session, season_id: str) -> Optional[Season]:
-    season = get_season(db, season_id)
+def get_active_season(db):
+    season = to_namespace(db.db.seasons.find_one({"active": True}, sort=[("start_date", -1)]))
     if season:
-        season.active = False
-        season.end_date = datetime.datetime.utcnow()
-        db.commit()
-        db.refresh(season)
+        season.races = get_season_races(db, season.id)
     return season
 
 
-def get_season_races(db: Session, season_id: str) -> List[Race]:
-    return (
-        db.query(Race)
-        .filter(Race.season_id == season_id)
-        .order_by(Race.created_at.asc())
-        .all()
+def get_all_seasons(db):
+    seasons = [to_namespace(doc) for doc in db.db.seasons.find({}).sort("start_date", -1)]
+    for season in seasons:
+        season.races = get_season_races(db, season.id)
+    return seasons
+
+
+def get_season(db, season_id: str):
+    season = to_namespace(db.db.seasons.find_one({"id": season_id}))
+    if season:
+        season.races = get_season_races(db, season.id)
+    return season
+
+
+def end_season(db, season_id: str):
+    db.db.seasons.update_one(
+        {"id": season_id},
+        {"$set": {"active": False, "end_date": _now()}},
     )
+    return get_season(db, season_id)
 
 
-def get_season_standings(db: Session, season_id: str) -> List[dict]:
-    """Get championship standings for a season."""
-    races = db.query(Race).filter(Race.season_id == season_id, Race.status == "finished").all()
-    race_ids = [r.id for r in races]
-    if not race_ids:
+def get_season_races(db, season_id: str):
+    docs = db.db.races.find({"season_id": season_id}).sort("created_at", 1)
+    return [to_namespace(doc) for doc in docs]
+
+
+def get_season_standings(db, season_id: str):
+    races = get_season_races(db, season_id)
+    finished_race_ids = [race.id for race in races if race.status == "finished"]
+    if not finished_race_ids:
         return []
 
-    results = db.query(RaceResultRow).filter(RaceResultRow.race_id.in_(race_ids)).all()
-
-    # Aggregate points per player
+    results = list(db.db.race_results.find({"race_id": {"$in": finished_race_ids}}))
     standings = {}
-    for r in results:
-        if r.player_id not in standings:
-            player = db.query(Player).filter(Player.id == r.player_id).first()
-            standings[r.player_id] = {
-                "player_id": r.player_id,
-                "username": player.username if player else r.car_id,
+
+    for result in results:
+        player_id = result["player_id"]
+        if player_id not in standings:
+            player = get_player_by_id(db, player_id)
+            standings[player_id] = {
+                "player_id": player_id,
+                "username": player.username if player else result["car_id"],
                 "team": player.team_name if player else "Unknown",
                 "elo": player.elo if player else 1200.0,
                 "total_points": 0,
@@ -207,57 +233,62 @@ def get_season_standings(db: Session, season_id: str) -> List[dict]:
                 "best_finish": 99,
                 "per_race": [],
             }
-        standings[r.player_id]["total_points"] += r.points
-        standings[r.player_id]["races"] += 1
-        if r.position == 1 and not r.retired:
-            standings[r.player_id]["wins"] += 1
-        if r.position <= 3 and not r.retired:
-            standings[r.player_id]["podiums"] += 1
-        if r.position < standings[r.player_id]["best_finish"]:
-            standings[r.player_id]["best_finish"] = r.position
-        standings[r.player_id]["per_race"].append({
-            "race_id": r.race_id,
-            "position": r.position,
-            "points": r.points,
-            "retired": r.retired,
+
+        row = standings[player_id]
+        row["total_points"] += result["points"]
+        row["races"] += 1
+        if result["position"] == 1 and not result["retired"]:
+            row["wins"] += 1
+        if result["position"] <= 3 and not result["retired"]:
+            row["podiums"] += 1
+        row["best_finish"] = min(row["best_finish"], result["position"])
+        row["per_race"].append({
+            "race_id": result["race_id"],
+            "position": result["position"],
+            "points": result["points"],
+            "retired": result["retired"],
         })
 
-    return sorted(standings.values(), key=lambda x: -x["total_points"])
+    return sorted(standings.values(), key=lambda item: -item["total_points"])
 
 
-# ─── ELO History ─────────────────────────────────────────────────────
+def save_elo_history(db, player_id: str, race_id: str, elo_before: float, elo_after: float):
+    record = {
+        "id": _id(),
+        "player_id": player_id,
+        "race_id": race_id,
+        "elo_before": elo_before,
+        "elo_after": elo_after,
+        "delta": elo_after - elo_before,
+        "created_at": _now(),
+    }
+    db.db.elo_history.insert_one(record)
+    return to_namespace(record)
 
-def get_elo_history(db: Session, player_id: str, limit: int = 100) -> List[EloHistory]:
-    return (
-        db.query(EloHistory)
-        .filter(EloHistory.player_id == player_id)
-        .order_by(EloHistory.id.asc())
-        .limit(limit)
-        .all()
-    )
+
+def get_elo_history(db, player_id: str, limit: int = 100):
+    docs = db.db.elo_history.find({"player_id": player_id}).sort("created_at", 1).limit(limit)
+    return [to_namespace(doc) for doc in docs]
 
 
-def get_player_race_results(db: Session, player_id: str, limit: int = 50) -> List[dict]:
-    """Get a player's recent race results with track info."""
-    results = (
-        db.query(RaceResultRow, Race)
-        .join(Race, RaceResultRow.race_id == Race.id)
-        .filter(RaceResultRow.player_id == player_id)
-        .order_by(Race.finished_at.desc())
-        .limit(limit)
-        .all()
-    )
-    return [
-        {
-            "race_id": r.race_id,
-            "track": race.track,
-            "race_type": race.race_type,
-            "position": r.position,
-            "points": r.points,
-            "pit_count": len(r.pit_laps) if r.pit_laps else 0,
-            "compounds_used": r.compounds_used or [],
-            "retired": r.retired,
-            "finished_at": race.finished_at.isoformat() if race.finished_at else None,
-        }
-        for r, race in results
-    ]
+def get_player_race_results(db, player_id: str, limit: int = 50):
+    results = list(db.db.race_results.find({"player_id": player_id}).sort("id", -1).limit(limit))
+    race_lookup = {
+        race["id"]: race
+        for race in db.db.races.find({"id": {"$in": [row["race_id"] for row in results]}})
+    }
+    payload = []
+    for result in results:
+        race = race_lookup.get(result["race_id"], {})
+        payload.append({
+            "race_id": result["race_id"],
+            "track": race.get("track"),
+            "race_type": race.get("race_type"),
+            "position": result["position"],
+            "points": result["points"],
+            "pit_count": len(result.get("pit_laps") or []),
+            "compounds_used": result.get("compounds_used") or [],
+            "retired": result["retired"],
+            "finished_at": race.get("finished_at").isoformat() if race.get("finished_at") else None,
+        })
+    return payload

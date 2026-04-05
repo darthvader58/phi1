@@ -1,129 +1,67 @@
-"""SQLAlchemy models for PIT WALL persistent data."""
+"""MongoDB helpers for PIT WALL persistent data."""
 
-import datetime
-import uuid
+import os
+from types import SimpleNamespace
+from urllib.parse import urlparse
 
-from sqlalchemy import (
-    Column, String, Integer, Float, DateTime, Text, JSON, Boolean,
-    ForeignKey, Index, create_engine,
-)
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker
-
-Base = declarative_base()
+from pymongo import ASCENDING, DESCENDING, MongoClient
 
 
-def generate_uuid():
-    return str(uuid.uuid4())
+def _resolve_database_name(url: str) -> str:
+    explicit_name = os.environ.get("MONGODB_DB")
+    if explicit_name:
+        return explicit_name
+
+    parsed = urlparse(url)
+    path_name = parsed.path.lstrip("/")
+    return path_name or "phi1"
 
 
-class Player(Base):
-    __tablename__ = "players"
+class MongoSession:
+    """Tiny session-like wrapper so the rest of the app can keep its structure."""
 
-    id = Column(String, primary_key=True, default=generate_uuid)
-    username = Column(String(64), unique=True, nullable=False, index=True)
-    api_key = Column(String(128), unique=True, nullable=False, index=True)
-    elo = Column(Float, default=1200.0)
-    team_name = Column(String(64), default="Independent")
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    def __init__(self, db):
+        self.db = db
 
-    race_results = relationship("RaceResultRow", back_populates="player")
-    bot_submissions = relationship("BotSubmission", back_populates="player")
-    elo_history = relationship("EloHistory", back_populates="player")
+    def close(self):
+        return None
 
 
-class Season(Base):
-    __tablename__ = "seasons"
-
-    id = Column(String, primary_key=True, default=generate_uuid)
-    name = Column(String(128), nullable=False)
-    start_date = Column(DateTime, default=datetime.datetime.utcnow)
-    end_date = Column(DateTime, nullable=True)
-    track_rotation = Column(JSON, default=list)  # ["bahrain", "monaco", ...]
-    active = Column(Boolean, default=True)
-
-    races = relationship("Race", back_populates="season")
+def create_db_engine(url: str | None = None):
+    mongo_url = url or os.environ.get("MONGODB_URI") or "mongodb://127.0.0.1:27017/phi1"
+    client = MongoClient(mongo_url)
+    db = client[_resolve_database_name(mongo_url)]
+    return db
 
 
-class Race(Base):
-    __tablename__ = "races"
+def init_db(db):
+    db.players.create_index([("id", ASCENDING)], unique=True)
+    db.players.create_index([("username", ASCENDING)], unique=True)
+    db.players.create_index([("api_key", ASCENDING)], unique=True)
+    db.players.create_index([("elo", DESCENDING)])
 
-    id = Column(String, primary_key=True, default=generate_uuid)
-    season_id = Column(String, ForeignKey("seasons.id"), nullable=True)
-    track = Column(String(64), nullable=False)
-    race_type = Column(String(32), default="quick")  # "quick" or "season"
-    status = Column(String(32), default="lobby")  # lobby/countdown/running/finished
-    weather_seed = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    started_at = Column(DateTime, nullable=True)
-    finished_at = Column(DateTime, nullable=True)
-    lap_data_json = Column(JSON, nullable=True)
-    events_json = Column(JSON, nullable=True)
+    db.seasons.create_index([("id", ASCENDING)], unique=True)
+    db.seasons.create_index([("active", ASCENDING)])
 
-    season = relationship("Season", back_populates="races")
-    results = relationship("RaceResultRow", back_populates="race")
-    submissions = relationship("BotSubmission", back_populates="race")
+    db.races.create_index([("id", ASCENDING)], unique=True)
+    db.races.create_index([("status", ASCENDING)])
+    db.races.create_index([("season_id", ASCENDING), ("created_at", ASCENDING)])
 
-    __table_args__ = (Index("ix_races_status", "status"),)
+    db.race_results.create_index([("id", ASCENDING)], unique=True)
+    db.race_results.create_index([("race_id", ASCENDING), ("position", ASCENDING)])
+    db.race_results.create_index([("player_id", ASCENDING), ("race_id", ASCENDING)])
 
+    db.bot_submissions.create_index([("id", ASCENDING)], unique=True)
+    db.bot_submissions.create_index([("player_id", ASCENDING), ("submitted_at", DESCENDING)])
 
-class RaceResultRow(Base):
-    __tablename__ = "race_results"
+    db.elo_history.create_index([("id", ASCENDING)], unique=True)
+    db.elo_history.create_index([("player_id", ASCENDING), ("created_at", ASCENDING)])
 
-    id = Column(String, primary_key=True, default=generate_uuid)
-    race_id = Column(String, ForeignKey("races.id"), nullable=False)
-    player_id = Column(String, ForeignKey("players.id"), nullable=False)
-    car_id = Column(String(32), nullable=False)
-    position = Column(Integer, nullable=False)
-    points = Column(Integer, default=0)
-    total_time = Column(Float, nullable=True)
-    pit_laps = Column(JSON, default=list)
-    compounds_used = Column(JSON, default=list)
-    strategy_json = Column(JSON, nullable=True)
-    retired = Column(Boolean, default=False)
-
-    race = relationship("Race", back_populates="results")
-    player = relationship("Player", back_populates="race_results")
-
-    __table_args__ = (Index("ix_rr_race_player", "race_id", "player_id"),)
+    return lambda: MongoSession(db)
 
 
-class BotSubmission(Base):
-    __tablename__ = "bot_submissions"
-
-    id = Column(String, primary_key=True, default=generate_uuid)
-    player_id = Column(String, ForeignKey("players.id"), nullable=False)
-    race_id = Column(String, ForeignKey("races.id"), nullable=True)
-    code = Column(Text, nullable=False)
-    code_hash = Column(String(64), nullable=False)
-    submitted_at = Column(DateTime, default=datetime.datetime.utcnow)
-
-    player = relationship("Player", back_populates="bot_submissions")
-    race = relationship("Race", back_populates="submissions")
-
-    __table_args__ = (Index("ix_bs_player", "player_id"),)
-
-
-class EloHistory(Base):
-    __tablename__ = "elo_history"
-
-    id = Column(String, primary_key=True, default=generate_uuid)
-    player_id = Column(String, ForeignKey("players.id"), nullable=False)
-    race_id = Column(String, ForeignKey("races.id"), nullable=False)
-    elo_before = Column(Float, nullable=False)
-    elo_after = Column(Float, nullable=False)
-    delta = Column(Float, nullable=False)
-
-    player = relationship("Player", back_populates="elo_history")
-
-    __table_args__ = (Index("ix_eh_player", "player_id"),)
-
-
-# Database setup helper
-def create_db_engine(url: str = "sqlite:///piwall.db"):
-    engine = create_engine(url, echo=False)
-    return engine
-
-
-def init_db(engine):
-    Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine)
+def to_namespace(document):
+    if document is None:
+        return None
+    payload = {key: value for key, value in document.items() if key != "_id"}
+    return SimpleNamespace(**payload)

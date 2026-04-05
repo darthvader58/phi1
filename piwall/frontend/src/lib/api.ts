@@ -1,14 +1,52 @@
 /** API client for PIT WALL backend. */
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_KEY_STORAGE = "piwall_api_key";
+const USERNAME_STORAGE = "piwall_username";
 
 function getApiKey(): string | null {
   if (typeof window === "undefined") return null;
-  return localStorage.getItem("piwall_api_key");
+  return localStorage.getItem(API_KEY_STORAGE);
 }
 
-async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
-  const apiKey = getApiKey();
+async function provisionBackendPlayer(force = false): Promise<string | null> {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const response = await fetch("/api/backend-player", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ force }),
+    cache: "no-store"
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const payload = (await response.json().catch(() => ({}))) as {
+    apiKey?: string;
+    username?: string;
+  };
+
+  if (!payload.apiKey || !payload.username) {
+    return null;
+  }
+
+  localStorage.setItem(API_KEY_STORAGE, payload.apiKey);
+  localStorage.setItem(USERNAME_STORAGE, payload.username);
+  window.dispatchEvent(new Event("piwall-backend-auth-changed"));
+
+  return payload.apiKey;
+}
+
+async function apiFetch(path: string, options: RequestInit = {}, retry = true): Promise<any> {
+  let apiKey = getApiKey();
+  if (!apiKey && path !== "/api/register") {
+    apiKey = await provisionBackendPlayer();
+  }
+
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string>),
@@ -18,6 +56,15 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
+    if (retry && res.status === 401 && body.detail === "Invalid API key") {
+      localStorage.removeItem(API_KEY_STORAGE);
+      localStorage.removeItem(USERNAME_STORAGE);
+      window.dispatchEvent(new Event("piwall-backend-auth-changed"));
+      const refreshedKey = await provisionBackendPlayer();
+      if (refreshedKey) {
+        return apiFetch(path, options, false);
+      }
+    }
     throw new Error(body.detail || `API error: ${res.status}`);
   }
   return res.json();

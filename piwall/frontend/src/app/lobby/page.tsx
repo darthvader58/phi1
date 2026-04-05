@@ -2,10 +2,12 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
+import { useSession } from "next-auth/react";
 import { api } from "@/lib/api";
 import { useToast } from "@/components/Toast";
 
 export default function LobbyPage() {
+  const { status: authStatus } = useSession();
   const { toast } = useToast();
   const [races, setRaces] = useState<any[]>([]);
   const [leaderboard, setLeaderboard] = useState<any[]>([]);
@@ -39,6 +41,26 @@ export default function LobbyPage() {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const syncLocalState = () => {
+      const apiKey = localStorage.getItem("piwall_api_key");
+      setRegistered(Boolean(apiKey));
+      setUsername(localStorage.getItem("piwall_username") || "");
+    };
+
+    syncLocalState();
+    window.addEventListener("storage", syncLocalState);
+    window.addEventListener("piwall-backend-auth-changed", syncLocalState);
+    return () => {
+      window.removeEventListener("storage", syncLocalState);
+      window.removeEventListener("piwall-backend-auth-changed", syncLocalState);
+    };
+  }, []);
+
   async function loadData() {
     try {
       const [r, lb] = await Promise.all([api.listRaces(), api.getLeaderboard()]);
@@ -60,6 +82,7 @@ export default function LobbyPage() {
       const res = await api.register(username);
       localStorage.setItem("piwall_api_key", res.api_key);
       localStorage.setItem("piwall_username", res.username);
+      window.dispatchEvent(new Event("piwall-backend-auth-changed"));
       setRegistered(true);
       toast("Registered successfully!", "success");
     } catch (err: any) {
@@ -115,20 +138,29 @@ export default function LobbyPage() {
             <div className="card p-6">
               <div className="flex items-center gap-2 mb-4">
                 <div className="accent-line" />
-                <span className="section-label">Register</span>
+                <span className="section-label">
+                  {authStatus === "authenticated" ? "Connecting Driver Profile" : "Register"}
+                </span>
               </div>
-              <form onSubmit={handleRegister} className="flex gap-3">
-                <input
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="Choose a username"
-                  className="input flex-1"
-                  required
-                />
-                <button type="submit" className="btn-primary">
-                  Register
-                </button>
-              </form>
+              {authStatus === "authenticated" ? (
+                <p className="text-sm text-pit-text">
+                  Your signed-in account is provisioning its race profile. Refresh once if this card does not clear in a
+                  moment.
+                </p>
+              ) : (
+                <form onSubmit={handleRegister} className="flex gap-3">
+                  <input
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    placeholder="Choose a username"
+                    className="input flex-1"
+                    required
+                  />
+                  <button type="submit" className="btn-primary">
+                    Register
+                  </button>
+                </form>
+              )}
               {error && <p className="text-f1-red text-xs mt-3">{error}</p>}
             </div>
           ) : (

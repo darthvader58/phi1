@@ -2,10 +2,12 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
+import { useSession } from "next-auth/react";
 import { api } from "@/lib/api";
 import { ActiveSeasonData, SeasonStanding } from "@/lib/types";
 
 export default function SeasonPage() {
+  const { status: authStatus } = useSession();
   const [leaderboard, setLeaderboard] = useState<any[]>([]);
   const [seasonData, setSeasonData] = useState<ActiveSeasonData | null>(null);
   const [seasonName, setSeasonName] = useState("Season 1");
@@ -18,6 +20,24 @@ export default function SeasonPage() {
       setRegistered(true);
     }
     loadData();
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const syncRegisteredState = () => {
+      setRegistered(Boolean(localStorage.getItem("piwall_api_key")));
+    };
+
+    syncRegisteredState();
+    window.addEventListener("storage", syncRegisteredState);
+    window.addEventListener("piwall-backend-auth-changed", syncRegisteredState);
+    return () => {
+      window.removeEventListener("storage", syncRegisteredState);
+      window.removeEventListener("piwall-backend-auth-changed", syncRegisteredState);
+    };
   }, []);
 
   async function loadData() {
@@ -75,6 +95,9 @@ export default function SeasonPage() {
             </button>
           </div>
         )}
+        {authStatus === "authenticated" && !registered ? (
+          <p className="text-xs text-pit-muted">Provisioning your race profile for season actions.</p>
+        ) : null}
       </div>
 
       <div className="card overflow-hidden mb-6">
