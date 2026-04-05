@@ -9,13 +9,20 @@ import sys
 import os
 import json
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
-from piwall.backend.data.calibration import calibrate_track, _deg_model
-from piwall.backend.data.tracks import TRACKS
-from piwall.backend.engine.physics import TyreModel, TrackPhysics
-from piwall.backend.engine.race import RaceEngine, Decision
-from piwall.backend.engine.bots import BUILTIN_BOTS
+# Support both direct execution and module import
+try:
+    from ..data.calibration import calibrate_track, _deg_model
+    from ..data.tracks import TRACKS
+    from .physics import TyreModel, TrackPhysics
+    from .race import RaceEngine, Decision
+    from .bots import BUILTIN_BOTS
+except ImportError:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+    from piwall.backend.data.calibration import calibrate_track, _deg_model
+    from piwall.backend.data.tracks import TRACKS
+    from piwall.backend.engine.physics import TyreModel, TrackPhysics
+    from piwall.backend.engine.race import RaceEngine, Decision
+    from piwall.backend.engine.bots import BUILTIN_BOTS
 
 
 def build_track_physics(track_name: str) -> TrackPhysics:
@@ -24,30 +31,35 @@ def build_track_physics(track_name: str) -> TrackPhysics:
     cal = calibrate_track(track_name)
 
     tyre_models = {}
-    for compound, params in cal.compounds.items():
+    # Compound speed hierarchy: SOFT fastest, HARD slowest
+    COMPOUND_ALPHA = {"SOFT": 0.0, "MEDIUM": 0.35, "HARD": 0.7}
+    # Compound deg multipliers: SOFT degrades most, HARD least
+    COMPOUND_K_SCALE = {"SOFT": 1.5, "MEDIUM": 1.0, "HARD": 0.65}
+
+    # Use average calibrated exponent and k as reference, then scale per compound
+    cal_compounds = list(cal.compounds.values())
+    ref_e = sum(p.e for p in cal_compounds) / len(cal_compounds) if cal_compounds else 1.1
+    ref_k = sum(p.k for p in cal_compounds) / len(cal_compounds) if cal_compounds else 0.05
+
+    for compound in cal.compounds:
         tyre_models[compound] = TyreModel(
             compound=compound,
-            alpha=params.alpha,
-            k=params.k,
-            e=params.e,
-            base_lap_time=params.base_lap_time,
+            alpha=COMPOUND_ALPHA.get(compound, 0.35),
+            k=ref_k * COMPOUND_K_SCALE.get(compound, 1.0),
+            e=ref_e,
+            base_lap_time=cal.base_lap_time,
         )
 
     # Add fallback compounds if missing
     for fallback in ["SOFT", "MEDIUM", "HARD"]:
         if fallback not in tyre_models:
-            # Interpolate from available data
-            if tyre_models:
-                ref = list(tyre_models.values())[0]
-                offsets = {"SOFT": -0.4, "MEDIUM": 0.0, "HARD": 0.5}
-                k_mults = {"SOFT": 1.5, "MEDIUM": 1.0, "HARD": 0.7}
-                tyre_models[fallback] = TyreModel(
-                    compound=fallback,
-                    alpha=ref.alpha + offsets.get(fallback, 0),
-                    k=ref.k * k_mults.get(fallback, 1.0),
-                    e=ref.e,
-                    base_lap_time=ref.base_lap_time + offsets.get(fallback, 0) * 0.3,
-                )
+            tyre_models[fallback] = TyreModel(
+                compound=fallback,
+                alpha=COMPOUND_ALPHA.get(fallback, 0.35),
+                k=ref_k * COMPOUND_K_SCALE.get(fallback, 1.0),
+                e=ref_e,
+                base_lap_time=cal.base_lap_time,
+            )
 
     # Add wet compound fallbacks
     if "INTERMEDIATE" not in tyre_models:
