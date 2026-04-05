@@ -8,8 +8,7 @@ const PRODUCT_LINKS = [
 ];
 
 const SUPPORT_LINKS = [
-  { href: "#", label: "Feedback" },
-  { href: "https://github.com/darthvader58/phi1", label: "GitHub", external: true }
+  { href: "#", label: "Feedback" }
 ];
 
 export default function Footer() {
@@ -46,7 +45,7 @@ export default function Footer() {
           </div>
 
           <div>
-            <h3 className="text-white text-base font-bold mb-2.5">Product</h3>
+            <h3 className="text-white text-base font-bold mb-2.5">Game</h3>
             <div className="space-y-2">
               {PRODUCT_LINKS.map((link) => (
                 <Link
