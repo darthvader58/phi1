@@ -17,7 +17,7 @@ const STATS = [
   { label: "Circuits", value: "6", sub: "Real F1 data" },
   { label: "Built-in Bots", value: "5", sub: "Nash to greedy" },
   { label: "Physics Model", value: "7", sub: "Variables per lap" },
-  { label: "Storage", value: "MDB", sub: "Accounts + race history" }
+  { label: "From FastF1", value: "2024", sub: "Season telemetry" }
 ];
 
 function F1AccentCar() {

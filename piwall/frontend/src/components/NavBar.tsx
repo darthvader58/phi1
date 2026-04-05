@@ -3,13 +3,13 @@
 import { useState } from "react";
 import Link from "next/link";
 import type { Session } from "next-auth";
+import AuthModal from "@/components/AuthModal";
 import UserMenu from "@/components/UserMenu";
 
 const NAV_LINKS = [
   { href: "/lobby", label: "Lobby" },
   { href: "/strategy", label: "Strategy" },
-  { href: "/season", label: "Season" },
-  { href: "/account", label: "Account" }
+  { href: "/season", label: "Season" }
 ];
 
 type NavBarProps = {
@@ -50,7 +50,13 @@ export default function NavBar({ session, googleEnabled }: NavBarProps) {
         <div className="ml-auto flex items-center gap-3">
           <span className="text-[11px] text-pit-muted font-mono hidden sm:inline">v0.1</span>
           <div className="w-px h-4 bg-pit-border hidden sm:block" />
-          {session?.user ? <UserMenu image={session.user.image} name={session.user.name} /> : null}
+          {session?.user ? (
+            <UserMenu image={session.user.image} name={session.user.name} />
+          ) : (
+            <div className="hidden sm:block">
+              <AuthModal googleEnabled={googleEnabled} triggerLabel="Login / Signup" />
+            </div>
+          )}
 
           <button
             onClick={() => setMenuOpen(!menuOpen)}
@@ -88,7 +94,11 @@ export default function NavBar({ session, googleEnabled }: NavBarProps) {
                 >
                   Signed in as {session.user.name || "Driver"}
                 </Link>
-              ) : null}
+              ) : (
+                <div className="px-3 py-2.5">
+                  <AuthModal googleEnabled={googleEnabled} triggerLabel="Login / Signup" />
+                </div>
+              )}
             </div>
           </div>
         </div>
