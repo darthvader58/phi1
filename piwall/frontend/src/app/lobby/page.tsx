@@ -67,11 +67,17 @@ export default function LobbyPage() {
       setRaces(r);
       setLeaderboard(lb);
     } catch {}
-    if (typeof window !== "undefined" && localStorage.getItem("piwall_api_key")) {
+    if (
+      authStatus === "authenticated" &&
+      typeof window !== "undefined" &&
+      localStorage.getItem("piwall_api_key")
+    ) {
       try {
         const s = await api.getSuggestedMatches();
         setSuggestions(s.suggestions || []);
       } catch {}
+    } else {
+      setSuggestions([]);
     }
   }
 

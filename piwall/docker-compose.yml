@@ -1,29 +1,13 @@
-version: '3.8'
-
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: piwall
-      POSTGRES_USER: piwall
-      POSTGRES_PASSWORD: piwall_dev
+  mongodb:
+    image: mongo:7
     ports:
-      - "5432:5432"
+      - "27017:27017"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - mongodata:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U piwall"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' || exit 1"]
+      interval: 10s
       timeout: 5s
       retries: 5
 
@@ -34,12 +18,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://piwall:piwall_dev@postgres:5432/piwall
-      REDIS_URL: redis://redis:6379/0
+      MONGODB_URI: mongodb://mongodb:27017/phi1
+      MONGODB_DB: phi1
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
+      mongodb:
         condition: service_healthy
     volumes:
       - ./backend:/app/backend
@@ -55,8 +38,9 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
       NEXT_PUBLIC_WS_URL: ws://localhost:8000
+      NEXTAUTH_URL: http://localhost:3000
     depends_on:
       - backend
 
 volumes:
-  pgdata:
+  mongodata:

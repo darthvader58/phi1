@@ -66,6 +66,19 @@ active_lobbies: Dict[str, RaceLobby] = {}
 # ─── Database setup ──────────────────────────────────────────────────
 
 DB_URL = os.environ.get("MONGODB_URI") or os.environ.get("DATABASE_URL") or "mongodb://127.0.0.1:27017/phi1"
+
+
+def _parse_cors_origins() -> List[str]:
+    raw = os.environ.get("CORS_ORIGINS") or os.environ.get("FRONTEND_URL")
+    if raw:
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+
+CORS_ORIGINS = _parse_cors_origins()
 db_engine = create_db_engine(DB_URL)
 SessionLocal = init_db(db_engine)
 
@@ -92,7 +105,7 @@ app = FastAPI(title="PIT WALL", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

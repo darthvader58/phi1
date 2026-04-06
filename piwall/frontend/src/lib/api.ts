@@ -41,9 +41,14 @@ async function provisionBackendPlayer(force = false): Promise<string | null> {
   return payload.apiKey;
 }
 
-async function apiFetch(path: string, options: RequestInit = {}, retry = true): Promise<any> {
+async function apiFetch(
+  path: string,
+  options: RequestInit = {},
+  config: { retry?: boolean; requireApiKey?: boolean } = {}
+): Promise<any> {
+  const { retry = true, requireApiKey = false } = config;
   let apiKey = getApiKey();
-  if (!apiKey && path !== "/api/register") {
+  if (requireApiKey && !apiKey) {
     apiKey = await provisionBackendPlayer();
   }
 
@@ -56,13 +61,13 @@ async function apiFetch(path: string, options: RequestInit = {}, retry = true): 
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    if (retry && res.status === 401 && body.detail === "Invalid API key") {
+    if (requireApiKey && retry && res.status === 401 && body.detail === "Invalid API key") {
       localStorage.removeItem(API_KEY_STORAGE);
       localStorage.removeItem(USERNAME_STORAGE);
       window.dispatchEvent(new Event("piwall-backend-auth-changed"));
       const refreshedKey = await provisionBackendPlayer();
       if (refreshedKey) {
-        return apiFetch(path, options, false);
+        return apiFetch(path, options, { retry: false, requireApiKey: true });
       }
     }
     throw new Error(body.detail || `API error: ${res.status}`);
@@ -83,22 +88,22 @@ export const api = {
     apiFetch("/api/race/create", {
       method: "POST",
       body: JSON.stringify({ track, speed, race_type: raceType }),
-    }),
+    }, { requireApiKey: true }),
 
   joinRace: (raceId: string, compound = "MEDIUM") =>
     apiFetch(`/api/race/${raceId}/join`, {
       method: "POST",
       body: JSON.stringify({ starting_compound: compound }),
-    }),
+    }, { requireApiKey: true }),
 
   submitBot: (raceId: string, code: string) =>
     apiFetch(`/api/race/${raceId}/submit-bot`, {
       method: "POST",
       body: JSON.stringify({ code }),
-    }),
+    }, { requireApiKey: true }),
 
   startRace: (raceId: string) =>
-    apiFetch(`/api/race/${raceId}/start`, { method: "POST" }),
+    apiFetch(`/api/race/${raceId}/start`, { method: "POST" }, { requireApiKey: true }),
 
   getRace: (raceId: string) => apiFetch(`/api/race/${raceId}`),
   listRaces: () => apiFetch("/api/races"),
@@ -128,14 +133,14 @@ export const api = {
     apiFetch("/api/season", {
       method: "POST",
       body: JSON.stringify({ name, tracks }),
-    }),
+    }, { requireApiKey: true }),
 
   listSeasons: () => apiFetch("/api/seasons"),
   getActiveSeason: () => apiFetch("/api/season/active"),
   getSeasonStandings: (seasonId: string) => apiFetch(`/api/season/${seasonId}/standings`),
   endSeason: (seasonId: string) =>
-    apiFetch(`/api/season/${seasonId}/end`, { method: "POST" }),
+    apiFetch(`/api/season/${seasonId}/end`, { method: "POST" }, { requireApiKey: true }),
 
   // Matchmaking
-  getSuggestedMatches: () => apiFetch("/api/matchmaking/suggest"),
+  getSuggestedMatches: () => apiFetch("/api/matchmaking/suggest", {}, { requireApiKey: true }),
 };

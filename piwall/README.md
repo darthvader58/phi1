@@ -4,11 +4,16 @@ Write strategy bot functions that race each other in a physics-accurate F1 simul
 
 ## Quick Start
 
-### Backend (standalone, SQLite)
+### Backend
 
 ```bash
 cd piwall
+python3 -m venv ../.venv
+source ../.venv/bin/activate
 pip install -r backend/requirements.txt
+
+export MONGODB_URI='mongodb://127.0.0.1:27017/phi1'
+export MONGODB_DB='phi1'
 
 # Run a CLI race with built-in bots
 PYTHONPATH=. python backend/engine/cli_runner.py bahrain 42
@@ -22,11 +27,12 @@ PYTHONPATH=. uvicorn backend.main:app --reload --port 8000
 ```bash
 cd piwall/frontend
 npm install
+cp .env.example .env.local
 npm run dev
 # Open http://localhost:3000
 ```
 
-### Docker (full stack with Postgres + Redis)
+### Docker (full stack with MongoDB)
 
 ```bash
 cd piwall
@@ -37,9 +43,10 @@ docker-compose up --build
 
 ## Architecture
 
-- **Backend**: Python (FastAPI), FastF1 for real F1 telemetry, SQLAlchemy (Postgres/SQLite)
-- **Frontend**: Next.js 14 (App Router), Tailwind CSS, Canvas API, Monaco Editor
+- **Backend**: Python (FastAPI), FastF1 for real F1 telemetry, MongoDB Atlas or local MongoDB
+- **Frontend**: Next.js 14 (App Router), Tailwind CSS, Monaco Editor, NextAuth
 - **Realtime**: WebSockets for live race broadcasting
+- **Accounts**: Google OAuth or email/password, Mongo-backed submissions and race history
 - **Simulation**: Physics-accurate lap time model calibrated from 2024 F1 data
 
 ## Tracks
