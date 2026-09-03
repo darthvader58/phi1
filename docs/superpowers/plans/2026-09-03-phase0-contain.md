@@ -691,7 +691,10 @@ Per-call isolation is not an option: user code executes once per car per lap (`r
 **Interfaces:**
 - Consumes: `run_isolated`, `MatchAborted` from Task 5.
 - Produces: `run_match(spec: dict) -> dict` — a module-level, picklable function.
-  - `spec` keys: `track` (str), `seed` (int), `cars` (list of `{car_id, player_id, code|bot_id, start_position, starting_compound}`).
+  - `spec` keys: `track` (str, for the record), `track_physics` (a prebuilt `TrackPhysics`,
+    picklable — 537 bytes for Bahrain, verified), `track_config` (the `TRACKS[...]` entry,
+    picklable), `seed` (int), `cars` (list of `{car_id, player_id, code|bot_id, start_position,
+    starting_compound}`). The caller builds `track_physics`/`track_config`; the child never does.
   - Returns `{"standings": [...], "events": [...], "lap_data": [...], "weather_history": [...]}`.
 
 - [ ] **Step 1: Write the failing test**
@@ -704,16 +707,25 @@ import pytest
 from backend.sandbox.isolation import MatchAborted
 from backend.sandbox.match_job import run_match_isolated
 
-SPEC = {
-    "track": "bahrain",
-    "seed": 42,
-    "cars": [
-        {"car_id": "c1", "player_id": "p1", "bot_id": "VEL-01",
-         "start_position": 1, "starting_compound": "MEDIUM"},
-        {"car_id": "c2", "player_id": "p2", "bot_id": "NXS-07",
-         "start_position": 2, "starting_compound": "MEDIUM"},
-    ],
-}
+def make_spec():
+    """Build a match spec. Track physics are built HERE, in the parent, because
+    build_track_physics writes a calibration cache file and the isolated child
+    forbids file writes (RLIMIT_FSIZE=0)."""
+    from backend.data.tracks import TRACKS
+    from backend.engine.cli_runner import build_track_physics
+
+    return {
+        "track": "bahrain",
+        "track_physics": build_track_physics("bahrain"),
+        "track_config": TRACKS["bahrain"],
+        "seed": 42,
+        "cars": [
+            {"car_id": "c1", "player_id": "p1", "bot_id": "VEL-01",
+             "start_position": 1, "starting_compound": "MEDIUM"},
+            {"car_id": "c2", "player_id": "p2", "bot_id": "NXS-07",
+             "start_position": 2, "starting_compound": "MEDIUM"},
+        ],
+    }
 
 HANGS = (
     "def my_strategy(state, my_car):\n"
@@ -723,17 +735,17 @@ HANGS = (
 
 
 def test_runs_a_match_and_returns_standings():
-    result = run_match_isolated(SPEC)
+    result = run_match_isolated(make_spec())
     assert len(result["standings"]) == 2
     assert result["lap_data"]
 
 
 def test_a_hanging_bot_cannot_hang_the_server():
-    spec = dict(SPEC)
+    spec = make_spec()
     spec["cars"] = [
         {"car_id": "c1", "player_id": "p1", "code": HANGS,
          "start_position": 1, "starting_compound": "MEDIUM"},
-        SPEC["cars"][1],
+        spec["cars"][1],
     ]
     with pytest.raises(MatchAborted):
         run_match_isolated(spec, cpu_seconds=3, wall_seconds=10)
@@ -824,9 +836,7 @@ the whole match from a plain dict, with no reference to server state.
 
 from typing import Any, Dict
 
-from backend.data.tracks import TRACKS
 from backend.engine.bots import BUILTIN_BOTS
-from backend.engine.cli_runner import build_track_physics
 from backend.engine.race import Decision, RaceEngine
 from backend.sandbox.isolation import (
     DEFAULT_CPU_SECONDS,
@@ -850,9 +860,18 @@ def _make_user_strategy(code: str):
 
 
 def run_match(spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Run one full match. Module-level and picklable for the spawn context."""
-    track = build_track_physics(spec["track"])
-    config = TRACKS[spec["track"]]
+    """Run one full match. Module-level and picklable for the spawn context.
+
+    Track physics arrive prebuilt in the spec. The child never calls
+    build_track_physics: that runs a scipy curve fit and writes
+    processed_cache/calibration_<track>.json, and the child sets
+    RLIMIT_FSIZE=0, so the write fails with OSError. Calibrating outside the
+    sandbox is also correct on its own terms -- it keeps an expensive fit off
+    the per-match path and is the seam where Phase 1 swaps in a frozen
+    calibration artifact (spec 5.3).
+    """
+    track = spec["track_physics"]
+    config = spec["track_config"]
 
     engine = RaceEngine(
         track=track,
@@ -923,7 +942,13 @@ Replace the block at lines 763-806 (from `track = build_track_physics(lobby.trac
     track = build_track_physics(lobby.track)
     seed = random.randint(0, 99999)
 
-    spec = {"track": lobby.track, "seed": seed, "cars": []}
+    spec = {
+        "track": lobby.track,
+        "track_physics": track,
+        "track_config": TRACKS[lobby.track],
+        "seed": seed,
+        "cars": [],
+    }
     pos = 1
     for pid, pdata in lobby.players.items():
         spec["cars"].append({
