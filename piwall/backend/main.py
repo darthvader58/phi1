@@ -16,7 +16,6 @@ Endpoints:
 """
 
 import asyncio
-import concurrent.futures
 import json
 import os
 import random
@@ -30,16 +29,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel
 
-from .db.models import create_db_engine, init_db
+from .db.models import create_db_engine, init_db, to_namespace
 from .db import crud
 from .data.tracks import TRACKS
 from .data.calibration import calibrate_track
 from .engine.physics import TyreModel, TrackPhysics
-from .engine.race import RaceEngine, RaceState, CarState, Decision, RaceEvent
+from .engine.race import RaceEngine
 from .engine.bots import BUILTIN_BOTS
 from .engine.cli_runner import build_track_physics
-from .sandbox.runner import execute_strategy, STRATEGY_TEMPLATE
+from .sandbox.runner import STRATEGY_TEMPLATE
 from backend.sandbox.validation import validate_submission
+from backend.sandbox.isolation import MatchAborted
+from backend.sandbox.match_job import run_match_isolated
 from .season.elo import compute_elo_updates
 
 
@@ -435,50 +436,47 @@ def test_bot(req: TestBotRequest, x_api_key: str = Header()):
     track = build_track_physics(req.track)
     track_cfg = TRACKS[req.track]
 
-    # Override total laps for quick test (0 = full race distance)
+    # Override total laps for quick test (0 = full race distance). Applied in
+    # the parent, so the prebuilt physics carried in the spec already knows it.
     track.total_laps = track_cfg.total_laps if req.laps <= 0 else min(req.laps, track_cfg.total_laps)
 
-    engine = RaceEngine(
-        track=track,
-        weather_transitions=track_cfg.weather_transitions,
-        seed=random.randint(0, 99999),
-        sc_prob_dry=track_cfg.safety_car_prob_dry,
-        sc_prob_wet=track_cfg.safety_car_prob_wet,
-    )
-
-    # Add user's bot
-    def user_strategy(state: RaceState, my_car: CarState) -> Decision:
-        state_dict = _race_state_to_dict(state)
-        car_dict = _car_state_to_dict(my_car)
-        result = execute_strategy(req.code, state_dict, car_dict)
-        if "error" in result:
-            return Decision(pit=False, compound=my_car.compound)
-        return Decision(pit=result["pit"], compound=result["compound"])
-
-    engine.add_car("USER", player["id"], user_strategy, 1, "MEDIUM")
-
-    # Add built-in bots
+    spec = {
+        "track": req.track,
+        "track_physics": track,
+        "track_config": track_cfg,
+        "seed": random.randint(0, 99999),
+        "cars": [{
+            "car_id": "USER", "player_id": player["id"], "code": req.code,
+            "start_position": 1, "starting_compound": "MEDIUM",
+        }],
+    }
     for pos, (bot_id, bot_info) in enumerate(BUILTIN_BOTS.items(), 2):
-        engine.add_car(bot_id, bot_id, bot_info["strategy"], pos,
-                       bot_info["starting_compound"])
+        spec["cars"].append({
+            "car_id": bot_id, "player_id": bot_id, "bot_id": bot_id,
+            "start_position": pos,
+            "starting_compound": bot_info["starting_compound"],
+        })
 
-    result = engine.run()
+    try:
+        result = run_match_isolated(spec)
+    except MatchAborted as exc:
+        raise HTTPException(400, f"Your bot was stopped: {exc}")
 
     return {
         "standings": [
             {
-                "car_id": c.car_id,
-                "position": c.position,
-                "gap_to_leader": round(c.gap_to_leader, 3),
-                "pit_count": c.pit_count,
-                "pit_laps": c.pit_laps,
-                "retired": c.retired,
+                "car_id": c["car_id"],
+                "position": c["position"],
+                "gap_to_leader": round(c["gap_to_leader"], 3),
+                "pit_count": c["pit_count"],
+                "pit_laps": c["pit_laps"],
+                "retired": c["retired"],
             }
-            for c in result.final_standings
+            for c in result["standings"]
         ],
         "events": [
-            {"lap": e.lap, "type": e.event_type, "detail": e.detail}
-            for e in result.events[:50]
+            {"lap": e["lap"], "type": e["event_type"], "detail": e["detail"]}
+            for e in result["events"][:50]
         ],
     }
 
@@ -760,65 +758,65 @@ async def _run_race(race_id: str):
     finally:
         db.close()
 
-    # Build track and engine setup
+    # Build the match spec. Track physics are built here, in the parent: the
+    # isolated child forbids file writes and build_track_physics writes a
+    # calibration cache.
     track = build_track_physics(lobby.track)
-    track_cfg = TRACKS[lobby.track]
+    seed = random.randint(0, 99999)
 
-    engine = RaceEngine(
-        track=track,
-        weather_transitions=track_cfg.weather_transitions,
-        seed=random.randint(0, 99999),
-        sc_prob_dry=track_cfg.safety_car_prob_dry,
-        sc_prob_wet=track_cfg.safety_car_prob_wet,
-    )
-
-    # Add human players with sandboxed strategies
+    spec = {
+        "track": lobby.track,
+        "track_physics": track,
+        "track_config": TRACKS[lobby.track],
+        "seed": seed,
+        "cars": [],
+    }
     pos = 1
     for pid, pdata in lobby.players.items():
-        code = pdata["code"]
-
-        def make_strategy(player_code):
-            def strategy(state, my_car):
-                sd = _race_state_to_dict(state)
-                cd = _car_state_to_dict(my_car)
-                result = execute_strategy(player_code, sd, cd)
-                if "error" in result:
-                    return Decision(pit=False, compound=my_car.compound)
-                return Decision(pit=result["pit"], compound=result["compound"])
-            return strategy
-
-        engine.add_car(
-            pdata["car_id"], pid, make_strategy(code), pos,
-            pdata.get("starting_compound", "MEDIUM"),
-        )
+        spec["cars"].append({
+            "car_id": pdata["car_id"], "player_id": pid,
+            "code": pdata["code"], "start_position": pos,
+            "starting_compound": pdata.get("starting_compound", "MEDIUM"),
+        })
         pos += 1
-
-    # Fill remaining slots with built-in bots
     for bot_id, bot_info in BUILTIN_BOTS.items():
         if pos > 10:
             break
-        engine.add_car(bot_id, bot_id, bot_info["strategy"], pos,
-                       bot_info["starting_compound"])
+        spec["cars"].append({
+            "car_id": bot_id, "player_id": bot_id, "bot_id": bot_id,
+            "start_position": pos,
+            "starting_compound": bot_info["starting_compound"],
+        })
         pos += 1
 
-    # Run the full race simulation in a thread pool so we don't block the event loop
+    # Run the match in a resource-limited child process, off the event loop.
     loop = asyncio.get_event_loop()
-    with concurrent.futures.ThreadPoolExecutor() as pool:
-        result = await loop.run_in_executor(pool, engine.run)
+    try:
+        result = await loop.run_in_executor(None, run_match_isolated, spec)
+    except MatchAborted as exc:
+        lobby.status = "aborted"
+        await _broadcast(lobby, {"type": "aborted", "reason": str(exc)})
+        db = SessionLocal()
+        try:
+            crud.update_race_status(db, race_id, "aborted")
+        finally:
+            db.close()
+        return
 
     lobby.result = result
     total_laps = track.total_laps
 
     # Pre-index events by lap for fast lookup
     events_by_lap: Dict[int, list] = {}
-    for e in result.events:
-        events_by_lap.setdefault(e.lap, []).append(
-            {"lap": e.lap, "type": e.event_type, "car_id": e.car_id, "detail": e.detail}
+    for e in result["events"]:
+        events_by_lap.setdefault(e["lap"], []).append(
+            {"lap": e["lap"], "type": e["event_type"],
+             "car_id": e["car_id"], "detail": e["detail"]}
         )
 
     # Broadcast each lap with pacing for an enjoyable viewing experience
     # Speed: 1x = 3.75s/lap, 5x = 0.75s/lap, 20x = 0.1875s/lap
-    for lap_snapshot in result.lap_data:
+    for lap_snapshot in result["lap_data"]:
         lap_num = lap_snapshot["lap"]
 
         state_msg = {
@@ -842,12 +840,20 @@ async def _run_race(race_id: str):
     db = SessionLocal()
     try:
         crud.update_race_status(db, race_id, "finished")
-        crud.save_race_results(db, race_id, result.final_standings)
-        crud.save_race_data(db, race_id, result.lap_data, result.events)
+        # crud reads standings and events by attribute; the isolated child
+        # hands them back as plain dicts, so adapt at this boundary.
+        crud.save_race_results(
+            db, race_id, [to_namespace(c) for c in result["standings"]]
+        )
+        crud.save_race_data(
+            db, race_id, result["lap_data"],
+            [to_namespace(e) for e in result["events"]],
+        )
 
         # Update ELO
         standings_tuples = [
-            (c.player_id, c.position, c.retired) for c in result.final_standings
+            (c["player_id"], c["position"], c["retired"])
+            for c in result["standings"]
         ]
         current_ratings = {}
         for pid, _, _ in standings_tuples:
@@ -875,64 +881,32 @@ async def _run_race(race_id: str):
 
 # ─── Serialization helpers ───────────────────────────────────────────
 
-def _race_state_to_dict(state: RaceState) -> dict:
-    return {
-        "lap": state.lap,
-        "total_laps": state.total_laps,
-        "track": state.track,
-        "weather": state.weather,
-        "safety_car": state.safety_car,
-        "safety_car_laps_left": state.safety_car_laps_left,
-        "track_temp": state.track_temp,
-        "cars": [_car_state_to_dict(c) for c in state.cars],
-    }
-
-
-def _car_state_to_dict(car: CarState) -> dict:
-    return {
-        "car_id": car.car_id,
-        "player_id": car.player_id,
-        "position": car.position,
-        "gap_to_leader": car.gap_to_leader,
-        "compound": car.compound,
-        "tyre_age": car.tyre_age,
-        "fuel_kg": car.fuel_kg,
-        "pit_count": car.pit_count,
-        "pit_laps": car.pit_laps,
-        "last_lap_time": car.last_lap_time,
-        "total_time": car.total_time,
-        "retired": car.retired,
-        "drs_available": car.drs_available,
-        "compounds_used": car.compounds_used,
-        "beliefs": car.beliefs,
-    }
-
-
 def _serialize_result(result) -> dict:
     if result is None:
         return None
     return {
-        "track": result.track,
-        "total_laps": result.total_laps,
+        "track": result["track"],
+        "total_laps": result["total_laps"],
         "standings": [
             {
-                "car_id": c.car_id,
-                "player_id": c.player_id,
-                "position": c.position,
-                "gap_to_leader": round(c.gap_to_leader, 3),
-                "compound": c.compound,
-                "tyre_age": c.tyre_age,
-                "pit_count": c.pit_count,
-                "pit_laps": c.pit_laps,
-                "compounds_used": c.compounds_used,
-                "total_time": round(c.total_time, 3),
-                "retired": c.retired,
+                "car_id": c["car_id"],
+                "player_id": c["player_id"],
+                "position": c["position"],
+                "gap_to_leader": round(c["gap_to_leader"], 3),
+                "compound": c["compound"],
+                "tyre_age": c["tyre_age"],
+                "pit_count": c["pit_count"],
+                "pit_laps": c["pit_laps"],
+                "compounds_used": c["compounds_used"],
+                "total_time": round(c["total_time"], 3),
+                "retired": c["retired"],
             }
-            for c in result.final_standings
+            for c in result["standings"]
         ],
         "events": [
-            {"lap": e.lap, "type": e.event_type, "car_id": e.car_id, "detail": e.detail}
-            for e in result.events
+            {"lap": e["lap"], "type": e["event_type"],
+             "car_id": e["car_id"], "detail": e["detail"]}
+            for e in result["events"]
         ],
-        "weather_history": result.weather_history,
+        "weather_history": result["weather_history"],
     }
