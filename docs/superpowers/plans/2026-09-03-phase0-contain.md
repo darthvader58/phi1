@@ -1116,15 +1116,37 @@ if __name__ == "__main__":
     print(f"migrated {migrated} player(s)")
 ```
 
-- [ ] **Step 7: Verify the full suite**
+- [ ] **Step 7: Remove the frontend fallback that queries the renamed field**
+
+`frontend/src/lib/repositories.ts` has a third-tier fallback in `resolveBackendPlayer` that looks a
+player up by the plaintext key:
+
+```typescript
+  if (backendApiKey) {
+    const backendPlayer = await db.collection("players").findOne({ api_key: backendApiKey });
+    if (backendPlayer) {
+      return backendPlayer;
+    }
+  }
+```
+
+After this task that field no longer exists, so the branch can never match. Delete the whole `if
+(backendApiKey) { ... }` block. The two fallbacks above it — by `backendPlayerId`, then by
+`backendUsername` — are unaffected and remain the resolution path. Also delete the now-unused
+`backendApiKey` const at the top of the function if nothing else in it references the variable.
+
+- [ ] **Step 8: Verify the full suite and the frontend build**
 
 Run: `cd piwall && python -m pytest -v`
 Expected: PASS — 21 tests.
 
-- [ ] **Step 8: Commit**
+Run: `cd piwall/frontend && npm run build`
+Expected: build succeeds (no unused-variable or type error from the deletion).
+
+- [ ] **Step 9: Commit**
 
 ```bash
-git add backend/db/crud.py backend/db/models.py piwall/tests/db piwall/scripts/migrate_hash_api_keys.py
+git add backend/db/crud.py backend/db/models.py piwall/tests/db piwall/scripts/migrate_hash_api_keys.py frontend/src/lib/repositories.ts
 git commit -m "fix(security): hash API keys at rest and migrate existing plaintext keys"
 ```
 
@@ -1138,7 +1160,9 @@ git commit -m "fix(security): hash API keys at rest and migrate existing plainte
 - Create: `frontend/src/app/api/game/[...path]/route.ts`
 - Modify: `frontend/src/lib/api.ts:1-20`
 - Modify: `frontend/src/components/BackendPlayerSync.tsx`
-- Modify: `frontend/src/app/lobby/page.tsx:89`
+- Modify: `frontend/src/app/lobby/page.tsx` (lines 35, 50, 73, 89)
+- Modify: `frontend/src/app/season/page.tsx` (lines 19, 31)
+- Modify: `frontend/src/components/UserMenu.tsx` (line 24)
 
 **Interfaces:**
 - Consumes: `getPlayerProfileByUserId` from `frontend/src/lib/repositories.ts`.
@@ -1213,15 +1237,37 @@ In `frontend/src/components/BackendPlayerSync.tsx`, delete the `API_KEY_STORAGE`
 
 In `frontend/src/app/api/backend-player/route.ts`, remove `apiKey` from both success responses (the object returned when stored credentials validate, and the object returned after registration), returning only `{ username }`.
 
-In `frontend/src/app/lobby/page.tsx:89`, remove the `localStorage.getItem("piwall_api_key")` read and any branch that depends on it.
+**Every remaining reader of `piwall_api_key` must be migrated, not just the ones above.** Several pages
+use the presence of that key as the "is this player registered?" signal. If it stops being written and
+those checks are left alone, every user appears permanently unregistered. Keep `piwall_username` in
+localStorage — it is not a secret — and use it as the registration marker instead.
+
+Change each of these to read `piwall_username` rather than `piwall_api_key`:
+
+| File | Lines | What it does |
+|---|---|---|
+| `frontend/src/app/lobby/page.tsx` | 35, 50, 73 | gates the registered view and request paths |
+| `frontend/src/app/season/page.tsx` | 19, 31 | gates the registered view |
+| `frontend/src/components/UserMenu.tsx` | 24 | clears credentials on sign-out |
+
+In `frontend/src/app/lobby/page.tsx` around line 89, `api.register()`'s response is stored with
+`localStorage.setItem("piwall_api_key", res.api_key)`. Delete that line and keep the
+`piwall_username` write beside it. `UserMenu.tsx:24` should drop its `removeItem("piwall_api_key")`
+call and keep removing `piwall_username`.
+
+Line numbers are indicative — grep for `piwall_api_key` and confirm you have caught every
+occurrence outside `src/app/api/` before you finish.
 
 - [ ] **Step 4: Verify no key reaches the browser**
 
 Run: `cd piwall/frontend && npm run build`
 Expected: build succeeds.
 
-Run: `grep -rn "piwall_api_key\|api_key" src/ | grep -v "app/api/"`
-Expected: no matches outside server-side route handlers.
+Run: `cd piwall/frontend && grep -rn "piwall_api_key" src/ | grep -v "app/api/"`
+Expected: **no matches at all** outside server-side route handlers.
+
+Run: `cd piwall/frontend && grep -rn "api_key" src/ | grep -v "app/api/"`
+Expected: no matches. (`src/app/api/**` is server-side and may legitimately reference the key.)
 
 - [ ] **Step 5: Commit**
 
