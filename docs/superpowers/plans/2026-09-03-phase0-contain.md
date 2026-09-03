@@ -686,7 +686,7 @@ Per-call isolation is not an option: user code executes once per car per lap (`r
 **Files:**
 - Create: `backend/sandbox/match_job.py`
 - Create: `piwall/tests/sandbox/test_match_job.py`
-- Modify: `backend/main.py:763-806`
+- Modify: `backend/main.py` — `_run_race` (~763-850), `_serialize_result` (~911), `test_bot` (~426)
 
 **Interfaces:**
 - Consumes: `run_isolated`, `MatchAborted` from Task 5.
@@ -893,12 +893,9 @@ def run_match(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     result = engine.run()
     return {
-        "standings": [
-            {"car_id": c.car_id, "player_id": c.player_id,
-             "position": c.position, "total_time": c.total_time,
-             "retired": c.retired, "pit_count": c.pit_count}
-            for c in result.final_standings
-        ],
+        "track": result.track,
+        "total_laps": result.total_laps,
+        "standings": [car_state_to_dict(c) for c in result.final_standings],
         "events": [
             {"lap": e.lap, "event_type": e.event_type,
              "car_id": e.car_id, "detail": e.detail}
@@ -981,14 +978,116 @@ Replace the block at lines 763-806 (from `track = build_track_physics(lobby.trac
         return
 ```
 
-Downstream code in `_run_race` reads `result.lap_data`, `result.final_standings` and `result.events` as attributes; `run_match` returns a dict, so update those accesses to `result["lap_data"]`, `result["standings"]` and `result["events"]`, and read standings entries with `entry["car_id"]` rather than `entry.car_id`.
+Downstream code in `_run_race` reads the result as an object. `run_match` returns a dict, so
+convert each access. Grep for `result\.` to find them all; as of this writing they are:
 
-- [ ] **Step 8: Verify the full suite**
+| Line | From | To |
+|---|---|---|
+| 814 | `result.events` (`e.lap`, `e.event_type`) | `result["events"]` (`e["lap"]`, `e["event_type"]`) |
+| 821 | `result.lap_data` | `result["lap_data"]` |
+| 845 | `result.final_standings` | `result["standings"]` — **note the key is renamed** |
+| 846 | `result.lap_data, result.events` | `result["lap_data"], result["events"]` |
+| 850 | `(c.player_id, c.position, c.retired)` | `(c["player_id"], c["position"], c["retired"])` |
+
+- [ ] **Step 8: Rewrite `_serialize_result` for dicts**
+
+`_serialize_result` (`backend/main.py`, near line 911) consumes `lobby.result` as a `RaceResult`
+object and is called from the `/api/race/{id}` endpoint. `lobby.result` is now a dict, so it would
+raise `AttributeError` on every race lookup. Because `run_match` now serialises standings with
+`car_state_to_dict`, every field it needs is already present and the function becomes a reshape:
+
+```python
+def _serialize_result(result) -> dict:
+    if result is None:
+        return None
+    return {
+        "track": result["track"],
+        "total_laps": result["total_laps"],
+        "standings": [
+            {
+                "car_id": c["car_id"],
+                "player_id": c["player_id"],
+                "position": c["position"],
+                "gap_to_leader": round(c["gap_to_leader"], 3),
+                "compound": c["compound"],
+                "tyre_age": c["tyre_age"],
+                "pit_count": c["pit_count"],
+                "pit_laps": c["pit_laps"],
+                "compounds_used": c["compounds_used"],
+                "total_time": round(c["total_time"], 3),
+                "retired": c["retired"],
+            }
+            for c in result["standings"]
+        ],
+        "events": [
+            {"lap": e["lap"], "type": e["event_type"],
+             "car_id": e["car_id"], "detail": e["detail"]}
+            for e in result["events"]
+        ],
+        "weather_history": result["weather_history"],
+    }
+```
+
+- [ ] **Step 9: Isolate `/api/test-bot` as well**
+
+This is the other path that executes untrusted code, and leaving it unisolated would make Phase 0's
+central claim false. `test_bot` (`backend/main.py`, near line 426) currently builds a `RaceEngine`
+and calls `engine.run()` **in the Starlette request threadpool**, so a submitted bot runs in the API
+process with no limits at all. Replace everything from `track = build_track_physics(req.track)`
+through the `return {...}` with:
+
+```python
+    track = build_track_physics(req.track)
+    spec = {
+        "track": req.track,
+        "track_physics": track,
+        "track_config": TRACKS[req.track],
+        "seed": random.randint(0, 99999),
+        "cars": [{
+            "car_id": "USER", "player_id": player["id"], "code": req.code,
+            "start_position": 1, "starting_compound": "MEDIUM",
+        }],
+    }
+    for pos, (bot_id, bot_info) in enumerate(BUILTIN_BOTS.items(), 2):
+        spec["cars"].append({
+            "car_id": bot_id, "player_id": bot_id, "bot_id": bot_id,
+            "start_position": pos,
+            "starting_compound": bot_info["starting_compound"],
+        })
+
+    try:
+        result = run_match_isolated(spec)
+    except MatchAborted as exc:
+        raise HTTPException(400, f"Your bot was stopped: {exc}")
+
+    return {
+        "standings": [
+            {
+                "car_id": c["car_id"],
+                "position": c["position"],
+                "gap_to_leader": round(c["gap_to_leader"], 3),
+                "pit_count": c["pit_count"],
+                "pit_laps": c["pit_laps"],
+                "retired": c["retired"],
+            }
+            for c in result["standings"]
+        ],
+        "events": [
+            {"lap": e["lap"], "type": e["event_type"], "detail": e["detail"]}
+            for e in result["events"][:50]
+        ],
+    }
+```
+
+The response shape is unchanged, so `frontend/src/app/strategy/page.tsx` keeps working. A bot that
+hangs now returns HTTP 400 with a clear message instead of pinning a request thread forever.
+
+- [ ] **Step 10: Verify the full suite**
 
 Run: `cd piwall && python -m pytest -v`
 Expected: PASS — 17 tests.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add backend/sandbox/match_job.py backend/engine/serialize.py backend/main.py piwall/tests/sandbox/test_match_job.py
