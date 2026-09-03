@@ -249,22 +249,82 @@ Five layers, no single one trusted.
 
 1. For each waiting ticket, search the band `[elo − w, elo + w]` where `w = base_band + growth × waited_seconds`, capped at `max_band`.
 2. Apply jitter to candidate ordering so identical ratings do not deterministically pair the same opponents repeatedly (Battlecode does the same).
-3. Fill up to the mode's grid size (heads-up = 2; grand prix = up to 10).
+3. Fill up to the mode's grid size. **Ranked grids are 5 cars**; casual grids run up to 10.
 4. **At `waited_seconds > bot_fallback_seconds` (default 25 s), fill remaining slots with house bots.** This is the colonist.io behaviour requested.
 
 ### 7.3 House bot ladder
 
 `backend/engine/bots.py` already ships built-in strategies. Rate them by running an offline round-robin to assign each a calibrated ELO, then select the bot nearest the waiting player's rating.
 
-Bot-assisted matches are **ranked at a reduced K-factor** and flagged in both the replay and the UI, so the ladder stays meaningful without punishing players for queueing at quiet hours. (Tunable: set the factor to zero to make them unranked.)
+Bot-assisted matches are ranked, with **K/2 applied to bot pairs only** (see §7.4), and flagged in both the replay and the UI. Human-vs-human comparisons within a mixed grid keep full weight, so a partially bot-filled race still rates its humans honestly.
 
-### 7.4 ELO
+House bot ratings are **frozen** — they are calibrated yardsticks, not ladder participants. This deliberately breaks the zero-sum property for human/bot pairs: points enter or leave the human pool. K/2 bounds the drift, and a scheduled recalibration job re-runs the offline round-robin to correct accumulated error.
 
-Extend the existing `backend/season/elo.py`:
+### 7.4 Rating
 
-- Provisional period: elevated K for a player's first 10 rated matches.
-- Multi-car races resolve to a rating update over finishing order rather than a single pairwise comparison.
-- Updates applied atomically via `findOneAndUpdate` with optimistic versioning, so concurrent match completions cannot interleave and lose an update. (Battlecode achieves this with row-level locking; this is the Mongo equivalent.)
+Ranked races carry 5 cars, so the rating model must handle a multi-car finishing order without
+overstating what one race proves. Four changes to `backend/season/elo.py`:
+
+**1. Normalize by √(N−1), not (N−1).**
+The current implementation averages each player's pairwise deltas over all opponents
+(`elo.py:64-66`). The four comparisons from a 5-car race are neither four independent
+observations nor one — they share a safety car, a weather sequence, and one RNG stream — so the
+effective sample size lies between. Dividing by √(N−1) is the standard variance-scaling
+compromise. Measured on a 5-car race where a 1200 beats a 1400 and three weaker cars, the winner's
+delta moves from +16.00 (today) to +32.00, against +64.00 for an unnormalized sum. Zero-sum is
+preserved in all three cases because every player divides by the same constant.
+
+**2. A mechanical DNF is a no-contest, not a loss.**
+`check_dnf` (`backend/engine/physics.py:221`) is a pure RNG roll with no strategy input, yet
+`elo.py:52` scores a retirement as a full loss against every finisher — costing, at √ normalization,
+as much rating as winning the race earns. Pairs involving a retired car are **excluded from the
+update entirely**, for both the retiree and the finishers. Scoring it as a draw (`s_a = 0.5`) is not
+a fix: a draw against a weaker opponent still bleeds rating, softening the injustice rather than
+removing it. Simulation over 2000 races at an 8% DNF rate shows rating/true-skill correlation
+improving at every checkpoint under this rule (0.951 → 0.974 at 2000 races), making it the single
+largest accuracy gain available and independent of model choice.
+
+*Forward-looking constraint:* this holds because `check_dnf` is currently the only retirement path
+and is purely random. If strategy-caused retirements are added later (tyre destruction, fuel
+mismanagement), those **must** be scored as real losses. The rule is "no-contest for outcomes the
+player could not influence," not "no-contest for all DNFs."
+
+**3. Per-pair K weighting for bot slots.**
+K/2 applies to bot pairs only, not to the whole match. In a 5-car race with 2 house bots the
+winner's delta moves from +32.00 to +27.20, while the two human comparisons retain full weight.
+
+**4. Provisional period and atomic application.**
+Elevated K for a player's first 10 rated matches. Updates applied via `findOneAndUpdate` with
+optimistic versioning so concurrent match completions cannot interleave and lose an update.
+(Battlecode uses row-level locking; this is the Mongo equivalent.)
+
+### 7.5 Rating model: decision and revisit path
+
+Rating lives behind a narrow interface — `rate(match_result) -> {player_id: delta}` — with Elo as
+the launch implementation.
+
+**OpenSkill (Plackett-Luce) was evaluated and deferred, not rejected.** Benchmarked against fixed
+Elo on 2000 simulated 5-car races with both systems using no-contest DNF handling, it won 3 of 5
+checkpoints (0.992 vs 0.974 at 2000 races) but lost two, including at 1000. That is a modest,
+non-decisive accuracy edge. Two concrete findings decided it:
+
+- Its `weights` parameter is **unusable for free-for-all matches**. With one player per team there is
+  nothing to weight: asymmetric weights `(0.5, 1.0)` and `(0.1, 1.0)` produce byte-identical updates,
+  and passing any weights at all doubles the delta versus passing none. Verified against
+  openskill 6.2.0. The reliable mechanism is post-hoc delta scaling.
+- Because the update is one joint computation over the finishing order, **per-pair K/2 cannot be
+  expressed**. The closest approximation is graduated match-level scaling
+  (`factor = 1 − 0.5 × bot_opponents / total_opponents`), which also dilutes the legitimate
+  human-vs-human evidence in a mixed grid.
+
+Its real advantage is σ (per-player uncertainty), which would supply provisional ratings for free
+and allow matchmaking on uncertainty overlap rather than fixed bands.
+
+**Revisit in Phase 5 against real match data.** The benchmark generates finishing order as
+`skill + gaussian noise`, a Thurstone-style process that matches neither model's assumptions and
+does not reproduce the correlated field-wide effects of a safety car. Once the ladder is live that
+caveat disappears and the choice becomes evidence rather than simulation. Swapping behind the
+interface is a contained change.
 
 ---
 
@@ -334,6 +394,16 @@ CI runs 1–4 on every push.
 
 ## 13. Open Questions
 
-1. **Grid size for ranked play** — heads-up (2 cars) is simplest to rate and reason about; larger grids are more faithful to F1. Recommend launching heads-up ranked with larger grids as casual.
-2. **Bot-assisted match K-factor** — recommend K/2; needs a value.
-3. **Replay retention** — indefinite for ranked, or time-boxed for casual to bound storage cost.
+**Resolved 2026-09-03:**
+
+1. ~~Grid size for ranked play~~ — **5 cars.** It is a racing game; heads-up would have bent the
+   product to fit the rating math. The math is corrected instead (§7.4).
+2. ~~Bot-assisted match K-factor~~ — **K/2, applied to bot pairs only** so human comparisons in a
+   mixed grid keep full weight.
+3. ~~Replay retention~~ — **indefinite for ranked, time-boxed for casual.** Adopted as the default;
+   revisit if storage cost becomes material.
+
+**Still open:**
+
+4. **Casual grid size cap** — up to 10 is assumed; unvalidated against sim runtime per match.
+5. **Provisional K multiplier and match count** — 10 matches assumed; needs tuning against real data.
