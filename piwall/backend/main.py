@@ -38,7 +38,8 @@ from .engine.physics import TyreModel, TrackPhysics
 from .engine.race import RaceEngine, RaceState, CarState, Decision, RaceEvent
 from .engine.bots import BUILTIN_BOTS
 from .engine.cli_runner import build_track_physics
-from .sandbox.runner import execute_strategy, compile_strategy, STRATEGY_TEMPLATE
+from .sandbox.runner import execute_strategy, STRATEGY_TEMPLATE
+from backend.sandbox.validation import validate_submission
 from .season.elo import compute_elo_updates
 
 
@@ -233,7 +234,7 @@ def submit_bot(race_id: str, req: SubmitBotRequest, x_api_key: str = Header()):
         raise HTTPException(400, "Not in this race")
 
     # Validate code
-    error = compile_strategy(req.code)
+    error = validate_submission(req.code)
     if error:
         raise HTTPException(400, error)
 
@@ -427,7 +428,7 @@ def test_bot(req: TestBotRequest, x_api_key: str = Header()):
     """Run a quick offline simulation with the user's bot vs built-in bots."""
     player = authenticate(x_api_key)
 
-    error = compile_strategy(req.code)
+    error = validate_submission(req.code)
     if error:
         raise HTTPException(400, error)
 
