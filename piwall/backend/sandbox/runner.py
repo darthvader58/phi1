@@ -54,8 +54,6 @@ ALLOWED_BUILTINS = {
     "False": False,
     "None": None,
     "isinstance": isinstance,
-    "getattr": getattr,
-    "hasattr": hasattr,
 }
 
 # Timeout handler
