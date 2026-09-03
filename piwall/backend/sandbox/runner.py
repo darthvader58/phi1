@@ -16,8 +16,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 from RestrictedPython import compile_restricted, safe_globals
-from RestrictedPython.Eval import default_guarded_getattr
 from RestrictedPython.Guards import (
+    full_write_guard,
+    guarded_iter_unpack_sequence,
     guarded_unpack_sequence,
     safer_getattr,
 )
@@ -122,8 +123,8 @@ def execute_strategy(
     restricted_globals["_getitem_"] = lambda obj, key: obj[key]
     restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
     restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
-    restricted_globals["_iter_unpack_sequence_"] = guarded_unpack_sequence
-    restricted_globals["_write_"] = lambda x: x
+    restricted_globals["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
+    restricted_globals["_write_"] = full_write_guard
 
     # Inject math and random modules (safe)
     restricted_globals["math"] = math
