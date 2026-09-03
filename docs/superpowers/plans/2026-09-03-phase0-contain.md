@@ -452,6 +452,7 @@ Note this wrapper is deliberately generic — Phase 1 reuses it as the seam wher
 - Consumes: nothing from earlier tasks.
 - Produces:
   - `run_isolated(fn, args=(), memory_mb=512, cpu_seconds=30, wall_seconds=60) -> Any`
+  - `probe_supported_limits(memory_mb=512, cpu_seconds=30) -> dict[str, bool]` — which rlimits this platform accepts.
   - `class MatchAborted(Exception)` — raised on timeout, memory exhaustion, or child crash.
   - **Constraint:** `fn` must be a module-level (picklable) function, because the spawn context re-imports it in the child.
 
@@ -462,7 +463,11 @@ Create `piwall/tests/sandbox/test_isolation.py`:
 ```python
 import pytest
 
-from backend.sandbox.isolation import MatchAborted, run_isolated
+from backend.sandbox.isolation import (
+    MatchAborted,
+    probe_supported_limits,
+    run_isolated,
+)
 
 
 def _add(a, b):
@@ -503,6 +508,19 @@ def test_memory_exhaustion_is_contained():
 def test_child_cannot_write_files():
     with pytest.raises(MatchAborted):
         run_isolated(_write_a_file, (), wall_seconds=10)
+
+
+def test_the_platform_limit_mechanism_is_visible():
+    """Assert what this platform genuinely enforces, rather than assuming.
+
+    RLIMIT_CPU and RLIMIT_FSIZE work everywhere we run. RLIMIT_AS works on
+    Linux but is rejected by macOS, so it is reported rather than required:
+    on macOS memory is bounded by the CPU and wall-clock limits instead.
+    """
+    supported = probe_supported_limits()
+    assert supported["RLIMIT_CPU"] is True
+    assert supported["RLIMIT_FSIZE"] is True
+    assert "RLIMIT_AS" in supported
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -538,19 +556,63 @@ class MatchAborted(Exception):
     """The isolated child exceeded its limits or failed."""
 
 
-def _apply_limits(memory_mb: int, cpu_seconds: int) -> None:
-    memory_bytes = memory_mb * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
-    resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
-    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+def _limit_plan(memory_mb: int, cpu_seconds: int):
+    return [
+        ("RLIMIT_AS", memory_mb * 1024 * 1024),
+        ("RLIMIT_CPU", cpu_seconds),
+        ("RLIMIT_NOFILE", 64),
+        ("RLIMIT_FSIZE", 0),
+        ("RLIMIT_NPROC", 0),
+    ]
+
+
+def _apply_limits(memory_mb: int, cpu_seconds: int) -> dict:
+    """Apply each limit independently; return which ones actually took effect.
+
+    Not every rlimit exists on every platform. macOS rejects RLIMIT_AS and
+    RLIMIT_DATA outright ("ValueError: current limit exceeds maximum limit"),
+    so applying the set as one block would abort every match on a developer
+    machine. Each limit is applied on its own and the outcome recorded, so
+    callers can assert on the mechanism rather than assume it.
+    """
+    applied = {}
+    for name, value in _limit_plan(memory_mb, cpu_seconds):
+        limit = getattr(resource, name, None)
+        if limit is None:
+            applied[name] = False
+            continue
+        try:
+            resource.setrlimit(limit, (value, value))
+            applied[name] = True
+        except (ValueError, OSError):
+            applied[name] = False
+    return applied
+
+
+def probe_supported_limits(memory_mb: int = 512, cpu_seconds: int = 30) -> dict:
+    """Report which limits this platform accepts, without running user code.
+
+    Linux enforces RLIMIT_AS, so memory is bounded directly. macOS does not,
+    and there memory exhaustion is bounded only by the CPU and wall-clock
+    limits. Production runs on Linux (spec 3, managed microVM); this function
+    exists so the gap is visible in tests rather than assumed away.
+    """
+    return _child_probe_limits(memory_mb, cpu_seconds)
+
+
+def _child_probe_limits(memory_mb: int, cpu_seconds: int) -> dict:
+    return run_isolated(_apply_limits, (memory_mb, cpu_seconds),
+                        memory_mb=memory_mb, cpu_seconds=cpu_seconds,
+                        wall_seconds=15)
 
 
 def _child_entrypoint(fn, args, memory_mb, cpu_seconds, conn) -> None:
     try:
-        _apply_limits(memory_mb, cpu_seconds)
-        conn.send(("ok", fn(*args)))
+        applied = _apply_limits(memory_mb, cpu_seconds)
+        if fn is _apply_limits:
+            conn.send(("ok", applied))
+        else:
+            conn.send(("ok", fn(*args)))
     except BaseException as exc:
         conn.send(("error", f"{type(exc).__name__}: {exc}"))
     finally:
@@ -600,7 +662,11 @@ def run_isolated(
 - [ ] **Step 4: Run the tests**
 
 Run: `cd piwall && python -m pytest tests/sandbox/test_isolation.py -v`
-Expected: PASS — 4 tests. The infinite-loop test takes ~1s (killed by RLIMIT_CPU); the memory test raises `MemoryError` in the child.
+Expected: PASS — 5 tests. The infinite-loop test takes ~1s (killed by RLIMIT_CPU, which reaches the
+parent as `EOFError` — the child dies on SIGXCPU before it can send, and `run_isolated` converts that
+to `MatchAborted`). On Linux the memory test trips `RLIMIT_AS`; on macOS, where that limit is
+rejected by the kernel, it trips the CPU/wall-clock limit instead — verified behaviour on
+Darwin arm64 / CPython 3.14.7.
 
 - [ ] **Step 5: Commit**
 
@@ -895,7 +961,7 @@ Downstream code in `_run_race` reads `result.lap_data`, `result.final_standings`
 - [ ] **Step 8: Verify the full suite**
 
 Run: `cd piwall && python -m pytest -v`
-Expected: PASS — 16 tests.
+Expected: PASS — 17 tests.
 
 - [ ] **Step 9: Commit**
 
@@ -1053,7 +1119,7 @@ if __name__ == "__main__":
 - [ ] **Step 7: Verify the full suite**
 
 Run: `cd piwall && python -m pytest -v`
-Expected: PASS — 20 tests.
+Expected: PASS — 21 tests.
 
 - [ ] **Step 8: Commit**
 
@@ -1281,7 +1347,7 @@ In `create_season` and `end_season`, immediately after the existing `player = au
 - [ ] **Step 8: Verify the full suite**
 
 Run: `cd piwall && python -m pytest -v`
-Expected: PASS — 23 tests.
+Expected: PASS — 24 tests.
 
 - [ ] **Step 9: Commit**
 
@@ -1378,7 +1444,7 @@ Expected: prints a list ending in `429`s, then `rate limiting active`.
 - [ ] **Step 5: Verify the full suite**
 
 Run: `cd piwall && python -m pytest -v`
-Expected: PASS — 23 tests.
+Expected: PASS — 24 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -1471,7 +1537,7 @@ git commit -m "fix(security): require Mongo auth, unpublish its port, and move s
 
 Per spec §11, Phase 0 is done when the containment corpus passes at every layer and no credential is readable by page JavaScript. Verify all of it:
 
-- [ ] `cd piwall && python -m pytest -v` — 23 tests pass.
+- [ ] `cd piwall && python -m pytest -v` — 24 tests pass.
 - [ ] `grep -rn "api_key" frontend/src/ | grep -v "app/api/"` returns nothing.
 - [ ] `grep -n "getattr\|hasattr" backend/sandbox/runner.py` shows no entries inside `ALLOWED_BUILTINS`.
 - [ ] A bot containing `while True: pass` raises `MatchAborted` instead of hanging a worker thread.
