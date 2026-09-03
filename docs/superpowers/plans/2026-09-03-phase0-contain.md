@@ -708,9 +708,9 @@ SPEC = {
     "track": "bahrain",
     "seed": 42,
     "cars": [
-        {"car_id": "c1", "player_id": "p1", "bot_id": "vel_01",
+        {"car_id": "c1", "player_id": "p1", "bot_id": "VEL-01",
          "start_position": 1, "starting_compound": "MEDIUM"},
-        {"car_id": "c2", "player_id": "p2", "bot_id": "apex_ai",
+        {"car_id": "c2", "player_id": "p2", "bot_id": "NXS-07",
          "start_position": 2, "starting_compound": "MEDIUM"},
     ],
 }
