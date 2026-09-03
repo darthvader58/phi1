@@ -15,8 +15,6 @@ import random
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
-
 
 # Real F1 constant: seconds per kg of fuel
 FUEL_EFFECT_PER_KG = 0.032
