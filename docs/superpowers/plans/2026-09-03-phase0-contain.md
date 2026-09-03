@@ -1287,6 +1287,7 @@ git commit -m "fix(security): hash API keys at rest and migrate existing plainte
 - Modify: `frontend/src/app/lobby/page.tsx` (lines 35, 50, 73, 89)
 - Modify: `frontend/src/app/season/page.tsx` (lines 19, 31)
 - Modify: `frontend/src/components/UserMenu.tsx` (line 24)
+- Modify: `frontend/src/lib/types.ts` (WsMessage union), `frontend/src/lib/websocket.ts` (onmessage switch), `frontend/src/app/race/[id]/page.tsx` (aborted state)
 
 **Interfaces:**
 - Consumes: `getPlayerProfileByUserId` from `frontend/src/lib/repositories.ts`.
@@ -1382,7 +1383,47 @@ call and keep removing `piwall_username`.
 Line numbers are indicative — grep for `piwall_api_key` and confirm you have caught every
 occurrence outside `src/app/api/` before you finish.
 
-- [ ] **Step 4: Verify no key reaches the browser**
+- [ ] **Step 4: Handle the new `aborted` race message**
+
+Task 6 made `_run_race` broadcast `{"type": "aborted", "reason": "..."}` when a match breaches its
+resource limits — the path a bot with `while True: pass` now takes. The client has no case for it,
+so an aborted race leaves the viewer stuck on "racing" forever, which is a worse experience than the
+hang this phase set out to fix.
+
+In `frontend/src/lib/types.ts`, extend the `WsMessage` union and add the field:
+
+```typescript
+export interface WsMessage {
+  type: "countdown" | "lights_out" | "lap" | "finished" | "aborted" | "ping" | "error";
+  lap?: number;
+  total_laps?: number;
+  data?: LapSnapshot;
+  events?: RaceEvent[];
+  result?: RaceResult;
+  seconds?: number;
+  error?: string;
+  reason?: string;
+}
+```
+
+In `frontend/src/lib/websocket.ts`, add a case to the `onmessage` switch, directly after the
+`"finished"` case:
+
+```typescript
+        case "aborted":
+          setStatus("aborted");
+          setCountdown(null);
+          setLightsOut(false);
+          break;
+```
+
+The hook's status state is a string union that currently includes `"finished"` — grep for
+`"finished"` in that file, add `"aborted"` to the same union, and expose the reason alongside it if
+the hook already returns an error field. In `frontend/src/app/race/[id]/page.tsx`, render an
+aborted race the way a finished one is rendered but with the reason shown, so the viewer learns the
+race stopped and why rather than watching a frozen track.
+
+- [ ] **Step 5: Verify no key reaches the browser**
 
 Run: `cd piwall/frontend && npm run build`
 Expected: build succeeds.
@@ -1393,7 +1434,7 @@ Expected: **no matches at all** outside server-side route handlers.
 Run: `cd piwall/frontend && grep -rn "api_key" src/ | grep -v "app/api/"`
 Expected: no matches. (`src/app/api/**` is server-side and may legitimately reference the key.)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add frontend/src
