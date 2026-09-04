@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.errors import OperationFailure
 
 
 def _resolve_database_name(url: str) -> str:
@@ -37,7 +38,33 @@ def create_db_engine(url: str | None = None):
 def init_db(db):
     db.players.create_index([("id", ASCENDING)], unique=True)
     db.players.create_index([("username", ASCENDING)], unique=True)
-    db.players.create_index([("api_key_hash", ASCENDING)], unique=True)
+
+    # A pre-hash deployment leaves a unique index on the plaintext key. Once the
+    # migration unsets that field every migrated player collides on null, so the
+    # stale index must go. Idempotent: absent on a fresh database.
+    try:
+        db.players.drop_index("api_key_1")
+    except OperationFailure:
+        pass
+
+    # Partial, so players not yet migrated (no api_key_hash yet) are not indexed
+    # at all instead of all colliding on null and crashing startup.
+    try:
+        db.players.create_index(
+            [("api_key_hash", ASCENDING)],
+            unique=True,
+            partialFilterExpression={"api_key_hash": {"$exists": True}},
+        )
+    except OperationFailure:
+        # An index named api_key_hash_1 already exists with different options
+        # (e.g. a non-partial unique index from an earlier deploy). Replace it.
+        db.players.drop_index("api_key_hash_1")
+        db.players.create_index(
+            [("api_key_hash", ASCENDING)],
+            unique=True,
+            partialFilterExpression={"api_key_hash": {"$exists": True}},
+        )
+
     db.players.create_index([("elo", DESCENDING)])
 
     db.seasons.create_index([("id", ASCENDING)], unique=True)
