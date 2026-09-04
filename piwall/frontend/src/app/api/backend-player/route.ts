@@ -60,8 +60,7 @@ export async function POST(request: Request) {
   if (!force && profile?.backendApiKey && profile?.backendUsername) {
     if (await isBackendApiKeyValid(String(profile.backendApiKey))) {
       return NextResponse.json({
-        username: String(profile.backendUsername),
-        apiKey: String(profile.backendApiKey)
+        username: String(profile.backendUsername)
       });
     }
   }
@@ -103,8 +102,7 @@ export async function POST(request: Request) {
       });
 
       return NextResponse.json({
-        username: payload.username,
-        apiKey: payload.api_key
+        username: payload.username
       });
     }
 

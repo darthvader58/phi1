@@ -21,7 +21,10 @@ export function useRaceWebSocket(raceId: string | null) {
   const [result, setResult] = useState<RaceResult | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [lightsOut, setLightsOut] = useState(false);
-  const [status, setStatus] = useState<"connecting" | "connected" | "racing" | "finished" | "disconnected">("connecting");
+  const [status, setStatus] = useState<
+    "connecting" | "connected" | "racing" | "finished" | "aborted" | "disconnected"
+  >("connecting");
+  const [abortReason, setAbortReason] = useState<string | null>(null);
 
   const connect = useCallback(() => {
     if (!raceId) return;
@@ -69,6 +72,13 @@ export function useRaceWebSocket(raceId: string | null) {
           if (msg.result) setResult(msg.result);
           break;
 
+        case "aborted":
+          setStatus("aborted");
+          setCountdown(null);
+          setLightsOut(false);
+          setAbortReason(msg.reason ?? null);
+          break;
+
         case "ping":
           break;
       }
@@ -78,8 +88,8 @@ export function useRaceWebSocket(raceId: string | null) {
       setConnected(false);
       wsRef.current = null;
 
-      // Don't reconnect if race is finished
-      if (status === "finished") return;
+      // Don't reconnect if the race is finished or aborted
+      if (status === "finished" || status === "aborted") return;
 
       // Auto-reconnect with backoff
       if (reconnectAttempts.current < MAX_RECONNECT_ATTEMPTS) {
@@ -122,6 +132,7 @@ export function useRaceWebSocket(raceId: string | null) {
     result,
     countdown,
     lightsOut,
+    abortReason,
     setSpeed,
   };
 }

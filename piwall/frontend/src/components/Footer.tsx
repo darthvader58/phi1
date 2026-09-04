@@ -7,7 +7,7 @@ const PRODUCT_LINKS = [
   { href: "/season", label: "Season" }
 ];
 
-const SUPPORT_LINKS = [
+const SUPPORT_LINKS: { href: string; label: string; external?: boolean }[] = [
   { href: "#", label: "Feedback" }
 ];
 

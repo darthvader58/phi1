@@ -32,7 +32,7 @@ export default function LobbyPage() {
   });
 
   useEffect(() => {
-    if (typeof window !== "undefined" && localStorage.getItem("piwall_api_key")) {
+    if (typeof window !== "undefined" && localStorage.getItem("piwall_username")) {
       setRegistered(true);
       setUsername(localStorage.getItem("piwall_username") || "");
     }
@@ -47,9 +47,9 @@ export default function LobbyPage() {
     }
 
     const syncLocalState = () => {
-      const apiKey = localStorage.getItem("piwall_api_key");
-      setRegistered(Boolean(apiKey));
-      setUsername(localStorage.getItem("piwall_username") || "");
+      const username = localStorage.getItem("piwall_username");
+      setRegistered(Boolean(username));
+      setUsername(username || "");
     };
 
     syncLocalState();
@@ -70,7 +70,7 @@ export default function LobbyPage() {
     if (
       authStatus === "authenticated" &&
       typeof window !== "undefined" &&
-      localStorage.getItem("piwall_api_key")
+      localStorage.getItem("piwall_username")
     ) {
       try {
         const s = await api.getSuggestedMatches();
@@ -86,7 +86,6 @@ export default function LobbyPage() {
     setError("");
     try {
       const res = await api.register(username);
-      localStorage.setItem("piwall_api_key", res.api_key);
       localStorage.setItem("piwall_username", res.username);
       window.dispatchEvent(new Event("piwall-backend-auth-changed"));
       setRegistered(true);

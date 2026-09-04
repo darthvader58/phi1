@@ -38,6 +38,7 @@ export default function RacePage() {
     result,
     countdown,
     lightsOut,
+    abortReason,
     setSpeed
   } = useRaceWebSocket(raceInfo?.status === "lobby" ? null : raceId);
 
@@ -207,6 +208,24 @@ export default function RacePage() {
             <div className="w-6 h-6 border-2 border-pit-muted border-t-f1-red rounded-full animate-spin mx-auto" />
           </div>
           <div className="text-pit-muted text-xs mt-2">Simulating race...</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (status === "aborted") {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="text-center animate-fade-in">
+          <div className="text-3xl sm:text-5xl font-black text-yellow-500 tracking-tight">RACE ABORTED</div>
+          <div className="text-sm sm:text-base text-pit-text mt-3 max-w-md mx-auto">
+            {abortReason || "The race was stopped after breaching its resource limits."}
+          </div>
+          <div className="mt-6">
+            <Link href="/lobby" className="btn-secondary">
+              Back to Lobby
+            </Link>
+          </div>
         </div>
       </div>
     );

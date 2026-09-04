@@ -21,7 +21,6 @@ export default function UserMenu({ name, image }: UserMenuProps) {
   }, [name]);
 
   function handleLogout() {
-    localStorage.removeItem("piwall_api_key");
     localStorage.removeItem("piwall_username");
     localStorage.removeItem("piwall_session_user_id");
     window.dispatchEvent(new Event("piwall-backend-auth-changed"));
