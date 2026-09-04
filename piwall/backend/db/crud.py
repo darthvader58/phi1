@@ -30,6 +30,7 @@ def _player_doc(player):
         "elo": player.elo,
         "team_name": player.team_name,
         "created_at": player.created_at,
+        "role": getattr(player, "role", "player"),
     }
 
 
@@ -42,6 +43,7 @@ def create_player(db, username: str, team_name: str = "Independent"):
         "elo": 1200.0,
         "team_name": team_name,
         "created_at": _now(),
+        "role": "player",
     })
     db.db.players.insert_one(_player_doc(player))
     player.api_key = raw_key  # transient: returned once, never persisted
@@ -70,7 +72,7 @@ def get_leaderboard(db, limit: int = 50):
     return [to_namespace(doc) for doc in db.db.players.find({}).sort("elo", -1).limit(limit)]
 
 
-def create_race(db, track: str, race_type: str = "quick", season_id: Optional[str] = None, weather_seed: Optional[int] = None):
+def create_race(db, track: str, race_type: str = "quick", season_id: Optional[str] = None, weather_seed: Optional[int] = None, owner_id: Optional[str] = None):
     race = {
         "id": _id(),
         "season_id": season_id,
@@ -83,6 +85,7 @@ def create_race(db, track: str, race_type: str = "quick", season_id: Optional[st
         "finished_at": None,
         "lap_data_json": None,
         "events_json": None,
+        "owner_id": owner_id,
     }
     db.db.races.insert_one(race)
     return to_namespace(race)

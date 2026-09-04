@@ -122,9 +122,20 @@ def authenticate(api_key: str) -> dict:
         player = crud.get_player_by_api_key(db, api_key)
         if not player:
             raise HTTPException(status_code=401, detail="Invalid API key")
-        return {"id": player.id, "username": player.username, "elo": player.elo}
+        return {
+            "id": player.id,
+            "username": player.username,
+            "elo": player.elo,
+            "role": getattr(player, "role", "player"),
+        }
     finally:
         db.close()
+
+
+def require_admin(player: dict) -> None:
+    """Raise unless the authenticated player holds the admin role."""
+    if player.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
 
 
 # ─── Request/Response models ─────────────────────────────────────────
@@ -194,7 +205,8 @@ def create_race(req: CreateRaceRequest, x_api_key: str = Header()):
                 raise HTTPException(400, "No active season. Create a season first.")
             season_id = active_season.id
 
-        race = crud.create_race(db, req.track, req.race_type, season_id=season_id)
+        race = crud.create_race(db, req.track, req.race_type, season_id=season_id,
+                                owner_id=player["id"])
         lobby = RaceLobby(race.id, req.track, req.race_type)
         lobby.speed = req.speed
         active_lobbies[race.id] = lobby
@@ -259,6 +271,16 @@ async def start_race(race_id: str, x_api_key: str = Header()):
         raise HTTPException(404, "Race not found")
     if lobby.status != "lobby":
         raise HTTPException(400, "Race already started")
+
+    db = SessionLocal()
+    try:
+        race = crud.get_race(db, race_id)
+    finally:
+        db.close()
+    if race is None:
+        raise HTTPException(404, "Race not found")
+    if getattr(race, "owner_id", None) not in (None, player["id"]):
+        raise HTTPException(403, "Only the race owner can start this race")
 
     lobby.status = "countdown"
 
@@ -490,7 +512,8 @@ def get_strategy_template():
 
 @app.post("/api/season")
 def create_season(req: CreateSeasonRequest, x_api_key: str = Header()):
-    authenticate(x_api_key)
+    player = authenticate(x_api_key)
+    require_admin(player)
     for t in req.tracks:
         if t not in TRACKS:
             raise HTTPException(400, f"Unknown track: {t}")
@@ -597,7 +620,8 @@ def get_season_standings(season_id: str):
 
 @app.post("/api/season/{season_id}/end")
 def end_season(season_id: str, x_api_key: str = Header()):
-    authenticate(x_api_key)
+    player = authenticate(x_api_key)
+    require_admin(player)
     db = SessionLocal()
     try:
         season = crud.end_season(db, season_id)
