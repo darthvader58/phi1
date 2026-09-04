@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -43,15 +44,62 @@ def test_runs_a_match_and_returns_standings():
     assert result["lap_data"]
 
 
-def test_a_hanging_bot_cannot_hang_the_server():
+def _spec_with_a_hanging_bot():
     spec = make_spec()
     spec["cars"] = [
         {"car_id": "c1", "player_id": "p1", "code": HANGS,
          "start_position": 1, "starting_compound": "MEDIUM"},
         spec["cars"][1],
     ]
+    return spec
+
+
+def test_a_hanging_bot_forfeits_its_decisions_and_the_match_completes():
+    """A bot that never returns must not hang the server.
+
+    Moving execution into a child process revived runner.py's 50ms SIGALRM
+    guard, which is dead in the API process because signal.signal() cannot arm
+    off the main thread -- inside the child, the engine runs on the child's
+    main thread, so it arms. The hanging bot therefore forfeits each decision
+    (~50ms apiece) rather than blocking, and the race finishes normally. That
+    is the better outcome: one player's bad bot does not deny everyone else
+    their race.
+
+    Limits are deliberately generous so this asserts the forfeit behaviour and
+    not a race against a limit.
+    """
+    started = time.monotonic()
+    result = run_match_isolated(
+        _spec_with_a_hanging_bot(), cpu_seconds=30, wall_seconds=60,
+    )
+    elapsed = time.monotonic() - started
+
+    # Returning at all is the guarantee: run_isolated would have raised
+    # MatchAborted rather than let the call block past its wall budget.
+    assert elapsed < 60
+    assert len(result["standings"]) == 2
+    assert result["lap_data"]
+
+    hanging = [c for c in result["standings"] if c["car_id"] == "c1"][0]
+    # Every decision it attempted was cut off, so it never pitted.
+    assert hanging["pit_count"] == 0
+
+
+def test_a_bot_that_exhausts_the_childs_budget_aborts_the_match():
+    """The abort path is still armed for a bot the 50ms guard cannot absorb.
+
+    Both limits are set low: the forfeits burn CPU (tripping RLIMIT_CPU) and
+    wall time (tripping the parent's poll). Either alone is enough, and they
+    fail in opposite directions under load -- SIGALRM is ITIMER_REAL, i.e.
+    wall-clock, so contention makes each forfeit burn *less* CPU but *more*
+    wall time. Asserting the guarantee rather than one mechanism is what keeps
+    this stable; pinning it to CPU alone is what made the previous version of
+    this test flaky.
+    """
     with pytest.raises(MatchAborted):
-        run_match_isolated(spec, cpu_seconds=3, wall_seconds=10)
+        run_match_isolated(
+            _spec_with_a_hanging_bot(), cpu_seconds=1, wall_seconds=5,
+        )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
