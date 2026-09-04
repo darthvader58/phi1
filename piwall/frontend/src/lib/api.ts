@@ -19,13 +19,6 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
 }
 
 export const api = {
-  // Auth
-  register: (username: string, teamName = "Independent") =>
-    apiFetch("/register", {
-      method: "POST",
-      body: JSON.stringify({ username, team_name: teamName }),
-    }),
-
   // Races
   createRace: (track: string, speed = 5, raceType = "quick") =>
     apiFetch("/race/create", {
