@@ -17,11 +17,16 @@ def _id():
     return str(uuid.uuid4())
 
 
+def hash_api_key(raw: str) -> str:
+    """Hash an API key for storage. Raw keys are never persisted."""
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _player_doc(player):
     return {
         "id": player.id,
         "username": player.username,
-        "api_key": player.api_key,
+        "api_key_hash": player.api_key_hash,
         "elo": player.elo,
         "team_name": player.team_name,
         "created_at": player.created_at,
@@ -29,20 +34,24 @@ def _player_doc(player):
 
 
 def create_player(db, username: str, team_name: str = "Independent"):
+    raw_key = f"pw_{secrets.token_hex(24)}"
     player = to_namespace({
         "id": _id(),
         "username": username,
-        "api_key": f"pw_{secrets.token_hex(24)}",
+        "api_key_hash": hash_api_key(raw_key),
         "elo": 1200.0,
         "team_name": team_name,
         "created_at": _now(),
     })
     db.db.players.insert_one(_player_doc(player))
+    player.api_key = raw_key  # transient: returned once, never persisted
     return player
 
 
 def get_player_by_api_key(db, api_key: str):
-    return to_namespace(db.db.players.find_one({"api_key": api_key}))
+    return to_namespace(
+        db.db.players.find_one({"api_key_hash": hash_api_key(api_key)})
+    )
 
 
 def get_player_by_username(db, username: str):

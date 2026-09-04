@@ -78,7 +78,6 @@ function mapManualRaceRecord(record: any): DashboardRaceRecord {
 async function resolveBackendPlayer(db: Awaited<ReturnType<typeof getDb>>, profile: any) {
   const backendPlayerId = typeof profile?.backendPlayerId === "string" ? profile.backendPlayerId : null;
   const backendUsername = typeof profile?.backendUsername === "string" ? profile.backendUsername : null;
-  const backendApiKey = typeof profile?.backendApiKey === "string" ? profile.backendApiKey : null;
 
   if (backendPlayerId) {
     const backendPlayer = await db.collection("players").findOne({ id: backendPlayerId });
@@ -89,13 +88,6 @@ async function resolveBackendPlayer(db: Awaited<ReturnType<typeof getDb>>, profi
 
   if (backendUsername) {
     const backendPlayer = await db.collection("players").findOne({ username: backendUsername });
-    if (backendPlayer) {
-      return backendPlayer;
-    }
-  }
-
-  if (backendApiKey) {
-    const backendPlayer = await db.collection("players").findOne({ api_key: backendApiKey });
     if (backendPlayer) {
       return backendPlayer;
     }

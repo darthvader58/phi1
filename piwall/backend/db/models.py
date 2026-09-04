@@ -37,7 +37,7 @@ def create_db_engine(url: str | None = None):
 def init_db(db):
     db.players.create_index([("id", ASCENDING)], unique=True)
     db.players.create_index([("username", ASCENDING)], unique=True)
-    db.players.create_index([("api_key", ASCENDING)], unique=True)
+    db.players.create_index([("api_key_hash", ASCENDING)], unique=True)
     db.players.create_index([("elo", DESCENDING)])
 
     db.seasons.create_index([("id", ASCENDING)], unique=True)
