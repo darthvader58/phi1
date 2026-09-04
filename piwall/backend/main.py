@@ -24,10 +24,13 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Dict, List, Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from .db.models import create_db_engine, init_db, to_namespace
 from .db import crud
@@ -105,6 +108,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="PIT WALL", version="0.1.0", lifespan=lifespan)
 
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -169,7 +176,8 @@ class CreateSeasonRequest(BaseModel):
 # ─── Endpoints ───────────────────────────────────────────────────────
 
 @app.post("/api/register")
-def register(req: RegisterRequest):
+@limiter.limit("5/hour")
+def register(request: Request, req: RegisterRequest):
     db = SessionLocal()
     try:
         existing = crud.get_player_by_username(db, req.username)
@@ -190,7 +198,8 @@ def register(req: RegisterRequest):
 
 
 @app.post("/api/race/create")
-def create_race(req: CreateRaceRequest, x_api_key: str = Header()):
+@limiter.limit("30/minute")
+def create_race(request: Request, req: CreateRaceRequest, x_api_key: str = Header()):
     player = authenticate(x_api_key)
     if req.track not in TRACKS:
         raise HTTPException(400, f"Unknown track: {req.track}")
@@ -447,7 +456,8 @@ def list_tracks():
 
 
 @app.post("/api/test-bot")
-def test_bot(req: TestBotRequest, x_api_key: str = Header()):
+@limiter.limit("10/minute")
+def test_bot(request: Request, req: TestBotRequest, x_api_key: str = Header()):
     """Run a quick offline simulation with the user's bot vs built-in bots."""
     player = authenticate(x_api_key)
 
