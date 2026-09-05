@@ -31,7 +31,13 @@ def validate_submission(code: str) -> Optional[str]:
         return f"Syntax error: {exc}"
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
+        # Load context only. `dir`, `input`, `vars`, `open` and `compile` are
+        # ordinary variable names, and this is the first surface a new player
+        # touches: rejecting `dir = 1` as "Use of 'dir' is not allowed" is
+        # unexplainable. Binding one of these names shadows the builtin inside
+        # the strategy, so a later read of it cannot reach the builtin either.
+        if (isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES
+                and isinstance(node.ctx, ast.Load)):
             return f"Use of '{node.id}' is not allowed in strategy code"
         if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
             return f"Access to dunder attribute '{node.attr}' is not allowed"
