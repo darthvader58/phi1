@@ -36,10 +36,44 @@ npm run dev
 
 ```bash
 cd piwall
-docker-compose up --build
+cp .env.example .env      # fill in secrets before starting
+docker compose up --build
 # Backend: http://localhost:8000
 # Frontend: http://localhost:3000
 ```
+
+## Upgrading an existing database — required before first start
+
+API keys are stored hashed. A database created before that change holds
+plaintext `api_key` fields, and nothing migrates them automatically: startup
+drops the stale `api_key_1` index and lookups query only `api_key_hash`, so
+**every existing player gets 401 until the migration has run**. Run it once,
+against the same database the backend will use, before starting the new
+backend:
+
+```bash
+cd piwall
+PYTHONPATH=. MONGODB_URI='mongodb://…' python scripts/migrate_hash_api_keys.py
+# migrated N player(s), 0 failure(s)
+```
+
+Then rotate. Every key that existed before this change was stored in plaintext
+in MongoDB *and* left in each player's browser localStorage, so it has to be
+treated as disclosed — hashing it at rest does not un-leak it:
+
+```bash
+PYTHONPATH=. MONGODB_URI='mongodb://…' python scripts/migrate_hash_api_keys.py --rotate
+# rotated N player(s), 0 failure(s)
+# re-linked M web profile(s); K player(s) have no profile in this database …
+```
+
+Rotation rewrites `playerProfiles.backendApiKey` for each web account, so
+signed-in users are carried across with no action from them. Any player
+reported as having no profile — an API-only account, or one whose profile
+lives in a different database — must be issued a new key by hand.
+
+Both commands are re-runnable and exit non-zero if any document failed. A
+fresh database needs neither.
 
 ## Architecture
 
