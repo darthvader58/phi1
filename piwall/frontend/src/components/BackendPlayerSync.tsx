@@ -6,8 +6,20 @@ import { useSession } from "next-auth/react";
 const USERNAME_STORAGE = "piwall_username";
 const SESSION_USER_STORAGE = "piwall_session_user_id";
 
+// Pre-hardening builds stored the raw backend API key here. The writes are
+// gone, but the value survives in every returning visitor's browser — the
+// source grep that gated that change cannot see it. Removing it on mount is
+// the only code path that reaches those browsers.
+const LEGACY_API_KEY_STORAGE = "piwall_api_key";
+
 export default function BackendPlayerSync() {
   const { data: session, status } = useSession();
+
+  // Unconditional and ahead of every branch below: signed-out visitors hold
+  // the leftover credential too, and status is "loading" on first render.
+  useEffect(() => {
+    localStorage.removeItem(LEGACY_API_KEY_STORAGE);
+  }, []);
 
   useEffect(() => {
     if (status === "unauthenticated") {
