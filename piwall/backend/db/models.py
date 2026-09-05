@@ -35,6 +35,21 @@ def create_db_engine(url: str | None = None):
     return db
 
 
+# MongoDB reports "an index with this name exists but with different options"
+# as IndexOptionsConflict (85); older servers used IndexKeySpecsConflict (86)
+# for the same situation when the key pattern also differed.
+_INDEX_CONFLICT_CODES = frozenset({85, 86})
+
+
+def _is_conflicting_index_options(exc: OperationFailure) -> bool:
+    """True when create_index failed purely because the index already exists
+    with different options -- the one case drop-and-recreate can fix."""
+    if exc.code in _INDEX_CONFLICT_CODES:
+        return True
+    # Very old servers report the conflict without a usable code.
+    return exc.code is None and "already exists with different options" in str(exc)
+
+
 def init_db(db):
     db.players.create_index([("id", ASCENDING)], unique=True)
     db.players.create_index([("username", ASCENDING)], unique=True)
@@ -55,9 +70,15 @@ def init_db(db):
             unique=True,
             partialFilterExpression={"api_key_hash": {"$exists": True}},
         )
-    except OperationFailure:
-        # An index named api_key_hash_1 already exists with different options
-        # (e.g. a non-partial unique index from an earlier deploy). Replace it.
+    except OperationFailure as exc:
+        # Only one failure is recoverable here: an index named api_key_hash_1
+        # already exists with different options (e.g. a non-partial unique
+        # index from an earlier deploy). Anything else -- a transient auth
+        # failure, a malformed filter -- must surface as itself, because
+        # dropping and recreating would fail again and bury the real cause
+        # under a more confusing error.
+        if not _is_conflicting_index_options(exc):
+            raise
         db.players.drop_index("api_key_hash_1")
         db.players.create_index(
             [("api_key_hash", ASCENDING)],
