@@ -17,6 +17,7 @@ Endpoints:
 
 import asyncio
 import json
+import logging
 import os
 import random
 import time
@@ -42,7 +43,7 @@ from .engine.bots import BUILTIN_BOTS
 from .engine.cli_runner import build_track_physics
 from .sandbox.runner import STRATEGY_TEMPLATE
 from backend.sandbox.validation import validate_submission
-from backend.sandbox.isolation import MatchAborted
+from backend.sandbox.isolation import ChildFailed, LimitExceeded, MatchAborted
 from backend.sandbox.match_job import run_match_isolated
 from .season.elo import compute_elo_updates
 
@@ -66,6 +67,8 @@ class RaceLobby:
 
 # Global state
 active_lobbies: Dict[str, RaceLobby] = {}
+
+logger = logging.getLogger("piwall")
 
 
 # ─── Database setup ──────────────────────────────────────────────────
@@ -511,8 +514,13 @@ def test_bot(request: Request, req: TestBotRequest, x_api_key: str = Header()):
 
     try:
         result = run_match_isolated(spec)
-    except MatchAborted as exc:
+    except LimitExceeded as exc:
         raise HTTPException(400, f"Your bot was stopped: {exc}")
+    except ChildFailed as exc:
+        # Ours, not theirs. Attributing an engine bug to the player's code
+        # sends them hunting a fault they did not write, and loses the signal.
+        logger.error("test-bot match failed for player %s: %s", player["id"], exc.detail)
+        raise HTTPException(500, str(exc))
 
     return {
         "standings": [
@@ -848,7 +856,11 @@ async def _run_race(race_id: str):
     try:
         result = await loop.run_in_executor(None, run_match_isolated, spec)
     except MatchAborted as exc:
+        if isinstance(exc, ChildFailed):
+            logger.error("race %s aborted by an internal failure: %s", race_id, exc.detail)
         lobby.status = "aborted"
+        # str() only: spectators on this socket are unauthenticated, and
+        # ChildFailed keeps its raw text off str() for exactly that reason.
         await _broadcast(lobby, {"type": "aborted", "reason": str(exc)})
         db = SessionLocal()
         try:

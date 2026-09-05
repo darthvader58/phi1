@@ -10,7 +10,8 @@ connections and memory into untrusted code.
 
 import multiprocessing as mp
 import resource
-from typing import Any, Callable, Tuple
+import signal
+from typing import Any, Callable, Optional, Tuple
 
 DEFAULT_MEMORY_MB = 512
 DEFAULT_CPU_SECONDS = 30
@@ -18,7 +19,39 @@ DEFAULT_WALL_SECONDS = 60
 
 
 class MatchAborted(Exception):
-    """The isolated child exceeded its limits or failed."""
+    """The isolated child produced no result.
+
+    Kept as the shared base so existing `except MatchAborted` sites still
+    catch both outcomes. Callers that show text to a player must distinguish
+    the two subclasses below.
+    """
+
+
+class LimitExceeded(MatchAborted):
+    """The child breached a resource limit: CPU, wall clock, memory, disk.
+
+    The message is composed here from the limit that was hit and never from
+    child output, so it is always safe to put in an HTTP body or broadcast to
+    spectators. It is also the truthful attribution: the submitted bot caused
+    it.
+    """
+
+
+class ChildFailed(MatchAborted):
+    """The child failed for a reason that is not a limit breach.
+
+    str() is deliberately generic. This text reaches a 400/500 body and the
+    spectator WebSocket, where race/[id] renders it verbatim to unauthenticated
+    viewers, and the underlying failure is ours rather than the player's -- an
+    engine KeyError, or a pickling error carrying absolute filesystem paths.
+    The raw child text is kept on .detail for server-side logging only.
+    """
+
+    GENERIC_MESSAGE = "The match could not be completed because of an internal error."
+
+    def __init__(self, detail: str):
+        super().__init__(self.GENERIC_MESSAGE)
+        self.detail = detail
 
 
 def _limit_plan(memory_mb: int, cpu_seconds: int):
@@ -79,9 +112,36 @@ def _child_entrypoint(fn, args, memory_mb, cpu_seconds, conn) -> None:
         else:
             conn.send(("ok", fn(*args)))
     except BaseException as exc:
-        conn.send(("error", f"{type(exc).__name__}: {exc}"))
+        # The type travels separately from the text: the parent classifies on
+        # the type and never has to parse the (untrusted, possibly path-laden)
+        # message to decide whether it may be shown.
+        conn.send(("error", {"type": type(exc).__name__,
+                             "text": f"{type(exc).__name__}: {exc}"}))
     finally:
         conn.close()
+
+
+# A child that breached one of these limits is killed by the kernel before it
+# can report anything, so the signal is the only evidence of what happened.
+def _limit_signal_reason(sig: int, memory_mb: int, cpu_seconds: int) -> Optional[str]:
+    if sig == getattr(signal, "SIGXCPU", None):
+        return f"your bot exceeded the {cpu_seconds}s CPU limit"
+    if sig == getattr(signal, "SIGXFSZ", None):
+        return "your bot tried to write to the filesystem, which is not permitted"
+    if sig == getattr(signal, "SIGKILL", None):
+        # Nothing else kills the child outright once the parent has stopped
+        # waiting: an out-of-memory kill is the remaining explanation.
+        return f"your bot exceeded the {memory_mb}MB memory limit"
+    return None
+
+
+def _classify_death(exitcode: Optional[int], memory_mb: int, cpu_seconds: int) -> MatchAborted:
+    if exitcode is not None and exitcode < 0:
+        reason = _limit_signal_reason(-exitcode, memory_mb, cpu_seconds)
+        if reason is not None:
+            return LimitExceeded(reason)
+        return ChildFailed(f"child terminated by signal {-exitcode}")
+    return ChildFailed(f"child exited with code {exitcode} without reporting")
 
 
 def run_isolated(
@@ -94,7 +154,8 @@ def run_isolated(
     """Run fn(*args) in a limited child process and return its result.
 
     fn must be a module-level function: the spawn context re-imports it.
-    Raises MatchAborted on timeout, limit breach, or child failure.
+    Raises LimitExceeded on a resource-limit breach and ChildFailed on any
+    other child failure; both subclass MatchAborted.
     """
     ctx = mp.get_context("spawn")
     receiver, sender = ctx.Pipe(duplex=False)
@@ -109,11 +170,13 @@ def run_isolated(
         if receiver.poll(wall_seconds):
             status, payload = receiver.recv()
         else:
-            status, payload = "error", f"exceeded {wall_seconds}s wall clock"
+            status, payload = "timeout", None
     except EOFError:
-        status, payload = "error", "child died without reporting"
+        status, payload = "died", None
     finally:
         receiver.close()
+        # Reap before reading exitcode: a limit breach shows up only as the
+        # signal that killed the child.
         process.join(timeout=1)
         if process.is_alive():
             process.kill()
@@ -121,4 +184,12 @@ def run_isolated(
 
     if status == "ok":
         return payload
-    raise MatchAborted(payload)
+    if status == "timeout":
+        raise LimitExceeded(f"your bot exceeded the {wall_seconds}s wall-clock limit")
+    if status == "died":
+        raise _classify_death(process.exitcode, memory_mb, cpu_seconds)
+    if payload["type"] == "MemoryError":
+        # Where RLIMIT_AS is enforced (Linux), the breach surfaces as an
+        # ordinary exception rather than a signal.
+        raise LimitExceeded(f"your bot exceeded the {memory_mb}MB memory limit")
+    raise ChildFailed(payload["text"])
