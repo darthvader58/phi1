@@ -16,6 +16,7 @@ Endpoints:
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -88,6 +89,14 @@ def _parse_cors_origins() -> List[str]:
 
 CORS_ORIGINS = _parse_cors_origins()
 
+# Shared secret proving a caller is our own Next.js server rather than the
+# open internet. /api/register issues credentials, so it cannot authenticate
+# the way every other endpoint does; this is the identity it authenticates
+# with instead. Unset means registration is closed (see provisioning_subject)
+# — failing open here would silently restore the hole in exactly the
+# deployment that forgot to configure it.
+PROVISIONING_SECRET = os.environ.get("PROVISIONING_SECRET") or ""
+
 # MongoClient() opens no socket until the first operation, so building the
 # engine here costs nothing and needs no reachable server. init_db() does talk
 # to the database (it creates and drops indexes), so it runs in lifespan and
@@ -124,6 +133,12 @@ def get_db():
 async def lifespan(app: FastAPI):
     global _session_factory
     print("PIT WALL starting up...")
+    if not PROVISIONING_SECRET:
+        logger.warning(
+            "PROVISIONING_SECRET is unset: /api/register will refuse every "
+            "request with 404 and no new players can be provisioned. Set it "
+            "on both the backend and the Next.js server to open registration."
+        )
     _session_factory = init_db(db_engine)
     yield
     print("PIT WALL shutting down...")
@@ -141,13 +156,59 @@ def rate_limit_key(request: Request) -> str:
     caller across that hop. It is hashed so raw credentials never reach the
     limiter's storage keys or any log line that prints them.
 
-    Requests with no key (registration, the public reads) fall back to the
-    socket address, which is the best identity available for them.
+    The key is not verified before it is bucketed, and deliberately so:
+    every endpoint using this key_func calls authenticate() first, so a
+    caller rotating the header to dodge its limit only spreads its own 401s
+    across buckets. Verifying here instead would put a database round trip
+    on the limiter path for no gain. Registration is the exception — it has
+    no authenticate() behind it — and so it uses registration_rate_key.
+
+    Requests with no key (the public reads) fall back to the socket address,
+    which is the best identity available for them.
     """
     api_key = request.headers.get("x-api-key")
     if api_key:
         return f"player:{crud.hash_api_key(api_key)}"
     return get_remote_address(request)
+
+
+def provisioning_subject(request: Request) -> Optional[str]:
+    """The user id a trusted caller vouched for, or None if it is untrusted.
+
+    A subject comes back only when the caller proved it holds the shared
+    provisioning secret, so both gates that read it — the 404 in register()
+    and the rate limit bucket — key on that proof rather than on anything
+    the caller can pick for itself. compare_digest, not ==: a secret
+    compared with a short-circuiting operator leaks its prefix to a caller
+    who can time the response.
+    """
+    if not PROVISIONING_SECRET:
+        return None
+    presented = request.headers.get("x-provision-secret") or ""
+    if not hmac.compare_digest(presented, PROVISIONING_SECRET):
+        return None
+    return (request.headers.get("x-provision-subject") or "").strip()[:128] or None
+
+
+def registration_rate_key(request: Request) -> str:
+    """Bucket registration on the vouched-for user, never on x-api-key.
+
+    Registration is the one limited endpoint with no authenticate() behind
+    it, and it issues credentials rather than presenting them. The shared
+    key_func's x-api-key branch would therefore let any caller mint a fresh
+    bucket per request by rotating a header nobody verifies, while its
+    remote-address fallback collapses every real signup into one
+    platform-wide bucket, because they all arrive from the Next.js process.
+    The vouched-for subject is the only identity here that is neither
+    forgeable nor shared.
+
+    Untrusted callers share an address-keyed bucket. That traffic gets a 404
+    regardless, so the bucket only bounds how much of it we process.
+    """
+    subject = provisioning_subject(request)
+    if subject:
+        return f"provision:{subject}"
+    return f"anon:{get_remote_address(request)}"
 
 
 limiter = Limiter(key_func=rate_limit_key)
@@ -218,8 +279,12 @@ class CreateSeasonRequest(BaseModel):
 # ─── Endpoints ───────────────────────────────────────────────────────
 
 @app.post("/api/register")
-@limiter.limit("5/hour")
+@limiter.limit("30/hour", key_func=registration_rate_key)
 def register(request: Request, req: RegisterRequest):
+    # 404 rather than 401/403: an unauthenticated scanner should not learn
+    # that this endpoint exists, let alone why it refused.
+    if not provisioning_subject(request):
+        raise HTTPException(404, "Not Found")
     db = SessionLocal()
     try:
         existing = crud.get_player_by_username(db, req.username)
