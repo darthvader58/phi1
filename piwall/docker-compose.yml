@@ -53,6 +53,10 @@ services:
       AUTH_GOOGLE_ID: ${AUTH_GOOGLE_ID}
       AUTH_GOOGLE_SECRET: ${AUTH_GOOGLE_SECRET}
       NEXTAUTH_URL: ${NEXTAUTH_URL}
+      # Auth.js v5's name for the same value. trustHost lets it accept the
+      # Host header; this is what pins the origin callbacks are built from,
+      # so the two belong together.
+      AUTH_URL: ${NEXTAUTH_URL}
       # Same value as the backend's. Server-side only — never NEXT_PUBLIC_.
       PROVISIONING_SECRET: ${PROVISIONING_SECRET:?set PROVISIONING_SECRET to a random secret shared by backend and frontend; registration is closed without it}
       # Dialled by the visitor's browser, so it stays a host address.

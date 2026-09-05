@@ -55,12 +55,23 @@ class ChildFailed(MatchAborted):
 
 
 def _limit_plan(memory_mb: int, cpu_seconds: int):
+    """Each limit as (name, soft, hard). Soft and hard differ only for CPU.
+
+    At the soft CPU limit the kernel sends SIGXCPU, whose default action
+    terminates the child and which _classify_death can tell apart from an
+    out-of-memory kill. Only at the hard limit does it send SIGKILL. Setting
+    both to the same value skips SIGXCPU in practice, so a bot that merely
+    looped forever died by SIGKILL and was reported to its author as having
+    exhausted memory — on Linux only, which is why a macOS test run cannot
+    see it: there RLIMIT_AS is rejected and the CPU path never competes.
+    """
+    memory_bytes = memory_mb * 1024 * 1024
     return [
-        ("RLIMIT_AS", memory_mb * 1024 * 1024),
-        ("RLIMIT_CPU", cpu_seconds),
-        ("RLIMIT_NOFILE", 64),
-        ("RLIMIT_FSIZE", 0),
-        ("RLIMIT_NPROC", 0),
+        ("RLIMIT_AS", memory_bytes, memory_bytes),
+        ("RLIMIT_CPU", cpu_seconds, cpu_seconds + 1),
+        ("RLIMIT_NOFILE", 64, 64),
+        ("RLIMIT_FSIZE", 0, 0),
+        ("RLIMIT_NPROC", 0, 0),
     ]
 
 
@@ -74,13 +85,13 @@ def _apply_limits(memory_mb: int, cpu_seconds: int) -> dict:
     callers can assert on the mechanism rather than assume it.
     """
     applied = {}
-    for name, value in _limit_plan(memory_mb, cpu_seconds):
+    for name, soft, hard in _limit_plan(memory_mb, cpu_seconds):
         limit = getattr(resource, name, None)
         if limit is None:
             applied[name] = False
             continue
         try:
-            resource.setrlimit(limit, (value, value))
+            resource.setrlimit(limit, (soft, hard))
             applied[name] = True
         except (ValueError, OSError):
             applied[name] = False
@@ -129,8 +140,11 @@ def _limit_signal_reason(sig: int, memory_mb: int, cpu_seconds: int) -> Optional
     if sig == getattr(signal, "SIGXFSZ", None):
         return "your bot tried to write to the filesystem, which is not permitted"
     if sig == getattr(signal, "SIGKILL", None):
-        # Nothing else kills the child outright once the parent has stopped
-        # waiting: an out-of-memory kill is the remaining explanation.
+        # Reached only once the CPU soft limit has had its chance to raise
+        # SIGXCPU above, so an out-of-memory kill is the explanation that
+        # remains. This holds only because _limit_plan leaves the CPU hard
+        # limit above the soft one; with the two equal, a runaway loop
+        # arrives here too and is misreported as memory exhaustion.
         return f"your bot exceeded the {memory_mb}MB memory limit"
     return None
 
