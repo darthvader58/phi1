@@ -15,6 +15,13 @@ pip install -r backend/requirements.txt
 export MONGODB_URI='mongodb://127.0.0.1:27017/phi1'
 export MONGODB_DB='phi1'
 
+# Required for player registration. The backend reads only real environment
+# variables — it loads no .env file — so this must be exported here even
+# though the Next.js server picks the same value up from frontend/.env
+# automatically. The two must be identical; without it, /api/register
+# returns 404 to every caller and no new player can be provisioned.
+export PROVISIONING_SECRET='<same value as frontend/.env>'   # openssl rand -hex 32
+
 # Run a CLI race with built-in bots
 PYTHONPATH=. python backend/engine/cli_runner.py bahrain 42
 
