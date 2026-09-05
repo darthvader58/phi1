@@ -34,15 +34,30 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.frontend
+      args:
+        # Client-side, so it must be baked in at build time.
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL}
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
-      NEXT_PUBLIC_WS_URL: ws://localhost:8000
-      NEXTAUTH_URL: http://localhost:3000
+      # Read server-side, inside this container: the proxy routes and NextAuth
+      # both run in the Next.js process. "localhost" here is the frontend
+      # container itself, so the backend is addressed by its service name.
+      BACKEND_API_URL: http://backend:8000
+      MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGODB_DB}?authSource=admin
+      MONGODB_DB: ${MONGODB_DB}
+      AUTH_SECRET: ${AUTH_SECRET}
+      AUTH_GOOGLE_ID: ${AUTH_GOOGLE_ID}
+      AUTH_GOOGLE_SECRET: ${AUTH_GOOGLE_SECRET}
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
+      # Dialled by the visitor's browser, so it stays a host address.
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL}
     restart: unless-stopped
     depends_on:
-      - backend
+      mongodb:
+        condition: service_healthy
+      backend:
+        condition: service_started
 
 volumes:
   mongodata:

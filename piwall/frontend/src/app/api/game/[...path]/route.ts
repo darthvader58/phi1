@@ -2,7 +2,13 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { getPlayerProfileByUserId } from "@/lib/repositories";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Server-side only: this module runs in the Next.js process, where
+// "localhost" is the frontend container, not the backend. BACKEND_API_URL is
+// the in-network address (http://backend:8000 under compose);
+// NEXT_PUBLIC_API_URL stays as a fallback so existing single-host setups,
+// where both are localhost, keep working unchanged.
+const API_BASE =
+  process.env.BACKEND_API_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 const SEGMENT_RE = /^[A-Za-z0-9_.-]+$/;
 
