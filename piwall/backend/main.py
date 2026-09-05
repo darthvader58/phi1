@@ -32,7 +32,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from .db.models import create_db_engine, init_db, to_namespace
+from .db.models import MongoSession, create_db_engine, init_db, to_namespace
 from .db import crud
 from .data.tracks import TRACKS
 from .data.calibration import calibrate_track
@@ -84,8 +84,27 @@ def _parse_cors_origins() -> List[str]:
 
 
 CORS_ORIGINS = _parse_cors_origins()
+
+# MongoClient() opens no socket until the first operation, so building the
+# engine here costs nothing and needs no reachable server. init_db() does talk
+# to the database (it creates and drops indexes), so it runs in lifespan and
+# never at import time: importing this module must not require — or mutate — a
+# live database, or the test suite cannot even be collected without one.
 db_engine = create_db_engine(DB_URL)
-SessionLocal = init_db(db_engine)
+_session_factory = None
+
+
+def SessionLocal():
+    """Return a database session for one unit of work.
+
+    lifespan installs the real factory once init_db() has run. The fallback
+    keeps every request path working if a caller reaches the database before
+    startup finished (or outside the app entirely, as tests and scripts do);
+    it differs only in that indexes have not been ensured.
+    """
+    if _session_factory is None:
+        return MongoSession(db_engine)
+    return _session_factory()
 
 
 def get_db():
@@ -100,8 +119,9 @@ def get_db():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: pre-calibrate tracks
+    global _session_factory
     print("PIT WALL starting up...")
+    _session_factory = init_db(db_engine)
     yield
     print("PIT WALL shutting down...")
 
