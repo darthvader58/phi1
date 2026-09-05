@@ -131,7 +131,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="PIT WALL", version="0.1.0", lifespan=lifespan)
 
-limiter = Limiter(key_func=get_remote_address)
+
+def rate_limit_key(request: Request) -> str:
+    """Bucket rate limits per player, not per socket address.
+
+    Every game request now arrives from the Next.js server process, so keying
+    on the remote address alone turned per-player limits into platform-wide
+    ones: one player's burst throttled everybody. The API key identifies the
+    caller across that hop. It is hashed so raw credentials never reach the
+    limiter's storage keys or any log line that prints them.
+
+    Requests with no key (registration, the public reads) fall back to the
+    socket address, which is the best identity available for them.
+    """
+    api_key = request.headers.get("x-api-key")
+    if api_key:
+        return f"player:{crud.hash_api_key(api_key)}"
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=rate_limit_key)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
