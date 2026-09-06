@@ -6,6 +6,7 @@ time a function of the installed dependency versions. The fit now happens
 offline in scripts/build_calibration.py; this module only reads its output.
 """
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Dict
@@ -13,6 +14,15 @@ from typing import Dict
 from .calibration_types import TrackCalibration, TyreDegParams
 
 ARTIFACT_DIR = Path(__file__).resolve().parent.parent.parent / "calibration"
+
+
+class CalibrationIntegrityError(ValueError):
+    """An artifact's content no longer hashes to the digest in its filename.
+
+    A hand-edited JSON, a bad merge, or a truncated write would otherwise
+    load silently under a stale content address — the exact silent
+    divergence this task exists to close.
+    """
 
 
 def _artifact_path(track: str) -> Path:
@@ -29,22 +39,39 @@ def _artifact_path(track: str) -> Path:
     return matches[0]
 
 
+def _digest_from_filename(path: Path) -> str:
+    return path.name.split(".sha256-")[1][:-5]
+
+
 def calibration_id(track: str) -> str:
     """Content address of the artifact, recorded in the match manifest."""
-    return "sha256:" + _artifact_path(track).name.split(".sha256-")[1][:-5]
+    return "sha256:" + _digest_from_filename(_artifact_path(track))
 
 
 def load_calibration(track: str) -> TrackCalibration:
-    raw = json.loads(_artifact_path(track).read_text())
+    path = _artifact_path(track)
+    raw = json.loads(path.read_text())
     compounds: Dict[str, TyreDegParams] = {
         name: TyreDegParams(**params) for name, params in sorted(raw["compounds"].items())
     }
-    return TrackCalibration(
+    cal = TrackCalibration(
         track=raw["track"],
         base_lap_time=raw["base_lap_time"],
         pit_loss_seconds=raw["pit_loss_seconds"],
         compounds=compounds,
     )
+
+    # The filename is a claim, not a fact: verify the bytes still hash to
+    # the digest they're named after before handing the calibration out.
+    expected = _digest_from_filename(path)
+    actual = hashlib.sha256(canonical_calibration_bytes(cal)).hexdigest()
+    if actual != expected:
+        raise CalibrationIntegrityError(
+            f"{path.name}: content hashes to sha256-{actual}, "
+            f"but the filename claims sha256-{expected}"
+        )
+
+    return cal
 
 
 def canonical_calibration_bytes(cal: TrackCalibration) -> bytes:

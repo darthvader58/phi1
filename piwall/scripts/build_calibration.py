@@ -2,10 +2,14 @@
 
 Usage: python scripts/build_calibration.py [track ...]
 
-Writes calibration/<track>.sha256-<id>.json. Commit the result: a match
-manifest records the calibration_id, so recalibrating creates a new artifact
-rather than invalidating replay history. Delete the old file only once no
-manifest references it.
+Writes calibration/<track>.sha256-<id>.json. load_calibration() takes no
+calibration id: it loads whatever single artifact exists for a track, and
+raises RuntimeError if it finds more than one. So only one artifact per
+track can exist at a time — recalibrating replaces it, not adds to it.
+Delete the old file in the same commit that adds the new one, or every load
+for that track (including live races) starts raising. Selecting a specific
+historical calibration by id is not supported today; that is future work
+for whatever later phase teaches load_calibration to take one.
 """
 
 import hashlib

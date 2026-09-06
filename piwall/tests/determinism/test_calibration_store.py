@@ -1,7 +1,10 @@
+import hashlib
+import json
 import re
 import pytest
 from backend.data.calibration_store import (
-    ARTIFACT_DIR, calibration_id, load_calibration,
+    ARTIFACT_DIR, CalibrationIntegrityError, calibration_id,
+    canonical_calibration_bytes, load_calibration,
 )
 
 TRACKS = ["bahrain", "monaco", "monza", "spa", "silverstone", "suzuka"]
@@ -20,6 +23,30 @@ def test_calibration_id_is_a_prefixed_sha256(track):
 @pytest.mark.parametrize("track", TRACKS)
 def test_loading_twice_gives_equal_calibration(track):
     assert load_calibration(track) == load_calibration(track)
+
+
+@pytest.mark.parametrize("track", TRACKS)
+def test_loaded_content_hashes_to_its_own_calibration_id(track):
+    """The filename is a claim; this checks the bytes actually back it up."""
+    cal = load_calibration(track)
+    digest = hashlib.sha256(canonical_calibration_bytes(cal)).hexdigest()
+    assert f"sha256:{digest}" == calibration_id(track)
+
+
+def test_content_mismatch_raises_rather_than_loading_silently(tmp_path, monkeypatch):
+    """A hand-edited or truncated artifact must not load under a stale address."""
+    from backend.data import calibration_store
+
+    real_path = next(iter(ARTIFACT_DIR.glob("bahrain.sha256-*.json")))
+    raw = json.loads(real_path.read_text())
+    raw["base_lap_time"] += 1.0  # corrupt content; filename keeps the old digest
+
+    corrupted = tmp_path / real_path.name
+    corrupted.write_text(json.dumps(raw))
+    monkeypatch.setattr(calibration_store, "ARTIFACT_DIR", tmp_path)
+
+    with pytest.raises(CalibrationIntegrityError):
+        load_calibration("bahrain")
 
 
 def test_loading_does_not_import_scipy():
