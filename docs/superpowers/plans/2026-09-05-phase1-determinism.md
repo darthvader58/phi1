@@ -230,12 +230,16 @@ def test_loading_twice_gives_equal_calibration(track):
 def test_loading_does_not_import_scipy():
     """The runner image has no scipy; an accidental import would crash it."""
     import subprocess, sys
+    from pathlib import Path
+    # Derived, not hardcoded: this same suite runs inside the container,
+    # where the tree lives at /app rather than at any developer's path.
+    repo = Path(__file__).resolve().parents[2]
     code = (
         "import sys; from backend.data.calibration_store import load_calibration; "
         "load_calibration('bahrain'); "
         "assert 'scipy' not in sys.modules, 'scipy was imported'"
     )
-    subprocess.run([sys.executable, "-c", code], check=True, cwd="/Users/shashwatraj/phi1/piwall")
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=repo)
 
 
 def test_unknown_track_raises_rather_than_silently_calibrating():
@@ -586,13 +590,14 @@ def test_weather_sequences_differ_across_seeds():
 def test_engine_hot_path_does_not_import_numpy():
     """numpy's float paths vary with the BLAS backend (spec 5.4)."""
     import subprocess, sys
+    from pathlib import Path
+    repo = Path(__file__).resolve().parents[2]
     code = (
         "import sys; import backend.engine.race, backend.engine.physics, "
         "backend.engine.weather; "
         "assert 'numpy' not in sys.modules, 'numpy reached the hot path'"
     )
-    subprocess.run([sys.executable, "-c", code], check=True,
-                   cwd="/Users/shashwatraj/phi1/piwall")
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=repo)
 ```
 
 - [ ] **Step 2: Run it**
