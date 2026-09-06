@@ -1,0 +1,7 @@
+# Calibration tooling only — never installed into the runner image.
+# scipy's curve_fit results shift across BLAS/LAPACK backends, which is why
+# calibration is an offline build step and its output is committed.
+numpy==2.4.6
+scipy==1.17.1
+fastf1==3.8.3
+matplotlib==3.11.1
