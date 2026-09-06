@@ -1,0 +1,1 @@
+{"base_lap_time":81.728,"compounds":{"HARD":{"alpha":0.4772,"base_lap_time":81.728,"compound":"HARD","e":1.1797,"k":0.033054,"n_samples":682,"r_squared":0.3408,"track":"monza"},"MEDIUM":{"alpha":0.7654,"base_lap_time":81.939,"compound":"MEDIUM","e":3.0,"k":0.000221,"n_samples":240,"r_squared":0.1272,"track":"monza"}},"pit_loss_seconds":24.7,"track":"monza"}

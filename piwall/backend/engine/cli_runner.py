@@ -11,14 +11,14 @@ import json
 
 # Support both direct execution and module import
 try:
-    from ..data.calibration import calibrate_track, _deg_model
+    from ..data.calibration_store import load_calibration
     from ..data.tracks import TRACKS
     from .physics import TyreModel, TrackPhysics
     from .race import RaceEngine, Decision
     from .bots import BUILTIN_BOTS
 except ImportError:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-    from piwall.backend.data.calibration import calibrate_track, _deg_model
+    from piwall.backend.data.calibration_store import load_calibration
     from piwall.backend.data.tracks import TRACKS
     from piwall.backend.engine.physics import TyreModel, TrackPhysics
     from piwall.backend.engine.race import RaceEngine, Decision
@@ -26,9 +26,9 @@ except ImportError:
 
 
 def build_track_physics(track_name: str) -> TrackPhysics:
-    """Build TrackPhysics from calibrated data."""
+    """Build TrackPhysics from the frozen calibration artifact."""
     track_cfg = TRACKS[track_name]
-    cal = calibrate_track(track_name)
+    cal = load_calibration(track_name)
 
     tyre_models = {}
     # Compound speed hierarchy: SOFT fastest, HARD slowest

@@ -37,7 +37,6 @@ from slowapi.util import get_remote_address
 from .db.models import MongoSession, create_db_engine, init_db, to_namespace
 from .db import crud
 from .data.tracks import TRACKS
-from .data.calibration import calibrate_track
 from .engine.physics import TyreModel, TrackPhysics
 from .engine.race import RaceEngine
 from .engine.bots import BUILTIN_BOTS
