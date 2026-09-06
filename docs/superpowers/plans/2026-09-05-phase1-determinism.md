@@ -1278,8 +1278,9 @@ In `piwall/Dockerfile.backend`, add before the entrypoint:
 ENV PYTHONHASHSEED=0
 COPY tests/ ./tests/
 COPY pytest.ini ./pytest.ini
-COPY calibration/ ./calibration/
 ```
+
+Task 2 already added `COPY calibration/ calibration/` — do not add it twice.
 
 - [ ] **Step 6: Run the gate on the production interpreter — the second machine**
 
