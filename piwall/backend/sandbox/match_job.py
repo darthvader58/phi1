@@ -6,6 +6,7 @@ the whole match from a plain dict, with no reference to server state.
 
 from typing import Any, Dict
 
+from backend.determinism.budget import DEFAULT_DECISION_OPS
 from backend.engine.bots import BUILTIN_BOTS
 from backend.engine.race import Decision, RaceEngine
 from backend.sandbox.isolation import (
@@ -18,11 +19,15 @@ from backend.engine.serialize import car_state_to_dict, race_state_to_dict
 from backend.sandbox.runner import execute_strategy
 
 
-def _make_user_strategy(code: str, seed: int, slot: int):
+def _make_user_strategy(code: str, seed: int, slot: int,
+                        max_ops: int = DEFAULT_DECISION_OPS):
     def strategy(state, my_car):
+        # BudgetForfeit and DecisionTimeout deliberately travel straight
+        # through: only RaceEngine knows the lap this happened on, and only
+        # it can record the forfeit as a replay event.
         result = execute_strategy(code, race_state_to_dict(state),
                                   car_state_to_dict(my_car),
-                                  seed=seed, slot=slot)
+                                  seed=seed, slot=slot, max_ops=max_ops)
         if "error" in result:
             return Decision(pit=False, compound=my_car.compound)
         return Decision(pit=result["pit"], compound=result["compound"])

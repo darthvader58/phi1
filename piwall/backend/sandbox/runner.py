@@ -2,7 +2,8 @@
 
 Runs user-submitted Python strategy functions in a restricted environment:
 - No imports except math, random, dataclasses
-- 50ms CPU time limit
+- A counted-operation budget per decision (see backend/determinism/budget.py)
+- A wall-clock net that voids the match rather than deciding its outcome
 - No file/network/system access
 - Returns a Decision object
 """
@@ -21,6 +22,12 @@ from RestrictedPython.Guards import (
     guarded_iter_unpack_sequence,
     guarded_unpack_sequence,
     safer_getattr,
+)
+
+from backend.determinism.budget import (
+    DEFAULT_DECISION_OPS,
+    BudgetForfeit,
+    run_with_budget,
 )
 
 
@@ -57,13 +64,43 @@ ALLOWED_BUILTINS = {
     "isinstance": isinstance,
 }
 
-# Timeout handler
+# The wall-clock net for one decision. It is NOT the thing that decides a
+# race: the counted budget in backend/determinism/budget.py is. This exists
+# only for the two shapes the op counter cannot bound --
+#   1. a single line that does unbounded work inside C, e.g.
+#      `x = len(sorted(range(20_000)))` in a loop: 200k line events there
+#      measured ~19s of real work, all of it invisible to the counter;
+#   2. a bot that catches its own forfeit (CPython drops the trace function
+#      as soon as a trace callback raises, so the counter gets one shot).
+# Sized far above the ~20ms it takes to burn DEFAULT_DECISION_OPS of ordinary
+# Python, so an honest bot that spends its whole budget is never cut short by
+# the clock. When it does fire the match is voided, never completed.
+DEFAULT_DECISION_WALL_MS = 2000
+
+
+# Distinguishes "the bot defined no my_strategy" from "my_strategy returned
+# None", without a second pass over restricted_locals outside the budget.
+_MISSING_STRATEGY = object()
+
+
 class TimeoutError(Exception):
     pass
 
 
+class DecisionTimeout(BaseException):
+    """The wall-clock net fired: this match must be voided, not completed.
+
+    Where it lands depends on elapsed time, so recording it as a decision
+    would put a machine-speed-dependent outcome into the replay -- exactly
+    what the counted budget exists to prevent (spec 5.5). Derived from
+    BaseException so that no `except Exception:` -- not the engine's
+    per-decision handler, not a line of bot code -- can quietly downgrade a
+    void into a completed race.
+    """
+
+
 def _timeout_handler(signum, frame):
-    raise TimeoutError("Strategy function exceeded 50ms CPU time limit")
+    raise TimeoutError("Strategy function exceeded its wall-clock limit")
 
 
 def compile_strategy(code: str) -> Optional[str]:
@@ -117,10 +154,11 @@ def execute_strategy(
     code: str,
     state_dict: dict,
     my_car_dict: dict,
-    timeout_ms: int = 50,
+    timeout_ms: int = DEFAULT_DECISION_WALL_MS,
     *,
     seed: int,
     slot: int,
+    max_ops: int = DEFAULT_DECISION_OPS,
 ) -> dict:
     """Execute a user strategy function in a sandboxed environment.
 
@@ -128,12 +166,24 @@ def execute_strategy(
         code: User's Python code (must define `my_strategy(state, my_car)`)
         state_dict: Serialized RaceState as dict
         my_car_dict: Serialized CarState as dict
-        timeout_ms: CPU time limit in milliseconds
+        timeout_ms: wall-clock net for this decision; see
+            DEFAULT_DECISION_WALL_MS. Not a budget -- exceeding it voids the
+            match instead of producing a decision.
         seed: Match seed, mixed into this car's private random stream
         slot: This car's stable index in the match, mixed into its stream
+        max_ops: executed-line budget for this decision. This is the limit
+            that decides races, because where it lands depends only on the
+            code and its inputs.
 
     Returns:
         {"pit": bool, "compound": str} or {"error": str}
+
+    Raises:
+        BudgetForfeit: the bot spent its whole operation budget. Deliberately
+            not swallowed into an {"error": ...}: the caller owns the lap
+            number and car id this happened on, and RaceEngine turns it into
+            a recorded no-op decision plus a "budget_forfeit" replay event.
+        DecisionTimeout: the wall-clock net fired; the match is void.
     """
     try:
         byte_code = compile_restricted(
@@ -171,10 +221,10 @@ def execute_strategy(
     restricted_globals["state"] = Namespace(state_dict)
     restricted_globals["my_car"] = Namespace(my_car_dict)
 
-    # Execute with timeout
+    # Execute under the counted budget, with the wall-clock net outside it
     restricted_locals = {}
 
-    # Set alarm for timeout (Unix only)
+    # Set alarm for the wall-clock net (Unix, main thread only)
     old_handler = None
     try:
         old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
@@ -183,18 +233,27 @@ def execute_strategy(
     except (ValueError, AttributeError):
         pass  # Signal not available (Windows, or not main thread)
 
-    try:
-        exec(byte_code, restricted_globals, restricted_locals)
+    def _define_and_decide():
+        """Everything the bot gets to run, under one counted budget.
 
-        # Find and call my_strategy
+        The module body is inside the budget too, not just the call: a bot
+        whose runaway loop sits at module level costs exactly as much as one
+        that hides it in my_strategy, and both must trip the same counter.
+        """
+        exec(byte_code, restricted_globals, restricted_locals)
         strategy_fn = restricted_locals.get("my_strategy")
         if strategy_fn is None:
-            return {"error": "Code must define a function called 'my_strategy'"}
-
-        result = strategy_fn(
+            return _MISSING_STRATEGY
+        return strategy_fn(
             restricted_globals["state"],
             restricted_globals["my_car"],
         )
+
+    try:
+        result, _ops_used = run_with_budget(_define_and_decide, (), max_ops)
+
+        if result is _MISSING_STRATEGY:
+            return {"error": "Code must define a function called 'my_strategy'"}
 
         # Parse result
         if isinstance(result, dict):
@@ -210,8 +269,15 @@ def execute_strategy(
         else:
             return {"error": f"my_strategy must return a dict with 'pit' and 'compound' keys"}
 
+    except BudgetForfeit:
+        # Explicit, even though BudgetForfeit is a BaseException and the
+        # handler below would not catch it: the forfeit belongs to the
+        # caller, which knows the lap and car it happened to.
+        raise
     except TimeoutError:
-        return {"error": "Strategy exceeded 50ms CPU time limit"}
+        raise DecisionTimeout(
+            f"a decision exceeded the {timeout_ms}ms wall-clock limit"
+        ) from None
     except Exception as e:
         return {"error": f"Runtime error: {type(e).__name__}: {e}"}
     finally:

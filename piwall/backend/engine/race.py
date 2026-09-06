@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Dict, List, Optional, Tuple
 
+from backend.determinism.budget import BudgetForfeit
 from .physics import (
     TrackPhysics, TyreModel, compute_lap_time, compute_overtake_probability,
     check_dnf, compute_pit_stop_time, SC_GAP_COMPRESSION,
@@ -63,7 +64,8 @@ class Decision:
 @dataclass
 class RaceEvent:
     lap: int
-    event_type: str   # "pit", "sc_start", "sc_end", "dnf", "overtake", "weather", "undercut"
+    event_type: str   # "pit", "sc_start", "sc_end", "dnf", "overtake",
+                      # "weather", "undercut", "budget_forfeit"
     car_id: str
     detail: str
 
@@ -437,6 +439,17 @@ class RaceEngine:
                     decision = self.strategies[car.car_id](state, my_state)
                     if not isinstance(decision, Decision):
                         decision = Decision(pit=False, compound=car.compound)
+                except BudgetForfeit:
+                    # A forfeit is a recorded non-decision, not a crash. The
+                    # car does nothing this lap and the race carries on, so
+                    # the replay stays complete -- and because the budget is
+                    # counted in executed lines rather than elapsed time,
+                    # this lands on the same lap on every machine.
+                    decision = Decision(pit=False, compound=car.compound)
+                    self.events.append(RaceEvent(
+                        lap, "budget_forfeit", car.car_id,
+                        "decision budget exhausted",
+                    ))
                 except Exception:
                     decision = Decision(pit=False, compound=car.compound)
                 decisions[car.car_id] = decision

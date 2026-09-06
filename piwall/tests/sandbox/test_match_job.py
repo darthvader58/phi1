@@ -57,13 +57,12 @@ def _spec_with_a_hanging_bot():
 def test_a_hanging_bot_forfeits_its_decisions_and_the_match_completes():
     """A bot that never returns must not hang the server.
 
-    Moving execution into a child process revived runner.py's 50ms SIGALRM
-    guard, which is dead in the API process because signal.signal() cannot arm
-    off the main thread -- inside the child, the engine runs on the child's
-    main thread, so it arms. The hanging bot therefore forfeits each decision
-    (~50ms apiece) rather than blocking, and the race finishes normally. That
-    is the better outcome: one player's bad bot does not deny everyone else
-    their race.
+    The cut-off is now the counted-operation budget, not a SIGALRM: the
+    hanging bot spends DEFAULT_DECISION_OPS executed lines and forfeits, on
+    the same lap and after the same number of lines on every machine. The
+    race finishes normally, which is the better outcome -- one player's bad
+    bot does not deny everyone else their race -- and the forfeit is recorded
+    as a "budget_forfeit" event so the replay shows what happened.
 
     Limits are deliberately generous so this asserts the forfeit behaviour and
     not a race against a limit.
@@ -84,22 +83,42 @@ def test_a_hanging_bot_forfeits_its_decisions_and_the_match_completes():
     # Every decision it attempted was cut off, so it never pitted.
     assert hanging["pit_count"] == 0
 
+    forfeits = [e for e in result["events"]
+                if e["event_type"] == "budget_forfeit"]
+    assert forfeits and all(e["car_id"] == "c1" for e in forfeits)
 
-def test_a_bot_that_exhausts_the_childs_budget_aborts_the_match():
-    """The abort path is still armed for a bot the 50ms guard cannot absorb.
 
-    Both limits are set low: the forfeits burn CPU (tripping RLIMIT_CPU) and
-    wall time (tripping the parent's poll). Either alone is enough, and they
-    fail in opposite directions under load -- SIGALRM is ITIMER_REAL, i.e.
-    wall-clock, so contention makes each forfeit burn *less* CPU but *more*
-    wall time. Asserting the guarantee rather than one mechanism is what keeps
-    this stable; pinning it to CPU alone is what made the previous version of
-    this test flaky.
+# The counter cannot bound this: each line is one trace event but does
+# unbounded work inside C, so the whole budget would cost minutes. This is
+# the shape the resource limits still exist for.
+BURNS_CPU_PER_LINE = (
+    "def my_strategy(state, my_car):\n"
+    "    while True:\n"
+    "        n = len(sorted(range(400000)))\n"
+)
+
+
+def test_a_bot_the_counter_cannot_bound_aborts_the_match():
+    """The abort path is still armed where the op budget cannot reach.
+
+    A bot whose cost hides inside C calls spends few operations and much
+    time, so the counted budget never trips. Elapsed time must not decide a
+    recorded race, so the outcome here is an abort -- the match is voided,
+    not completed with a machine-speed-dependent forfeit written into it.
+
+    Both limits are set low: the bot burns CPU (tripping RLIMIT_CPU) and wall
+    time (tripping the parent's poll, or runner.py's own wall-clock net).
+    Any of them is enough, and they fail in opposite directions under load,
+    so this asserts the guarantee rather than one mechanism.
     """
+    spec = make_spec()
+    spec["cars"] = [
+        {"car_id": "c1", "player_id": "p1", "code": BURNS_CPU_PER_LINE,
+         "start_position": 1, "starting_compound": "MEDIUM"},
+        spec["cars"][1],
+    ]
     with pytest.raises(MatchAborted):
-        run_match_isolated(
-            _spec_with_a_hanging_bot(), cpu_seconds=1, wall_seconds=5,
-        )
+        run_match_isolated(spec, cpu_seconds=1, wall_seconds=15)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
