@@ -13,12 +13,12 @@ HASATTR = (
 
 
 def test_getattr_builtin_is_unreachable(sample_state, sample_car):
-    result = execute_strategy(GETATTR, sample_state, sample_car)
+    result = execute_strategy(GETATTR, sample_state, sample_car, seed=42, slot=0)
     assert "error" in result
 
 
 def test_hasattr_builtin_is_unreachable(sample_state, sample_car):
-    result = execute_strategy(HASATTR, sample_state, sample_car)
+    result = execute_strategy(HASATTR, sample_state, sample_car, seed=42, slot=0)
     assert "error" in result
 
 
@@ -30,5 +30,5 @@ WRITE = (
 
 
 def test_user_code_cannot_mutate_passed_state(sample_state, sample_car):
-    result = execute_strategy(WRITE, sample_state, sample_car)
+    result = execute_strategy(WRITE, sample_state, sample_car, seed=42, slot=0)
     assert "error" in result

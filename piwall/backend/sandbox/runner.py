@@ -118,8 +118,9 @@ def execute_strategy(
     state_dict: dict,
     my_car_dict: dict,
     timeout_ms: int = 50,
-    seed: int = 0,
-    slot: int = 0,
+    *,
+    seed: int,
+    slot: int,
 ) -> dict:
     """Execute a user strategy function in a sandboxed environment.
 
