@@ -87,11 +87,39 @@ def compile_strategy(code: str) -> Optional[str]:
         return f"Compilation error: {e}"
 
 
+def build_sandbox_globals(seed: int, slot: int) -> dict:
+    """Build the RestrictedPython globals every bot's strategy executes under.
+
+    `seed` and `slot` exist to derive a private `random.Random` stream for
+    this car (see below) -- they carry no other effect on the globals.
+    """
+    restricted_globals = safe_globals.copy()
+    restricted_globals["__builtins__"] = ALLOWED_BUILTINS
+    restricted_globals["_getattr_"] = safer_getattr
+    restricted_globals["_getiter_"] = iter
+    restricted_globals["_getitem_"] = lambda obj, key: obj[key]
+    restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
+    restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
+    restricted_globals["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
+    restricted_globals["_write_"] = full_write_guard
+
+    restricted_globals["math"] = math
+    # A private stream per slot, derived from the match seed. Binding the
+    # random *module* here gave every bot in the process one shared
+    # generator: draw order then depended on which bots raced alongside
+    # which, so no match could be reproduced from its seed.
+    restricted_globals["random"] = random.Random((seed << 8) ^ slot)
+
+    return restricted_globals
+
+
 def execute_strategy(
     code: str,
     state_dict: dict,
     my_car_dict: dict,
     timeout_ms: int = 50,
+    seed: int = 0,
+    slot: int = 0,
 ) -> dict:
     """Execute a user strategy function in a sandboxed environment.
 
@@ -100,6 +128,8 @@ def execute_strategy(
         state_dict: Serialized RaceState as dict
         my_car_dict: Serialized CarState as dict
         timeout_ms: CPU time limit in milliseconds
+        seed: Match seed, mixed into this car's private random stream
+        slot: This car's stable index in the match, mixed into its stream
 
     Returns:
         {"pit": bool, "compound": str} or {"error": str}
@@ -115,20 +145,7 @@ def execute_strategy(
     except Exception as e:
         return {"error": f"Compilation error: {e}"}
 
-    # Build restricted globals
-    restricted_globals = safe_globals.copy()
-    restricted_globals["__builtins__"] = ALLOWED_BUILTINS
-    restricted_globals["_getattr_"] = safer_getattr
-    restricted_globals["_getiter_"] = iter
-    restricted_globals["_getitem_"] = lambda obj, key: obj[key]
-    restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
-    restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
-    restricted_globals["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
-    restricted_globals["_write_"] = full_write_guard
-
-    # Inject math and random modules (safe)
-    restricted_globals["math"] = math
-    restricted_globals["random"] = random
+    restricted_globals = build_sandbox_globals(seed=seed, slot=slot)
 
     # Make state and car available as simple namespace objects
     class Namespace:

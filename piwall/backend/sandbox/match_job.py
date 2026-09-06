@@ -18,10 +18,11 @@ from backend.engine.serialize import car_state_to_dict, race_state_to_dict
 from backend.sandbox.runner import execute_strategy
 
 
-def _make_user_strategy(code: str):
+def _make_user_strategy(code: str, seed: int, slot: int):
     def strategy(state, my_car):
         result = execute_strategy(code, race_state_to_dict(state),
-                                  car_state_to_dict(my_car))
+                                  car_state_to_dict(my_car),
+                                  seed=seed, slot=slot)
         if "error" in result:
             return Decision(pit=False, compound=my_car.compound)
         return Decision(pit=result["pit"], compound=result["compound"])
@@ -51,9 +52,9 @@ def run_match(spec: Dict[str, Any]) -> Dict[str, Any]:
         sc_prob_wet=config.safety_car_prob_wet,
     )
 
-    for car in spec["cars"]:
+    for slot, car in enumerate(spec["cars"]):
         if car.get("code"):
-            strategy = _make_user_strategy(car["code"])
+            strategy = _make_user_strategy(car["code"], spec["seed"], slot)
         else:
             strategy = BUILTIN_BOTS[car["bot_id"]]["strategy"]
         engine.add_car(
