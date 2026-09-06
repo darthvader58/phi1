@@ -5,14 +5,20 @@ guarantee the determinism contract depends on (spec 5.4).
 """
 
 import random
-import pytest
 from backend.engine.weather import DEFAULT_TRANSITIONS, WeatherEngine
 
 
 def test_transition_tables_iterate_in_a_fixed_order():
     """step() walks probs.keys() cumulatively, so order changes outcomes."""
+    expected_order = {
+        "dry": ["dry", "damp", "wet"],
+        "damp": ["dry", "damp", "wet"],
+        "wet": ["dry", "damp", "wet"],
+        "drying": ["dry", "damp", "wet", "drying"],
+    }
+    assert set(DEFAULT_TRANSITIONS) == set(expected_order), "state set changed"
     for state, probs in DEFAULT_TRANSITIONS.items():
-        assert list(probs.keys()) == list(probs.keys()), f"{state} iterates unstably"
+        assert list(probs.keys()) == expected_order[state], f"{state} iterates unstably"
 
 
 def test_weather_is_reproducible_from_a_seed():
