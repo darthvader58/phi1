@@ -16,8 +16,9 @@ Endpoints:
 """
 
 import asyncio
-import concurrent.futures
+import hmac
 import json
+import logging
 import os
 import random
 import time
@@ -25,20 +26,26 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Dict, List, Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
-from .db.models import create_db_engine, init_db
+from .db.models import MongoSession, create_db_engine, init_db, to_namespace
 from .db import crud
 from .data.tracks import TRACKS
 from .data.calibration import calibrate_track
 from .engine.physics import TyreModel, TrackPhysics
-from .engine.race import RaceEngine, RaceState, CarState, Decision, RaceEvent
+from .engine.race import RaceEngine
 from .engine.bots import BUILTIN_BOTS
 from .engine.cli_runner import build_track_physics
-from .sandbox.runner import execute_strategy, compile_strategy, STRATEGY_TEMPLATE
+from .sandbox.runner import STRATEGY_TEMPLATE
+from backend.sandbox.validation import validate_submission
+from backend.sandbox.isolation import ChildFailed, LimitExceeded, MatchAborted
+from backend.sandbox.match_job import run_match_isolated
 from .season.elo import compute_elo_updates
 
 
@@ -62,6 +69,8 @@ class RaceLobby:
 # Global state
 active_lobbies: Dict[str, RaceLobby] = {}
 
+logger = logging.getLogger("piwall")
+
 
 # ─── Database setup ──────────────────────────────────────────────────
 
@@ -79,8 +88,35 @@ def _parse_cors_origins() -> List[str]:
 
 
 CORS_ORIGINS = _parse_cors_origins()
+
+# Shared secret proving a caller is our own Next.js server rather than the
+# open internet. /api/register issues credentials, so it cannot authenticate
+# the way every other endpoint does; this is the identity it authenticates
+# with instead. Unset means registration is closed (see provisioning_subject)
+# — failing open here would silently restore the hole in exactly the
+# deployment that forgot to configure it.
+PROVISIONING_SECRET = os.environ.get("PROVISIONING_SECRET") or ""
+
+# MongoClient() opens no socket until the first operation, so building the
+# engine here costs nothing and needs no reachable server. init_db() does talk
+# to the database (it creates and drops indexes), so it runs in lifespan and
+# never at import time: importing this module must not require — or mutate — a
+# live database, or the test suite cannot even be collected without one.
 db_engine = create_db_engine(DB_URL)
-SessionLocal = init_db(db_engine)
+_session_factory = None
+
+
+def SessionLocal():
+    """Return a database session for one unit of work.
+
+    lifespan installs the real factory once init_db() has run. The fallback
+    keeps every request path working if a caller reaches the database before
+    startup finished (or outside the app entirely, as tests and scripts do);
+    it differs only in that indexes have not been ensured.
+    """
+    if _session_factory is None:
+        return MongoSession(db_engine)
+    return _session_factory()
 
 
 def get_db():
@@ -95,13 +131,89 @@ def get_db():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: pre-calibrate tracks
+    global _session_factory
     print("PIT WALL starting up...")
+    if not PROVISIONING_SECRET:
+        logger.warning(
+            "PROVISIONING_SECRET is unset: /api/register will refuse every "
+            "request with 404 and no new players can be provisioned. Set it "
+            "on both the backend and the Next.js server to open registration."
+        )
+    _session_factory = init_db(db_engine)
     yield
     print("PIT WALL shutting down...")
 
 
 app = FastAPI(title="PIT WALL", version="0.1.0", lifespan=lifespan)
+
+
+def rate_limit_key(request: Request) -> str:
+    """Bucket rate limits per player, not per socket address.
+
+    Every game request now arrives from the Next.js server process, so keying
+    on the remote address alone turned per-player limits into platform-wide
+    ones: one player's burst throttled everybody. The API key identifies the
+    caller across that hop. It is hashed so raw credentials never reach the
+    limiter's storage keys or any log line that prints them.
+
+    The key is not verified before it is bucketed, and deliberately so:
+    every endpoint using this key_func calls authenticate() first, so a
+    caller rotating the header to dodge its limit only spreads its own 401s
+    across buckets. Verifying here instead would put a database round trip
+    on the limiter path for no gain. Registration is the exception — it has
+    no authenticate() behind it — and so it uses registration_rate_key.
+
+    Requests with no key (the public reads) fall back to the socket address,
+    which is the best identity available for them.
+    """
+    api_key = request.headers.get("x-api-key")
+    if api_key:
+        return f"player:{crud.hash_api_key(api_key)}"
+    return get_remote_address(request)
+
+
+def provisioning_subject(request: Request) -> Optional[str]:
+    """The user id a trusted caller vouched for, or None if it is untrusted.
+
+    A subject comes back only when the caller proved it holds the shared
+    provisioning secret, so both gates that read it — the 404 in register()
+    and the rate limit bucket — key on that proof rather than on anything
+    the caller can pick for itself. compare_digest, not ==: a secret
+    compared with a short-circuiting operator leaks its prefix to a caller
+    who can time the response.
+    """
+    if not PROVISIONING_SECRET:
+        return None
+    presented = request.headers.get("x-provision-secret") or ""
+    if not hmac.compare_digest(presented, PROVISIONING_SECRET):
+        return None
+    return (request.headers.get("x-provision-subject") or "").strip()[:128] or None
+
+
+def registration_rate_key(request: Request) -> str:
+    """Bucket registration on the vouched-for user, never on x-api-key.
+
+    Registration is the one limited endpoint with no authenticate() behind
+    it, and it issues credentials rather than presenting them. The shared
+    key_func's x-api-key branch would therefore let any caller mint a fresh
+    bucket per request by rotating a header nobody verifies, while its
+    remote-address fallback collapses every real signup into one
+    platform-wide bucket, because they all arrive from the Next.js process.
+    The vouched-for subject is the only identity here that is neither
+    forgeable nor shared.
+
+    Untrusted callers share an address-keyed bucket. That traffic gets a 404
+    regardless, so the bucket only bounds how much of it we process.
+    """
+    subject = provisioning_subject(request)
+    if subject:
+        return f"provision:{subject}"
+    return f"anon:{get_remote_address(request)}"
+
+
+limiter = Limiter(key_func=rate_limit_key)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,9 +232,20 @@ def authenticate(api_key: str) -> dict:
         player = crud.get_player_by_api_key(db, api_key)
         if not player:
             raise HTTPException(status_code=401, detail="Invalid API key")
-        return {"id": player.id, "username": player.username, "elo": player.elo}
+        return {
+            "id": player.id,
+            "username": player.username,
+            "elo": player.elo,
+            "role": getattr(player, "role", "player"),
+        }
     finally:
         db.close()
+
+
+def require_admin(player: dict) -> None:
+    """Raise unless the authenticated player holds the admin role."""
+    if player.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
 
 
 # ─── Request/Response models ─────────────────────────────────────────
@@ -156,7 +279,12 @@ class CreateSeasonRequest(BaseModel):
 # ─── Endpoints ───────────────────────────────────────────────────────
 
 @app.post("/api/register")
-def register(req: RegisterRequest):
+@limiter.limit("30/hour", key_func=registration_rate_key)
+def register(request: Request, req: RegisterRequest):
+    # 404 rather than 401/403: an unauthenticated scanner should not learn
+    # that this endpoint exists, let alone why it refused.
+    if not provisioning_subject(request):
+        raise HTTPException(404, "Not Found")
     db = SessionLocal()
     try:
         existing = crud.get_player_by_username(db, req.username)
@@ -177,7 +305,8 @@ def register(req: RegisterRequest):
 
 
 @app.post("/api/race/create")
-def create_race(req: CreateRaceRequest, x_api_key: str = Header()):
+@limiter.limit("30/minute")
+def create_race(request: Request, req: CreateRaceRequest, x_api_key: str = Header()):
     player = authenticate(x_api_key)
     if req.track not in TRACKS:
         raise HTTPException(400, f"Unknown track: {req.track}")
@@ -192,7 +321,8 @@ def create_race(req: CreateRaceRequest, x_api_key: str = Header()):
                 raise HTTPException(400, "No active season. Create a season first.")
             season_id = active_season.id
 
-        race = crud.create_race(db, req.track, req.race_type, season_id=season_id)
+        race = crud.create_race(db, req.track, req.race_type, season_id=season_id,
+                                owner_id=player["id"])
         lobby = RaceLobby(race.id, req.track, req.race_type)
         lobby.speed = req.speed
         active_lobbies[race.id] = lobby
@@ -233,7 +363,7 @@ def submit_bot(race_id: str, req: SubmitBotRequest, x_api_key: str = Header()):
         raise HTTPException(400, "Not in this race")
 
     # Validate code
-    error = compile_strategy(req.code)
+    error = validate_submission(req.code)
     if error:
         raise HTTPException(400, error)
 
@@ -257,6 +387,16 @@ async def start_race(race_id: str, x_api_key: str = Header()):
         raise HTTPException(404, "Race not found")
     if lobby.status != "lobby":
         raise HTTPException(400, "Race already started")
+
+    db = SessionLocal()
+    try:
+        race = crud.get_race(db, race_id)
+    finally:
+        db.close()
+    if race is None:
+        raise HTTPException(404, "Race not found")
+    if getattr(race, "owner_id", None) not in (None, player["id"]):
+        raise HTTPException(403, "Only the race owner can start this race")
 
     lobby.status = "countdown"
 
@@ -423,61 +563,64 @@ def list_tracks():
 
 
 @app.post("/api/test-bot")
-def test_bot(req: TestBotRequest, x_api_key: str = Header()):
+@limiter.limit("10/minute")
+def test_bot(request: Request, req: TestBotRequest, x_api_key: str = Header()):
     """Run a quick offline simulation with the user's bot vs built-in bots."""
     player = authenticate(x_api_key)
 
-    error = compile_strategy(req.code)
+    error = validate_submission(req.code)
     if error:
         raise HTTPException(400, error)
 
     track = build_track_physics(req.track)
     track_cfg = TRACKS[req.track]
 
-    # Override total laps for quick test (0 = full race distance)
+    # Override total laps for quick test (0 = full race distance). Applied in
+    # the parent, so the prebuilt physics carried in the spec already knows it.
     track.total_laps = track_cfg.total_laps if req.laps <= 0 else min(req.laps, track_cfg.total_laps)
 
-    engine = RaceEngine(
-        track=track,
-        weather_transitions=track_cfg.weather_transitions,
-        seed=random.randint(0, 99999),
-        sc_prob_dry=track_cfg.safety_car_prob_dry,
-        sc_prob_wet=track_cfg.safety_car_prob_wet,
-    )
-
-    # Add user's bot
-    def user_strategy(state: RaceState, my_car: CarState) -> Decision:
-        state_dict = _race_state_to_dict(state)
-        car_dict = _car_state_to_dict(my_car)
-        result = execute_strategy(req.code, state_dict, car_dict)
-        if "error" in result:
-            return Decision(pit=False, compound=my_car.compound)
-        return Decision(pit=result["pit"], compound=result["compound"])
-
-    engine.add_car("USER", player["id"], user_strategy, 1, "MEDIUM")
-
-    # Add built-in bots
+    spec = {
+        "track": req.track,
+        "track_physics": track,
+        "track_config": track_cfg,
+        "seed": random.randint(0, 99999),
+        "cars": [{
+            "car_id": "USER", "player_id": player["id"], "code": req.code,
+            "start_position": 1, "starting_compound": "MEDIUM",
+        }],
+    }
     for pos, (bot_id, bot_info) in enumerate(BUILTIN_BOTS.items(), 2):
-        engine.add_car(bot_id, bot_id, bot_info["strategy"], pos,
-                       bot_info["starting_compound"])
+        spec["cars"].append({
+            "car_id": bot_id, "player_id": bot_id, "bot_id": bot_id,
+            "start_position": pos,
+            "starting_compound": bot_info["starting_compound"],
+        })
 
-    result = engine.run()
+    try:
+        result = run_match_isolated(spec)
+    except LimitExceeded as exc:
+        raise HTTPException(400, f"Your bot was stopped: {exc}")
+    except ChildFailed as exc:
+        # Ours, not theirs. Attributing an engine bug to the player's code
+        # sends them hunting a fault they did not write, and loses the signal.
+        logger.error("test-bot match failed for player %s: %s", player["id"], exc.detail)
+        raise HTTPException(500, str(exc))
 
     return {
         "standings": [
             {
-                "car_id": c.car_id,
-                "position": c.position,
-                "gap_to_leader": round(c.gap_to_leader, 3),
-                "pit_count": c.pit_count,
-                "pit_laps": c.pit_laps,
-                "retired": c.retired,
+                "car_id": c["car_id"],
+                "position": c["position"],
+                "gap_to_leader": round(c["gap_to_leader"], 3),
+                "pit_count": c["pit_count"],
+                "pit_laps": c["pit_laps"],
+                "retired": c["retired"],
             }
-            for c in result.final_standings
+            for c in result["standings"]
         ],
         "events": [
-            {"lap": e.lap, "type": e.event_type, "detail": e.detail}
-            for e in result.events[:50]
+            {"lap": e["lap"], "type": e["event_type"], "detail": e["detail"]}
+            for e in result["events"][:50]
         ],
     }
 
@@ -491,7 +634,8 @@ def get_strategy_template():
 
 @app.post("/api/season")
 def create_season(req: CreateSeasonRequest, x_api_key: str = Header()):
-    authenticate(x_api_key)
+    player = authenticate(x_api_key)
+    require_admin(player)
     for t in req.tracks:
         if t not in TRACKS:
             raise HTTPException(400, f"Unknown track: {t}")
@@ -598,7 +742,8 @@ def get_season_standings(season_id: str):
 
 @app.post("/api/season/{season_id}/end")
 def end_season(season_id: str, x_api_key: str = Header()):
-    authenticate(x_api_key)
+    player = authenticate(x_api_key)
+    require_admin(player)
     db = SessionLocal()
     try:
         season = crud.end_season(db, season_id)
@@ -759,65 +904,69 @@ async def _run_race(race_id: str):
     finally:
         db.close()
 
-    # Build track and engine setup
+    # Build the match spec. Track physics are built here, in the parent: the
+    # isolated child forbids file writes and build_track_physics writes a
+    # calibration cache.
     track = build_track_physics(lobby.track)
-    track_cfg = TRACKS[lobby.track]
+    seed = random.randint(0, 99999)
 
-    engine = RaceEngine(
-        track=track,
-        weather_transitions=track_cfg.weather_transitions,
-        seed=random.randint(0, 99999),
-        sc_prob_dry=track_cfg.safety_car_prob_dry,
-        sc_prob_wet=track_cfg.safety_car_prob_wet,
-    )
-
-    # Add human players with sandboxed strategies
+    spec = {
+        "track": lobby.track,
+        "track_physics": track,
+        "track_config": TRACKS[lobby.track],
+        "seed": seed,
+        "cars": [],
+    }
     pos = 1
     for pid, pdata in lobby.players.items():
-        code = pdata["code"]
-
-        def make_strategy(player_code):
-            def strategy(state, my_car):
-                sd = _race_state_to_dict(state)
-                cd = _car_state_to_dict(my_car)
-                result = execute_strategy(player_code, sd, cd)
-                if "error" in result:
-                    return Decision(pit=False, compound=my_car.compound)
-                return Decision(pit=result["pit"], compound=result["compound"])
-            return strategy
-
-        engine.add_car(
-            pdata["car_id"], pid, make_strategy(code), pos,
-            pdata.get("starting_compound", "MEDIUM"),
-        )
+        spec["cars"].append({
+            "car_id": pdata["car_id"], "player_id": pid,
+            "code": pdata["code"], "start_position": pos,
+            "starting_compound": pdata.get("starting_compound", "MEDIUM"),
+        })
         pos += 1
-
-    # Fill remaining slots with built-in bots
     for bot_id, bot_info in BUILTIN_BOTS.items():
         if pos > 10:
             break
-        engine.add_car(bot_id, bot_id, bot_info["strategy"], pos,
-                       bot_info["starting_compound"])
+        spec["cars"].append({
+            "car_id": bot_id, "player_id": bot_id, "bot_id": bot_id,
+            "start_position": pos,
+            "starting_compound": bot_info["starting_compound"],
+        })
         pos += 1
 
-    # Run the full race simulation in a thread pool so we don't block the event loop
+    # Run the match in a resource-limited child process, off the event loop.
     loop = asyncio.get_event_loop()
-    with concurrent.futures.ThreadPoolExecutor() as pool:
-        result = await loop.run_in_executor(pool, engine.run)
+    try:
+        result = await loop.run_in_executor(None, run_match_isolated, spec)
+    except MatchAborted as exc:
+        if isinstance(exc, ChildFailed):
+            logger.error("race %s aborted by an internal failure: %s", race_id, exc.detail)
+        lobby.status = "aborted"
+        # str() only: spectators on this socket are unauthenticated, and
+        # ChildFailed keeps its raw text off str() for exactly that reason.
+        await _broadcast(lobby, {"type": "aborted", "reason": str(exc)})
+        db = SessionLocal()
+        try:
+            crud.update_race_status(db, race_id, "aborted")
+        finally:
+            db.close()
+        return
 
     lobby.result = result
     total_laps = track.total_laps
 
     # Pre-index events by lap for fast lookup
     events_by_lap: Dict[int, list] = {}
-    for e in result.events:
-        events_by_lap.setdefault(e.lap, []).append(
-            {"lap": e.lap, "type": e.event_type, "car_id": e.car_id, "detail": e.detail}
+    for e in result["events"]:
+        events_by_lap.setdefault(e["lap"], []).append(
+            {"lap": e["lap"], "type": e["event_type"],
+             "car_id": e["car_id"], "detail": e["detail"]}
         )
 
     # Broadcast each lap with pacing for an enjoyable viewing experience
     # Speed: 1x = 3.75s/lap, 5x = 0.75s/lap, 20x = 0.1875s/lap
-    for lap_snapshot in result.lap_data:
+    for lap_snapshot in result["lap_data"]:
         lap_num = lap_snapshot["lap"]
 
         state_msg = {
@@ -841,12 +990,20 @@ async def _run_race(race_id: str):
     db = SessionLocal()
     try:
         crud.update_race_status(db, race_id, "finished")
-        crud.save_race_results(db, race_id, result.final_standings)
-        crud.save_race_data(db, race_id, result.lap_data, result.events)
+        # crud reads standings and events by attribute; the isolated child
+        # hands them back as plain dicts, so adapt at this boundary.
+        crud.save_race_results(
+            db, race_id, [to_namespace(c) for c in result["standings"]]
+        )
+        crud.save_race_data(
+            db, race_id, result["lap_data"],
+            [to_namespace(e) for e in result["events"]],
+        )
 
         # Update ELO
         standings_tuples = [
-            (c.player_id, c.position, c.retired) for c in result.final_standings
+            (c["player_id"], c["position"], c["retired"])
+            for c in result["standings"]
         ]
         current_ratings = {}
         for pid, _, _ in standings_tuples:
@@ -874,64 +1031,32 @@ async def _run_race(race_id: str):
 
 # ─── Serialization helpers ───────────────────────────────────────────
 
-def _race_state_to_dict(state: RaceState) -> dict:
-    return {
-        "lap": state.lap,
-        "total_laps": state.total_laps,
-        "track": state.track,
-        "weather": state.weather,
-        "safety_car": state.safety_car,
-        "safety_car_laps_left": state.safety_car_laps_left,
-        "track_temp": state.track_temp,
-        "cars": [_car_state_to_dict(c) for c in state.cars],
-    }
-
-
-def _car_state_to_dict(car: CarState) -> dict:
-    return {
-        "car_id": car.car_id,
-        "player_id": car.player_id,
-        "position": car.position,
-        "gap_to_leader": car.gap_to_leader,
-        "compound": car.compound,
-        "tyre_age": car.tyre_age,
-        "fuel_kg": car.fuel_kg,
-        "pit_count": car.pit_count,
-        "pit_laps": car.pit_laps,
-        "last_lap_time": car.last_lap_time,
-        "total_time": car.total_time,
-        "retired": car.retired,
-        "drs_available": car.drs_available,
-        "compounds_used": car.compounds_used,
-        "beliefs": car.beliefs,
-    }
-
-
 def _serialize_result(result) -> dict:
     if result is None:
         return None
     return {
-        "track": result.track,
-        "total_laps": result.total_laps,
+        "track": result["track"],
+        "total_laps": result["total_laps"],
         "standings": [
             {
-                "car_id": c.car_id,
-                "player_id": c.player_id,
-                "position": c.position,
-                "gap_to_leader": round(c.gap_to_leader, 3),
-                "compound": c.compound,
-                "tyre_age": c.tyre_age,
-                "pit_count": c.pit_count,
-                "pit_laps": c.pit_laps,
-                "compounds_used": c.compounds_used,
-                "total_time": round(c.total_time, 3),
-                "retired": c.retired,
+                "car_id": c["car_id"],
+                "player_id": c["player_id"],
+                "position": c["position"],
+                "gap_to_leader": round(c["gap_to_leader"], 3),
+                "compound": c["compound"],
+                "tyre_age": c["tyre_age"],
+                "pit_count": c["pit_count"],
+                "pit_laps": c["pit_laps"],
+                "compounds_used": c["compounds_used"],
+                "total_time": round(c["total_time"], 3),
+                "retired": c["retired"],
             }
-            for c in result.final_standings
+            for c in result["standings"]
         ],
         "events": [
-            {"lap": e.lap, "type": e.event_type, "car_id": e.car_id, "detail": e.detail}
-            for e in result.events
+            {"lap": e["lap"], "type": e["event_type"],
+             "car_id": e["car_id"], "detail": e["detail"]}
+            for e in result["events"]
         ],
-        "weather_history": result.weather_history,
+        "weather_history": result["weather_history"],
     }

@@ -2,7 +2,20 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { getPlayerProfileByUserId, saveBackendPlayerCredentials, upsertPlayerProfile } from "@/lib/repositories";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Server-side only: this module runs in the Next.js process, where
+// "localhost" is the frontend container, not the backend. BACKEND_API_URL is
+// the in-network address (http://backend:8000 under compose);
+// NEXT_PUBLIC_API_URL stays as a fallback so existing single-host setups,
+// where both are localhost, keep working unchanged.
+const API_BASE =
+  process.env.BACKEND_API_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+// Proves to the backend that this request came from our server rather than
+// the open internet, so /api/register can bucket its rate limit on a real
+// user id instead of a socket address every signup shares. Server-side only
+// — a NEXT_PUBLIC_ prefix here would inline the secret into the browser
+// bundle at build time and publish it to every visitor.
+const PROVISIONING_SECRET = process.env.PROVISIONING_SECRET || "";
 
 function slugifyUsername(value: string) {
   return value
@@ -60,8 +73,7 @@ export async function POST(request: Request) {
   if (!force && profile?.backendApiKey && profile?.backendUsername) {
     if (await isBackendApiKeyValid(String(profile.backendApiKey))) {
       return NextResponse.json({
-        username: String(profile.backendUsername),
-        apiKey: String(profile.backendApiKey)
+        username: String(profile.backendUsername)
       });
     }
   }
@@ -83,10 +95,35 @@ export async function POST(request: Request) {
   for (const username of usernames) {
     const response = await fetch(`${API_BASE}/api/register`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-provision-secret": PROVISIONING_SECRET,
+        "x-provision-subject": session.user.id
+      },
       body: JSON.stringify({ username, team_name: "Pit Wall" }),
       cache: "no-store"
     });
+
+    // Surface throttling as throttling. The backend's 429 body is keyed
+    // "error", not "detail", so the generic handling below would turn it
+    // into an opaque 500 and drop the Retry-After it came with. Return
+    // rather than break: another candidate would only burn more of the
+    // caller's budget.
+    if (response.status === 429) {
+      return NextResponse.json(
+        { error: "Too many registration attempts. Please try again shortly." },
+        { status: 429 }
+      );
+    }
+
+    // Registration is closed unless PROVISIONING_SECRET matches on both
+    // sides. A misconfigured deployment should say so once, not retry.
+    if (response.status === 404) {
+      return NextResponse.json(
+        { error: "Player provisioning is not configured on this server." },
+        { status: 503 }
+      );
+    }
 
     const payload = (await response.json().catch(() => ({}))) as {
       id?: string;
@@ -103,8 +140,7 @@ export async function POST(request: Request) {
       });
 
       return NextResponse.json({
-        username: payload.username,
-        apiKey: payload.api_key
+        username: payload.username
       });
     }
 

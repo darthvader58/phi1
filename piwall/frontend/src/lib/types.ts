@@ -145,7 +145,7 @@ export interface ActiveSeasonData {
 }
 
 export interface WsMessage {
-  type: "countdown" | "lights_out" | "lap" | "finished" | "ping" | "error";
+  type: "countdown" | "lights_out" | "lap" | "finished" | "aborted" | "ping" | "error";
   lap?: number;
   total_laps?: number;
   data?: LapSnapshot;
@@ -153,6 +153,7 @@ export interface WsMessage {
   result?: RaceResult;
   seconds?: number;
   error?: string;
+  reason?: string;
 }
 
 // Compound colors (matching F1 standard)

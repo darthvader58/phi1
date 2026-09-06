@@ -32,7 +32,7 @@ export default function LobbyPage() {
   });
 
   useEffect(() => {
-    if (typeof window !== "undefined" && localStorage.getItem("piwall_api_key")) {
+    if (typeof window !== "undefined" && localStorage.getItem("piwall_username")) {
       setRegistered(true);
       setUsername(localStorage.getItem("piwall_username") || "");
     }
@@ -47,9 +47,9 @@ export default function LobbyPage() {
     }
 
     const syncLocalState = () => {
-      const apiKey = localStorage.getItem("piwall_api_key");
-      setRegistered(Boolean(apiKey));
-      setUsername(localStorage.getItem("piwall_username") || "");
+      const username = localStorage.getItem("piwall_username");
+      setRegistered(Boolean(username));
+      setUsername(username || "");
     };
 
     syncLocalState();
@@ -70,7 +70,7 @@ export default function LobbyPage() {
     if (
       authStatus === "authenticated" &&
       typeof window !== "undefined" &&
-      localStorage.getItem("piwall_api_key")
+      localStorage.getItem("piwall_username")
     ) {
       try {
         const s = await api.getSuggestedMatches();
@@ -81,20 +81,8 @@ export default function LobbyPage() {
     }
   }
 
-  async function handleRegister(e: React.FormEvent) {
-    e.preventDefault();
-    setError("");
-    try {
-      const res = await api.register(username);
-      localStorage.setItem("piwall_api_key", res.api_key);
-      localStorage.setItem("piwall_username", res.username);
-      window.dispatchEvent(new Event("piwall-backend-auth-changed"));
-      setRegistered(true);
-      toast("Registered successfully!", "success");
-    } catch (err: any) {
-      setError(err.message);
-      toast(err.message, "error");
-    }
+  function handleOpenSignIn() {
+    window.dispatchEvent(new Event("pitwall-open-auth"));
   }
 
   async function handleCreateRace() {
@@ -154,18 +142,14 @@ export default function LobbyPage() {
                   moment.
                 </p>
               ) : (
-                <form onSubmit={handleRegister} className="flex gap-3">
-                  <input
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    placeholder="Choose a username"
-                    className="input flex-1"
-                    required
-                  />
-                  <button type="submit" className="btn-primary">
-                    Register
+                <div className="flex items-center gap-3">
+                  <p className="text-sm text-pit-text flex-1">
+                    Sign in to provision your race profile and start racing.
+                  </p>
+                  <button onClick={handleOpenSignIn} className="btn-primary" type="button">
+                    Sign In
                   </button>
-                </form>
+                </div>
               )}
               {error && <p className="text-f1-red text-xs mt-3">{error}</p>}
             </div>

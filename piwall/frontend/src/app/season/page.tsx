@@ -16,7 +16,7 @@ export default function SeasonPage() {
   const [tab, setTab] = useState<"championship" | "elo">("championship");
 
   useEffect(() => {
-    if (typeof window !== "undefined" && localStorage.getItem("piwall_api_key")) {
+    if (typeof window !== "undefined" && localStorage.getItem("piwall_username")) {
       setRegistered(true);
     }
     loadData();
@@ -28,7 +28,7 @@ export default function SeasonPage() {
     }
 
     const syncRegisteredState = () => {
-      setRegistered(Boolean(localStorage.getItem("piwall_api_key")));
+      setRegistered(Boolean(localStorage.getItem("piwall_username")));
     };
 
     syncRegisteredState();

@@ -1,12 +1,13 @@
 services:
   mongodb:
     image: mongo:7
-    ports:
-      - "27017:27017"
     volumes:
       - mongodata:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' || exit 1"]
+      test: ["CMD-SHELL", "mongosh --quiet -u \"$$MONGO_INITDB_ROOT_USERNAME\" -p \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval 'db.runCommand({ ping: 1 }).ok' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -18,14 +19,17 @@ services:
     ports:
       - "8000:8000"
     environment:
-      MONGODB_URI: mongodb://mongodb:27017/phi1
-      MONGODB_DB: phi1
-      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGODB_DB}?authSource=admin
+      MONGODB_DB: ${MONGODB_DB}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      # Must match the frontend's value exactly. Compose refuses to start
+      # rather than boot a backend whose registration silently 404s.
+      PROVISIONING_SECRET: ${PROVISIONING_SECRET:?set PROVISIONING_SECRET to a random secret shared by backend and frontend; registration is closed without it}
+    restart: unless-stopped
     depends_on:
       mongodb:
         condition: service_healthy
     volumes:
-      - ./backend:/app/backend
       - ./fastf1_cache:/app/fastf1_cache
       - ./processed_cache:/app/processed_cache
 
@@ -33,14 +37,36 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.frontend
+      args:
+        # Client-side, so it must be baked in at build time.
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL}
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
-      NEXT_PUBLIC_WS_URL: ws://localhost:8000
-      NEXTAUTH_URL: http://localhost:3000
+      # Read server-side, inside this container: the proxy routes and NextAuth
+      # both run in the Next.js process. "localhost" here is the frontend
+      # container itself, so the backend is addressed by its service name.
+      BACKEND_API_URL: http://backend:8000
+      MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGODB_DB}?authSource=admin
+      MONGODB_DB: ${MONGODB_DB}
+      AUTH_SECRET: ${AUTH_SECRET}
+      AUTH_GOOGLE_ID: ${AUTH_GOOGLE_ID}
+      AUTH_GOOGLE_SECRET: ${AUTH_GOOGLE_SECRET}
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
+      # Auth.js v5's name for the same value. trustHost lets it accept the
+      # Host header; this is what pins the origin callbacks are built from,
+      # so the two belong together.
+      AUTH_URL: ${NEXTAUTH_URL}
+      # Same value as the backend's. Server-side only — never NEXT_PUBLIC_.
+      PROVISIONING_SECRET: ${PROVISIONING_SECRET:?set PROVISIONING_SECRET to a random secret shared by backend and frontend; registration is closed without it}
+      # Dialled by the visitor's browser, so it stays a host address.
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL}
+    restart: unless-stopped
     depends_on:
-      - backend
+      mongodb:
+        condition: service_healthy
+      backend:
+        condition: service_started
 
 volumes:
   mongodata:

@@ -67,8 +67,24 @@ if (googleEnabled) {
 export const { handlers, auth, signIn, signOut } = NextAuth({
   adapter: mongoEnabled ? MongoDBAdapter(getMongoClientPromise()) : undefined,
   secret: process.env.AUTH_SECRET,
+  // Auth.js refuses to derive its own origin from the Host header unless it
+  // is told to, because a forged Host would otherwise redirect OAuth
+  // callbacks to an attacker's domain. It auto-detects only on Vercel, so
+  // every other deployment — this container included — must opt in, or
+  // /api/auth/session returns UntrustedHost and no request can be signed in.
+  //
+  // Trusting the header is safe here only because AUTH_URL pins the
+  // canonical origin that callbacks are built from; keep them set together.
+  trustHost: true,
   session: {
-    strategy: mongoEnabled ? "database" : "jwt"
+    // Must be "jwt" whenever the Credentials provider is enabled: a
+    // credentials sign-in has no linked account for an adapter to hang a
+    // session off, so Auth.js rejects the database strategy outright. It
+    // throws that during config assertion, which runs on every auth
+    // request, so the mismatch 500s even a plain session read rather than
+    // failing only at sign-in. The adapter stays on — it still persists
+    // users and OAuth account links; only the session lives in the cookie.
+    strategy: "jwt"
   },
   providers,
   pages: {
@@ -87,9 +103,20 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
 
       return true;
     },
-    async session({ session, user }) {
+    // Under the JWT strategy the session callback receives no `user` — that
+    // argument is database-strategy only. The id has to be carried on the
+    // token instead, or every consumer of session.user.id (player
+    // provisioning included) silently receives undefined.
+    async jwt({ token, user }) {
+      if (user?.id) {
+        token.id = user.id;
+      }
+
+      return token;
+    },
+    async session({ session, token }) {
       if (session.user) {
-        session.user.id = user.id;
+        session.user.id = (token.id as string) ?? (token.sub as string);
       }
 
       return session;
