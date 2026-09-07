@@ -45,6 +45,11 @@ class MatchManifest:
 def build_manifest(match_id: str, seed: int, track: str,
                    participants: List[Participant]) -> MatchManifest:
     """Capture everything a replay needs, at the moment the match is created."""
+    slots = [p.slot for p in participants]
+    if len(slots) != len(set(slots)):
+        # Two participants in one slot would share an RNG stream and a grid
+        # position — a silent determinism break, not a style issue.
+        raise ValueError(f"duplicate participant slots: {sorted(slots)}")
     return MatchManifest(
         match_id=match_id,
         seed=seed,
