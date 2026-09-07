@@ -58,7 +58,8 @@ from backend.engine.race import RaceEngine
 from backend.sandbox import runner
 from backend.sandbox.match_job import _make_user_strategy
 from backend.sandbox.runner import (
-    DEFAULT_DECISION_WALL_MS, STRATEGY_TEMPLATE, execute_strategy,
+    DEFAULT_DECISION_WALL_MS, STRATEGY_TEMPLATE, DecisionTimeout,
+    execute_strategy,
 )
 
 RUNAWAY = (
@@ -376,3 +377,49 @@ def test_a_forfeit_that_crashes_still_reaches_the_replay():
     result = engine.run()
     forfeits = [e for e in result.events if e.event_type == "budget_forfeit"]
     assert len(forfeits) == 20, "a swallowed forfeit went unrecorded"
+
+
+# The wall-clock net fires inside the protected block -- hidden C work, few
+# line events, so the op budget does not trip there -- and the bare `except:`
+# eats it. Execution then continues into unprotected Python that DOES trip
+# the budget, so a BudgetForfeit propagates out of a decision during which
+# the net had already fired.
+SWALLOWS_THE_NET_THEN_FORFEITS = (
+    "def my_strategy(state, my_car):\n"
+    "    try:\n"
+    "        total = 0\n"
+    "        for i in range(200):\n"
+    "            total = total + len(sorted(range(500000)))\n"
+    "    except:\n"
+    "        pass\n"
+    "    y = 0\n"
+    "    while True:\n"
+    "        y = y + 1\n"
+    "    return {'pit': True, 'compound': 'SOFT'}\n"
+)
+
+
+def test_a_fired_net_outranks_a_later_forfeit(sample_state, sample_car):
+    """If the net fired, the decision voids -- whatever propagates afterwards.
+
+    A forfeit is a recorded, replay-safe verdict; a fired net means unbounded
+    time was consumed and the match must be voided instead. Letting the
+    forfeit escape first turned the second into the first, and the match
+    completed.
+    """
+    with pytest.raises(DecisionTimeout):
+        execute_strategy(SWALLOWS_THE_NET_THEN_FORFEITS, sample_state,
+                         sample_car, 100, seed=42, slot=0, max_ops=5000)
+
+
+def test_a_race_voids_rather_than_completing_when_the_net_fired():
+    """The property at the level that matters: the match does not finish."""
+    engine = RaceEngine(track=_track(total_laps=3), seed=42)
+    engine.add_car(
+        "USR-01", "p1",
+        _make_user_strategy(SWALLOWS_THE_NET_THEN_FORFEITS, 42, 0,
+                            max_ops=5000, timeout_ms=100),
+        1, "MEDIUM",
+    )
+    with pytest.raises(DecisionTimeout):
+        engine.run()

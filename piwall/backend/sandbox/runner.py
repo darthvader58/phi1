@@ -331,17 +331,8 @@ def execute_strategy(
             restricted_globals["my_car"],
         )
 
-    def _void_if_the_net_fired():
-        """The latch. A bot that ate the net's exception does not get to pretend
-        the net never fired -- this runs on every way out of the call."""
-        if wall_state["fired"]:
-            raise DecisionTimeout(
-                f"a decision exceeded the {timeout_ms}ms wall-clock limit"
-            ) from None
-
     try:
         result, _ops_used = run_with_budget(_define_and_decide, (), max_ops)
-        _void_if_the_net_fired()
 
         if result is _MISSING_STRATEGY:
             return {"error": "Code must define a function called 'my_strategy'"}
@@ -363,16 +354,10 @@ def execute_strategy(
     except BudgetForfeit:
         # Explicit, even though BudgetForfeit is a BaseException and the
         # handler below would not catch it: the forfeit belongs to the
-        # caller, which knows the lap and car it happened to.
+        # caller, which knows the lap and car it happened to. The latch in
+        # the finally still outranks it.
         raise
-    except _WallClockFired:
-        raise DecisionTimeout(
-            f"a decision exceeded the {timeout_ms}ms wall-clock limit"
-        ) from None
     except Exception as e:
-        # Same latch on the failure path: a bot that swallows the net and
-        # then fails some other way is still a void, not a buggy bot.
-        _void_if_the_net_fired()
         return {"error": f"Runtime error: {type(e).__name__}: {e}"}
     finally:
         # Cancel alarm
@@ -382,6 +367,21 @@ def execute_strategy(
                 signal.signal(signal.SIGALRM, old_handler)
         except (ValueError, AttributeError):
             pass
+
+        # The latch, on *every* way out of a decision: a normal return, a
+        # forfeit, a bot error, the net's own exception. Raising from finally
+        # supersedes whatever was propagating or being returned, which is
+        # exactly the ordering wanted -- a fired net means unbounded time was
+        # consumed, and that outranks every other verdict including a forfeit.
+        #
+        # This lives here rather than in each except branch because the two
+        # bugs found in review were both a branch that forgot to ask. There
+        # is no branch to forget now: the only way past this line is for the
+        # net not to have fired.
+        if wall_state["fired"]:
+            raise DecisionTimeout(
+                f"a decision exceeded the {timeout_ms}ms wall-clock limit"
+            ) from None
 
 
 # Default user strategy template
