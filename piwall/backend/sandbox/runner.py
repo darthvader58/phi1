@@ -124,6 +124,28 @@ def compile_strategy(code: str) -> Optional[str]:
         return f"Compilation error: {e}"
 
 
+def _guarded_getitem(obj, key):
+    """Subscription guard for `obj[key]` in bot code.
+
+    RestrictedPython rewrites attribute *syntax*, so `state.__class__` is
+    caught at compile time. It never sees a name that arrives as a string at
+    runtime, and `Namespace.__getitem__` maps subscription straight onto
+    getattr -- so `state['__class__']` was attribute access smuggled past the
+    rewriter, and from the class it is three hops to the real builtins and
+    `sys.settrace`. Every underscore-prefixed string key is refused here, and
+    Namespace refuses them again on its own, so neither route relies on the
+    other being right.
+
+    Non-string keys pass straight through: `beliefs[rival_id]`, `cars[0]` and
+    `pit_laps[-1]` are all ordinary indexing.
+    """
+    if isinstance(key, str) and key.startswith("_"):
+        raise KeyError(
+            f'"{key}" is an invalid key because it starts with "_"'
+        )
+    return obj[key]
+
+
 def build_sandbox_globals(seed: int, slot: int) -> dict:
     """Build the RestrictedPython globals every bot's strategy executes under.
 
@@ -134,7 +156,7 @@ def build_sandbox_globals(seed: int, slot: int) -> dict:
     restricted_globals["__builtins__"] = ALLOWED_BUILTINS
     restricted_globals["_getattr_"] = safer_getattr
     restricted_globals["_getiter_"] = iter
-    restricted_globals["_getitem_"] = lambda obj, key: obj[key]
+    restricted_globals["_getitem_"] = _guarded_getitem
     restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
     restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
     restricted_globals["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
@@ -212,11 +234,17 @@ def execute_strategy(
                 else:
                     setattr(self, k, v)
 
+        # Both accessors take the field name as a *string*, which is the one
+        # thing RestrictedPython's rewriting cannot see. Routing them through
+        # safer_getattr applies the same rules the compiler applies to
+        # attribute syntax: no underscore-prefixed names, no frame or code
+        # introspection attributes. No RaceState or CarState field starts
+        # with "_" (see engine/serialize.py), so nothing legitimate is lost.
         def __getitem__(self, key):
-            return getattr(self, key, None)
+            return safer_getattr(self, key, None)
 
         def get(self, key, default=None):
-            return getattr(self, key, default)
+            return safer_getattr(self, key, default)
 
     restricted_globals["state"] = Namespace(state_dict)
     restricted_globals["my_car"] = Namespace(my_car_dict)

@@ -212,3 +212,44 @@ def test_the_trace_function_is_restored(sample_state, sample_car):
         execute_strategy(RUNAWAY, sample_state, sample_car,
                          seed=42, slot=0, max_ops=500)
     assert sys.gettrace() is before
+
+
+# The budget is only a budget if a bot cannot switch it off. This ran a full
+# match at 400,000 ops per decision -- twice DEFAULT_DECISION_OPS -- with
+# forfeits == 0, by reaching sys.settrace through a dunder name passed as a
+# runtime string. See tests/sandbox/test_containment.py for the guards.
+UNHOOKS_THE_TRACER = (
+    "def my_strategy(state, my_car):\n"
+    "    g = state.get('__class__').get\n"
+    "    imp = g(g, '__globals__')['__builtins__']['__import__']\n"
+    "    g(imp('sys'), 'settrace')(None)\n"
+    "    x = 0\n"
+    "    while x < 400000:\n"
+    "        x = x + 1\n"
+    "    return {'pit': True, 'compound': 'SOFT'}\n"
+)
+
+
+def test_a_bot_cannot_switch_off_its_own_budget():
+    engine = RaceEngine(track=_track(), seed=42)
+    engine.add_car(
+        "USR-01", "p1",
+        _make_user_strategy(UNHOOKS_THE_TRACER, 42, 0, max_ops=500),
+        1, "MEDIUM",
+    )
+    engine.add_car("VEL-01", "bot", BUILTIN_BOTS["VEL-01"]["strategy"], 2, "SOFT")
+    result = engine.run()
+
+    # Either it forfeits or the guard refuses it outright -- but it must never
+    # get to run 400,000 operations against a 500-operation budget and then
+    # have its decision honoured.
+    forfeiter = next(c for c in result.final_standings if c.car_id == "USR-01")
+    assert forfeiter.pit_count == 0, "the escaping bot's pit decision was honoured"
+
+
+def test_the_tracer_survives_a_bot_that_tries_to_unhook_it(sample_state, sample_car):
+    before = sys.gettrace()
+    result = execute_strategy(UNHOOKS_THE_TRACER, sample_state, sample_car,
+                              seed=42, slot=0, max_ops=500)
+    assert "error" in result
+    assert sys.gettrace() is before
