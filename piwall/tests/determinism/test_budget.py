@@ -55,6 +55,7 @@ import sys
 from backend.engine.bots import BUILTIN_BOTS
 from backend.engine.physics import TrackPhysics, TyreModel
 from backend.engine.race import RaceEngine
+from backend.sandbox import runner
 from backend.sandbox.match_job import _make_user_strategy
 from backend.sandbox.runner import (
     DEFAULT_DECISION_WALL_MS, STRATEGY_TEMPLATE, execute_strategy,
@@ -80,6 +81,76 @@ SWALLOWER = (
     "        pass\n"
     "    return {'pit': True, 'compound': 'SOFT'}\n"
 )
+
+
+# EQL-44 is the busiest built-in strategy, rewritten the way a player would
+# have to write it: same algorithm, returning dicts, since bots cannot import
+# the engine's Decision. Used to price a realistic bot on the sandboxed path.
+EQL_44_AS_PLAYER_CODE = """
+def my_strategy(state, my_car):
+    remaining = state.total_laps - state.lap
+    if remaining <= 3 or my_car.tyre_age < 5:
+        return {"pit": False, "compound": my_car.compound}
+
+    deg_rates = {"SOFT": 0.10, "MEDIUM": 0.065, "HARD": 0.045}
+    current_rate = deg_rates.get(my_car.compound, 0.06)
+    pit_delta = 22.0
+
+    current_cost = sum(
+        current_rate * (my_car.tyre_age + k) ** 1.1
+        for k in range(1, remaining + 1)
+    )
+
+    best_alt = None
+    best_alt_cost = float("inf")
+    for comp in deg_rates:
+        rate = deg_rates[comp]
+        if comp == my_car.compound and my_car.pit_count == 0:
+            continue
+        alt_cost = pit_delta + sum(
+            rate * k ** 1.1 for k in range(1, remaining + 1)
+        )
+        if alt_cost < best_alt_cost:
+            best_alt_cost = alt_cost
+            best_alt = comp
+
+    if best_alt is None:
+        return {"pit": False, "compound": my_car.compound}
+
+    delta_ev = current_cost - best_alt_cost
+
+    if delta_ev > 0:
+        should_pit_now = True
+        for offset in range(1, min(4, remaining)):
+            future_remaining = remaining - offset
+            if future_remaining <= 0:
+                break
+            future_cost = sum(
+                current_rate * (my_car.tyre_age + offset + k) ** 1.1
+                for k in range(1, future_remaining + 1)
+            )
+            future_rate = deg_rates.get(best_alt, 0.06)
+            future_alt = pit_delta + sum(
+                future_rate * k ** 1.1 for k in range(1, future_remaining + 1)
+            )
+            if future_cost - future_alt > delta_ev * 1.05:
+                should_pit_now = False
+                break
+
+        for rival in state.cars:
+            if rival.car_id == my_car.car_id or rival.retired:
+                continue
+            if rival.position > my_car.position:
+                belief = my_car.beliefs.get(rival.car_id, {})
+                if belief.get("undercut_viable", False):
+                    should_pit_now = True
+                    break
+
+        if should_pit_now:
+            return {"pit": True, "compound": best_alt}
+
+    return {"pit": False, "compound": my_car.compound}
+"""
 
 
 def _track(total_laps=20):
@@ -152,32 +223,47 @@ def test_an_honest_strategy_is_nowhere_near_the_budget(sample_state, sample_car)
     assert "error" not in result
 
 
-def test_the_builtin_bots_leave_two_orders_of_magnitude_of_headroom():
-    """DEFAULT_DECISION_OPS is only defensible if real bots stay far below it.
+def test_a_sandboxed_bot_stays_well_inside_the_budget():
+    """DEFAULT_DECISION_OPS is only defensible against the real cost of a bot.
 
-    Measured over a full race rather than a single synthetic call: EQL-44's
+    Measured on the path a player's code actually takes -- compiled by
+    RestrictedPython and run with the sandbox's guards in place -- not by
+    calling a built-in bot directly. `safer_getattr`, `_guarded_getitem` and
+    `_inplacevar_` are Python, so every guarded access is itself traced and
+    billed to the bot. Calling EQL-44 directly costs ~950 operations on its
+    worst lap; the same algorithm as sandboxed player code costs ~3,140.
+    Measuring the cheap path would have overstated the headroom threefold.
+
+    Measured over a whole race, and over the biggest race there is: EQL-44's
     cost scales with laps remaining and field size, so its worst decision is
-    on lap 1, not on an arbitrary one.
+    lap 1 of Monaco with a full grid, not an arbitrary one.
     """
-    worst = {}
+    worst = 0
+    real_run_with_budget = runner.run_with_budget
 
-    def counted(bot_id, fn):
-        def strategy(state, my_car):
-            value, ops = run_with_budget(fn, (state, my_car),
-                                         DEFAULT_DECISION_OPS)
-            worst[bot_id] = max(worst.get(bot_id, 0), ops)
-            return value
-        return strategy
+    def spy(fn, args=(), max_ops=DEFAULT_DECISION_OPS):
+        nonlocal worst
+        value, ops = real_run_with_budget(fn, args, max_ops)
+        worst = max(worst, ops)
+        return value, ops
 
-    engine = RaceEngine(track=_track(total_laps=78), seed=7)
-    for i, (bot_id, spec) in enumerate(BUILTIN_BOTS.items()):
-        engine.add_car(bot_id, f"p{i}", counted(bot_id, spec["strategy"]),
-                       i + 1, spec["starting_compound"])
-    engine.run()
+    runner.run_with_budget = spy
+    try:
+        engine = RaceEngine(track=_track(total_laps=78), seed=7)
+        for slot in range(10):
+            engine.add_car(
+                f"USR-{slot}", f"p{slot}",
+                _make_user_strategy(EQL_44_AS_PLAYER_CODE, 7, slot),
+                slot + 1, "MEDIUM",
+            )
+        engine.run()
+    finally:
+        runner.run_with_budget = real_run_with_budget
 
-    busiest = max(worst.values())
-    assert busiest * 100 < DEFAULT_DECISION_OPS, (
-        f"built-in bots are close to the budget: {worst}"
+    assert worst > 0, "the spy never saw a decision"
+    assert worst * 20 < DEFAULT_DECISION_OPS, (
+        f"a realistic bot costs {worst} ops against a "
+        f"{DEFAULT_DECISION_OPS} budget -- less than 20x headroom"
     )
 
 
@@ -253,3 +339,40 @@ def test_the_tracer_survives_a_bot_that_tries_to_unhook_it(sample_state, sample_
                               seed=42, slot=0, max_ops=500)
     assert "error" in result
     assert sys.gettrace() is before
+
+
+SWALLOWS_THEN_CRASHES = (
+    "def my_strategy(state, my_car):\n"
+    "    try:\n"
+    "        x = 0\n"
+    "        while x < 100000:\n"
+    "            x = x + 1\n"
+    "    except:\n"
+    "        pass\n"
+    "    return {'pit': 1 / 0, 'compound': 'SOFT'}\n"
+)
+
+
+def test_a_swallowed_forfeit_is_recorded_even_if_the_bot_then_crashes(
+        sample_state, sample_car):
+    """Otherwise a forfeiting bot is indistinguishable from a buggy one.
+
+    The Decision is a no-op either way, so determinism survives -- but with
+    no budget_forfeit event the replay says "this bot threw an exception",
+    which is not what happened.
+    """
+    with pytest.raises(BudgetForfeit):
+        execute_strategy(SWALLOWS_THEN_CRASHES, sample_state, sample_car,
+                         seed=42, slot=0, max_ops=500)
+
+
+def test_a_forfeit_that_crashes_still_reaches_the_replay():
+    engine = RaceEngine(track=_track(), seed=42)
+    engine.add_car(
+        "USR-01", "p1",
+        _make_user_strategy(SWALLOWS_THEN_CRASHES, 42, 0, max_ops=500),
+        1, "MEDIUM",
+    )
+    result = engine.run()
+    forfeits = [e for e in result.events if e.event_type == "budget_forfeit"]
+    assert len(forfeits) == 20, "a swallowed forfeit went unrecorded"

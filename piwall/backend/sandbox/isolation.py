@@ -17,6 +17,27 @@ DEFAULT_MEMORY_MB = 512
 DEFAULT_CPU_SECONDS = 30
 DEFAULT_WALL_SECONDS = 60
 
+# The child exits with this code when a bot swallowed the per-decision
+# wall-clock signal and kept running. Nothing in-process can stop a loop that
+# catches every exception, so runner.py leaves by the one door a bare
+# `except:` cannot cover. Distinctive enough not to collide with an ordinary
+# interpreter exit code.
+WALL_CLOCK_VOID_EXITCODE = 87
+
+# Set only inside the isolated child, by _child_entrypoint. runner.py checks
+# it before it is willing to take the process down: outside the child -- in
+# the API process, or under pytest -- exiting would kill something that is
+# not ours to kill.
+IN_ISOLATED_CHILD = False
+
+# Child exception type names that mean "the bot breached a limit" rather than
+# "our engine has a bug". The text is composed here, from our own constants,
+# and never from the child's message: everything crossing that pipe passed
+# through untrusted code and may carry filesystem paths.
+_LIMIT_EXCEPTION_REASONS = {
+    "DecisionTimeout": "your bot exceeded the per-decision wall-clock limit",
+}
+
 
 class MatchAborted(Exception):
     """The isolated child produced no result.
@@ -116,6 +137,8 @@ def _child_probe_limits(memory_mb: int, cpu_seconds: int) -> dict:
 
 
 def _child_entrypoint(fn, args, memory_mb, cpu_seconds, conn) -> None:
+    global IN_ISOLATED_CHILD
+    IN_ISOLATED_CHILD = True
     try:
         applied = _apply_limits(memory_mb, cpu_seconds)
         if fn is _apply_limits:
@@ -155,6 +178,12 @@ def _classify_death(exitcode: Optional[int], memory_mb: int, cpu_seconds: int) -
         if reason is not None:
             return LimitExceeded(reason)
         return ChildFailed(f"child terminated by signal {-exitcode}")
+    if exitcode == WALL_CLOCK_VOID_EXITCODE:
+        # Not a crash: runner.py chose this exit because the bot was ignoring
+        # every exception raised at it. See WALL_CLOCK_VOID_EXITCODE.
+        return LimitExceeded(
+            "your bot ignored the per-decision wall-clock limit"
+        )
     return ChildFailed(f"child exited with code {exitcode} without reporting")
 
 
@@ -206,4 +235,10 @@ def run_isolated(
         # Where RLIMIT_AS is enforced (Linux), the breach surfaces as an
         # ordinary exception rather than a signal.
         raise LimitExceeded(f"your bot exceeded the {memory_mb}MB memory limit")
+    reason = _LIMIT_EXCEPTION_REASONS.get(payload["type"])
+    if reason is not None:
+        # A voided match is the bot's doing, not ours. Reporting it as
+        # ChildFailed put it down the channel that exists for engine bugs,
+        # where it was indistinguishable from one.
+        raise LimitExceeded(reason)
     raise ChildFailed(payload["text"])

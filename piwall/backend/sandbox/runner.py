@@ -9,6 +9,7 @@ Runs user-submitted Python strategy functions in a restricted environment:
 """
 
 import math
+import os
 import random
 import signal
 import textwrap
@@ -24,6 +25,7 @@ from RestrictedPython.Guards import (
     safer_getattr,
 )
 
+from backend.sandbox import isolation
 from backend.determinism.budget import (
     DEFAULT_DECISION_OPS,
     BudgetForfeit,
@@ -72,6 +74,10 @@ ALLOWED_BUILTINS = {
 #      measured ~19s of real work, all of it invisible to the counter;
 #   2. a bot that catches its own forfeit (CPython drops the trace function
 #      as soon as a trace callback raises, so the counter gets one shot).
+# The net is not a single catchable exception -- a bare `except:` would eat
+# that as readily as it eats the forfeit. It repeats, it latches, and in the
+# isolated child a bot still running one interval later is exited outright.
+# _make_wall_clock_handler has the details.
 # Sized far above the ~20ms it takes to burn DEFAULT_DECISION_OPS of ordinary
 # Python, so an honest bot that spends its whole budget is never cut short by
 # the clock. When it does fire the match is voided, never completed.
@@ -83,8 +89,16 @@ DEFAULT_DECISION_WALL_MS = 2000
 _MISSING_STRATEGY = object()
 
 
-class TimeoutError(Exception):
-    pass
+class _WallClockFired(BaseException):
+    """Raised inside the bot by the SIGALRM handler when the net fires.
+
+    A BaseException, and not the builtin TimeoutError it used to shadow, for
+    two reasons. It must not be reinterpreted by run_with_budget's "the bot
+    swallowed its forfeit" recovery -- a fired net means unbounded time was
+    consumed, which outranks a forfeit and has to void rather than be
+    recorded. And no `except Exception:` between here and execute_strategy
+    should be able to absorb it.
+    """
 
 
 class DecisionTimeout(BaseException):
@@ -99,8 +113,45 @@ class DecisionTimeout(BaseException):
     """
 
 
-def _timeout_handler(signum, frame):
-    raise TimeoutError("Strategy function exceeded its wall-clock limit")
+def _make_wall_clock_handler(timeout_ms: int):
+    """Build the SIGALRM handler for one decision, plus its latch.
+
+    A single alarm is not enough on its own. Raising _WallClockFired into
+    the bot is only a *request* to stop: a bare `except:` in bot code catches it
+    exactly as readily as it catches BudgetForfeit, and RestrictedPython
+    permits bare except. A bot looping inside `try: ... except: pass` ran for
+    45s against an 800ms alarm, because the alarm fired once and its
+    exception was eaten.
+
+    So the alarm repeats, and what actually holds is:
+
+    * the latch. Once the net has fired, `state["fired"]` stays set, so no
+      matter what the bot swallows, the decision is voided the moment control
+      comes back to us -- whether it returns or raises.
+    * the second firing. A bot still running one interval after being told to
+      stop is provably ignoring the signal, and no in-process exception will
+      ever reach it. Inside the isolated child there is one door a bare
+      `except:` cannot cover, and it takes it: the process exits with
+      WALL_CLOCK_VOID_EXITCODE, which isolation.py classifies as the bot's
+      limit breach rather than as a crash of ours.
+
+    Outside the isolated child -- the API process, or a test run -- exiting
+    would take down a process that is not ours to end, so there the handler
+    only keeps raising. Nothing is lost: the API process never executes bots
+    (signal.signal cannot arm off the main thread), and the isolated child is
+    the only place a match actually runs.
+    """
+    state = {"fired": 0}
+
+    def handler(signum, frame):
+        state["fired"] += 1
+        if state["fired"] > 1 and isolation.IN_ISOLATED_CHILD:
+            os._exit(isolation.WALL_CLOCK_VOID_EXITCODE)
+        raise _WallClockFired(
+            f"strategy function exceeded its {timeout_ms}ms wall-clock limit"
+        )
+
+    return handler, state
 
 
 def compile_strategy(code: str) -> Optional[str]:
@@ -252,12 +303,15 @@ def execute_strategy(
     # Execute under the counted budget, with the wall-clock net outside it
     restricted_locals = {}
 
-    # Set alarm for the wall-clock net (Unix, main thread only)
+    # Arm the wall-clock net (Unix, main thread only). The alarm *repeats*:
+    # one shot would be a single catchable exception, and a bot is free to
+    # catch it. See _make_wall_clock_handler.
+    wall_handler, wall_state = _make_wall_clock_handler(timeout_ms)
     old_handler = None
     try:
-        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        # Convert ms to microseconds for setitimer
-        signal.setitimer(signal.ITIMER_REAL, timeout_ms / 1000.0)
+        old_handler = signal.signal(signal.SIGALRM, wall_handler)
+        seconds = timeout_ms / 1000.0
+        signal.setitimer(signal.ITIMER_REAL, seconds, seconds)
     except (ValueError, AttributeError):
         pass  # Signal not available (Windows, or not main thread)
 
@@ -277,8 +331,17 @@ def execute_strategy(
             restricted_globals["my_car"],
         )
 
+    def _void_if_the_net_fired():
+        """The latch. A bot that ate the net's exception does not get to pretend
+        the net never fired -- this runs on every way out of the call."""
+        if wall_state["fired"]:
+            raise DecisionTimeout(
+                f"a decision exceeded the {timeout_ms}ms wall-clock limit"
+            ) from None
+
     try:
         result, _ops_used = run_with_budget(_define_and_decide, (), max_ops)
+        _void_if_the_net_fired()
 
         if result is _MISSING_STRATEGY:
             return {"error": "Code must define a function called 'my_strategy'"}
@@ -302,11 +365,14 @@ def execute_strategy(
         # handler below would not catch it: the forfeit belongs to the
         # caller, which knows the lap and car it happened to.
         raise
-    except TimeoutError:
+    except _WallClockFired:
         raise DecisionTimeout(
             f"a decision exceeded the {timeout_ms}ms wall-clock limit"
         ) from None
     except Exception as e:
+        # Same latch on the failure path: a bot that swallows the net and
+        # then fails some other way is still a void, not a buggy bot.
+        _void_if_the_net_fired()
         return {"error": f"Runtime error: {type(e).__name__}: {e}"}
     finally:
         # Cancel alarm

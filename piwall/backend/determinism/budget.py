@@ -71,6 +71,24 @@ def run_with_budget(
     sys.settrace(tracer)
     try:
         result = fn(*args)
+    except BudgetForfeit:
+        raise
+    except Exception:
+        # A bot that catches its forfeit and then fails some other way -- the
+        # classic being a bare `except: pass` around the loop followed by
+        # `1 / 0` -- would otherwise be recorded as merely buggy, with no
+        # budget_forfeit event in the replay at all. The verdict was reached
+        # before whatever came next, so it is the verdict that stands.
+        #
+        # Exception, not BaseException, and the distinction is load-bearing:
+        # the sandbox's wall-clock net raises a BaseException at the bot, and
+        # a fired net means unbounded time was consumed. That has to stay a
+        # void. Rewriting it into a tidy deterministic forfeit here would let
+        # a bot that swallows its forfeit spend the whole net interval on
+        # every lap of the race and still have each one recorded as normal.
+        if state["tripped"]:
+            raise BudgetForfeit(state["ops"], max_ops) from None
+        raise
     finally:
         sys.settrace(previous)
 

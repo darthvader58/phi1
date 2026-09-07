@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.sandbox.isolation import MatchAborted
+from backend.sandbox.isolation import ChildFailed, LimitExceeded, MatchAborted
 from backend.sandbox.match_job import run_match_isolated
 
 
@@ -44,14 +44,18 @@ def test_runs_a_match_and_returns_standings():
     assert result["lap_data"]
 
 
-def _spec_with_a_hanging_bot():
+def _spec_with(code):
     spec = make_spec()
     spec["cars"] = [
-        {"car_id": "c1", "player_id": "p1", "code": HANGS,
+        {"car_id": "c1", "player_id": "p1", "code": code,
          "start_position": 1, "starting_compound": "MEDIUM"},
         spec["cars"][1],
     ]
     return spec
+
+
+def _spec_with_a_hanging_bot():
+    return _spec_with(HANGS)
 
 
 def test_a_hanging_bot_forfeits_its_decisions_and_the_match_completes():
@@ -111,14 +115,57 @@ def test_a_bot_the_counter_cannot_bound_aborts_the_match():
     Any of them is enough, and they fail in opposite directions under load,
     so this asserts the guarantee rather than one mechanism.
     """
-    spec = make_spec()
-    spec["cars"] = [
-        {"car_id": "c1", "player_id": "p1", "code": BURNS_CPU_PER_LINE,
-         "start_position": 1, "starting_compound": "MEDIUM"},
-        spec["cars"][1],
-    ]
-    with pytest.raises(MatchAborted):
-        run_match_isolated(spec, cpu_seconds=1, wall_seconds=15)
+    with pytest.raises(LimitExceeded):
+        run_match_isolated(_spec_with(BURNS_CPU_PER_LINE),
+                           cpu_seconds=30, wall_seconds=30)
+
+
+# Everything this bot does happens inside its own try, so the exception the
+# wall-clock net raises lands where a bare `except:` catches it. Raising at a
+# bot is only a request to stop; this is the bot declining.
+SWALLOWS_THE_NET = (
+    "def my_strategy(state, my_car):\n"
+    "    x = 0\n"
+    "    while True:\n"
+    "        try:\n"
+    "            while x < 1000000000:\n"
+    "                x = x + 1\n"
+    "        except:\n"
+    "            x = 0\n"
+)
+
+
+def test_a_bot_that_refuses_the_wall_clock_signal_is_still_stopped():
+    """No in-process exception can bound a loop that catches everything.
+
+    A single alarm let this run for 45s against an 800ms net. The alarm now
+    repeats, and a bot still running an interval after being told to stop is
+    exited outright from inside the isolated child -- the one door a bare
+    `except:` cannot cover. It is classified as the bot's limit breach, not
+    as a crash of ours.
+    """
+    started = time.monotonic()
+    with pytest.raises(LimitExceeded):
+        run_match_isolated(_spec_with(SWALLOWS_THE_NET),
+                           cpu_seconds=30, wall_seconds=30)
+    # Bounded by our own net at a small multiple of the per-decision limit,
+    # not by RLIMIT_CPU seconds later.
+    assert time.monotonic() - started < 20
+
+
+def test_a_voided_match_is_not_reported_as_an_engine_bug():
+    """LimitExceeded and ChildFailed are different channels on purpose.
+
+    ChildFailed means our code broke and shows the player a generic message;
+    LimitExceeded means their bot did something and names it. A wall-clock
+    void crossing the process boundary used to arrive as an unrecognised
+    type name and be reported as the former.
+    """
+    with pytest.raises(LimitExceeded) as excinfo:
+        run_match_isolated(_spec_with(BURNS_CPU_PER_LINE),
+                           cpu_seconds=30, wall_seconds=30)
+    assert not isinstance(excinfo.value, ChildFailed)
+    assert "wall-clock" in str(excinfo.value)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
