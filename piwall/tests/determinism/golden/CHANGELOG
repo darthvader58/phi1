@@ -1,0 +1,9 @@
+# Golden hash changelog
+
+Every entry below was appended automatically by
+`scripts/verify_determinism.py --record --reason "..."` and records why a
+committed replay hash moved. A moved hash is a 64-character hex diff on its
+own -- unreviewable without the reason recorded here.
+
+Do not hand-edit this file. Do not hand-edit `*.expected.txt` either; both
+are written together by the same --record run.
