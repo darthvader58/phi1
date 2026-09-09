@@ -14,12 +14,14 @@ requeued rather than completed (spec 5.5).
 import sys
 from typing import Any, Callable, Tuple
 
+from .signals import MatchVoiding, RecordedOutcome
+
 # Roughly two orders of magnitude above the busiest built-in strategy, so a
 # genuine bot never approaches it and a runaway loop always trips it.
 DEFAULT_DECISION_OPS = 200_000
 
 
-class BudgetForfeit(BaseException):
+class BudgetForfeit(RecordedOutcome):
     """Raised when a decision exhausts its operation budget.
 
     Deliberately derived from BaseException rather than Exception. The
@@ -89,19 +91,18 @@ def run_with_budget(
         if state["tripped"]:
             raise BudgetForfeit(state["ops"], max_ops) from None
         raise
-    except BaseException as exc:
-        # A BaseException that is neither the forfeit nor the wall-clock net.
-        # Before this clause existed, such an exception skipped the latch
-        # below entirely: a bot that swallowed its forfeit and then raised any
-        # BaseException it could obtain escaped with no budget_forfeit
-        # recorded and the match voided as an engine fault.
-        #
-        # The wall-clock net is carved out for the reason the Exception clause
-        # above gives -- a fired net means unbounded time was actually spent,
-        # so it has to stay a void rather than be tidied into a deterministic
-        # forfeit. Matched by type name because the net is defined in the
-        # sandbox, which imports this module.
-        if state["tripped"] and type(exc).__name__ != "_WallClockFired":
+    except MatchVoiding:
+        # A voiding signal outranks the forfeit latch. A fired wall-clock net
+        # means unbounded time was genuinely spent, so tidying it into a
+        # deterministic forfeit would record a machine-speed-dependent result
+        # in a replay that must be byte-identical everywhere.
+        raise
+    except BaseException:
+        # Anything else that is not an Exception: the bot raised it itself.
+        # Without this clause such an exception skipped the latch below
+        # entirely, so a bot that swallowed its forfeit and then raised a
+        # BaseException escaped with no budget_forfeit recorded at all.
+        if state["tripped"]:
             raise BudgetForfeit(state["ops"], max_ops) from None
         raise
     finally:

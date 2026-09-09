@@ -27,6 +27,7 @@ from RestrictedPython.Guards import (
 )
 
 from backend.sandbox import isolation
+from backend.determinism.signals import MatchVoiding
 from backend.determinism.budget import (
     DEFAULT_DECISION_OPS,
     BudgetForfeit,
@@ -211,7 +212,7 @@ DEFAULT_DECISION_WALL_MS = 2000
 _MISSING_STRATEGY = object()
 
 
-class _WallClockFired(BaseException):
+class _WallClockFired(MatchVoiding):
     """Raised inside the bot by the SIGALRM handler when the net fires.
 
     A BaseException, and not the builtin TimeoutError it used to shadow, for
@@ -223,7 +224,7 @@ class _WallClockFired(BaseException):
     """
 
 
-class DecisionTimeout(BaseException):
+class DecisionTimeout(MatchVoiding):
     """The wall-clock net fired: this match must be voided, not completed.
 
     Where it lands depends on elapsed time, so recording it as a decision
