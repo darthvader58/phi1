@@ -14,7 +14,7 @@ requeued rather than completed (spec 5.5).
 import sys
 from typing import Any, Callable, Tuple
 
-from .signals import MatchVoiding, RecordedOutcome
+from .signals import INTERPRETER_SIGNALS, MatchVoiding, RecordedOutcome
 
 # Roughly two orders of magnitude above the busiest built-in strategy, so a
 # genuine bot never approaches it and a runaway loop always trips it.
@@ -90,6 +90,11 @@ def run_with_budget(
         # every lap of the race and still have each one recorded as normal.
         if state["tripped"]:
             raise BudgetForfeit(state["ops"], max_ops) from None
+        raise
+    except INTERPRETER_SIGNALS:
+        # Never rewritten into a forfeit. A Ctrl-C is not the bot exhausting
+        # its budget, and converting one would make the interpreter
+        # uninterruptible for the length of a race.
         raise
     except MatchVoiding:
         # A voiding signal outranks the forfeit latch. A fired wall-clock net

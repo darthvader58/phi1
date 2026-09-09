@@ -11,7 +11,11 @@ from copy import deepcopy
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Dict, List, Optional, Tuple
 
-from backend.determinism.signals import MatchVoiding, RecordedOutcome
+from backend.determinism.signals import (
+    INTERPRETER_SIGNALS,
+    MatchVoiding,
+    RecordedOutcome,
+)
 from .physics import (
     TrackPhysics, TyreModel, compute_lap_time, compute_overtake_probability,
     check_dnf, compute_pit_stop_time, SC_GAP_COMPRESSION,
@@ -456,6 +460,11 @@ class RaceEngine:
                     # recording one as a decision would put a machine-speed
                     # dependent result into a replay that must be identical
                     # everywhere. The match runner voids and requeues instead.
+                    raise
+                except INTERPRETER_SIGNALS:
+                    # Ctrl-C and interpreter teardown belong to the operator,
+                    # not to this race. Absorbing one swallowed it once per
+                    # car per lap.
                     raise
                 except Exception:
                     decision = Decision(pit=False, compound=car.compound)

@@ -10,6 +10,7 @@ Runs user-submitted Python strategy functions in a restricted environment:
 
 import math
 import operator
+import types
 import os
 import random
 import signal
@@ -153,9 +154,16 @@ def _guarded_getattr(obj, name, *args, **kwargs):
     bot legitimately does needs it -- classes are for calling (`ValueError(x)`,
     `int(s)`), and attributes belong to the instances they produce.
     """
-    if isinstance(obj, type):
+    # GenericAlias and not just type: isinstance(list[int], type) is False in
+    # 3.11+, and GenericAlias forwards attribute reads to its origin, so
+    # `list[int].mro()` walked straight past a bare isinstance(obj, type)
+    # check. Nothing dangerous was reachable through it today, but leaving it
+    # would mean the guard covered the instance and not the shape.
+    if isinstance(obj, (type, types.GenericAlias)):
         raise AttributeError(
-            f"attribute {name!r} is not readable on a class inside strategy code"
+            f"attribute {name!r} is not readable on a class inside strategy "
+            f"code. Classes are for calling -- use an instance, or a lambda "
+            f"such as `key=lambda s: s.lower()` instead of `key=str.lower`"
         )
     return safer_getattr(obj, name, *args, **kwargs)
 

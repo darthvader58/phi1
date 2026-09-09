@@ -368,3 +368,18 @@ def test_print_is_usable_and_silent():
     result = run("print('hello')\nreturn {'pit': True, 'compound': 'SOFT'}")
     assert decided(result), result
     assert result["pit"] is True
+
+
+@pytest.mark.parametrize("alias", ["list[int]", "dict[int]", "tuple[int]",
+                                   "enumerate[int]"])
+def test_generic_alias_does_not_bypass_the_class_guard(alias):
+    """isinstance(list[int], type) is False in 3.11+, and it forwards reads.
+
+    A bare isinstance(obj, type) check covered the class objects and not the
+    shape: `list[int].mro()` walked straight past it. Nothing dangerous was
+    reachable through the aliases in ALLOWED_BUILTINS, but a guard that covers
+    the instances it happens to know about is the enumeration this one exists
+    to avoid.
+    """
+    result = run(f"x = {alias}.mro()\nreturn {{'pit': False, 'compound': 'HARD'}}")
+    assert not decided(result), f"{alias}.mro() bypassed the class guard"

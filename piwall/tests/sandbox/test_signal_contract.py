@@ -193,3 +193,44 @@ def test_a_recorded_outcome_is_absorbed_by_the_engines_handler_but_not_by_bot_co
     except RecordedOutcome:
         caught_explicitly = True
     assert caught_explicitly, "the engine could not catch a forfeit by contract"
+
+
+@pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_interpreter_signals_are_not_absorbed_by_the_budget_meter(signal):
+    """A Ctrl-C is not the bot exhausting its budget.
+
+    The catch-all that converts a swallowed forfeit into a recorded one would
+    otherwise rewrite a KeyboardInterrupt as a BudgetForfeit, making the
+    interpreter uninterruptible for the length of a race.
+    """
+    from backend.determinism.budget import run_with_budget
+
+    def burn_then_interrupt():
+        try:
+            n = 0
+            while True:
+                n += 1
+        except BaseException:
+            pass
+        raise signal()
+
+    with pytest.raises(signal):
+        run_with_budget(burn_then_interrupt, (), max_ops=2000)
+
+
+@pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
+def test_interpreter_signals_reach_the_caller_through_a_race(signal):
+    """Absorbing one meant Ctrl-C was swallowed once per car per lap."""
+    from backend.engine.build import build_engine
+
+    engine = build_engine("bahrain", seed=42)
+
+    def interrupting_strategy(state, my_state):
+        raise signal()
+
+    engine.add_car(
+        car_id="c1", player_id="p1", strategy=interrupting_strategy,
+        starting_position=1, starting_compound="MEDIUM",
+    )
+    with pytest.raises(signal):
+        engine.run()

@@ -63,3 +63,16 @@ class MatchVoiding(SandboxSignal):
     Voiding is not a failure mode to be avoided; it is the correct answer when
     the alternative is a replay that does not reproduce.
     """
+
+
+# Signals that belong to neither the engine nor the bot: the operator pressed
+# Ctrl-C, the interpreter is shutting down, a generator is being finalised.
+#
+# They are BaseException-derived and so reach the same broad handlers, but the
+# right answer is neither "record it" nor "void the match" — it is to get out
+# of the way. Absorbing a KeyboardInterrupt as a bot error meant Ctrl-C during
+# an in-process race was swallowed once per car per lap and the race carried
+# on, which is a genuinely unpleasant thing to debug.
+#
+# Handlers that catch broadly must re-raise these ahead of their catch-all.
+INTERPRETER_SIGNALS = (KeyboardInterrupt, SystemExit, GeneratorExit)
