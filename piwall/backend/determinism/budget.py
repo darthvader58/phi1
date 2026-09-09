@@ -89,6 +89,21 @@ def run_with_budget(
         if state["tripped"]:
             raise BudgetForfeit(state["ops"], max_ops) from None
         raise
+    except BaseException as exc:
+        # A BaseException that is neither the forfeit nor the wall-clock net.
+        # Before this clause existed, such an exception skipped the latch
+        # below entirely: a bot that swallowed its forfeit and then raised any
+        # BaseException it could obtain escaped with no budget_forfeit
+        # recorded and the match voided as an engine fault.
+        #
+        # The wall-clock net is carved out for the reason the Exception clause
+        # above gives -- a fired net means unbounded time was actually spent,
+        # so it has to stay a void rather than be tidied into a deterministic
+        # forfeit. Matched by type name because the net is defined in the
+        # sandbox, which imports this module.
+        if state["tripped"] and type(exc).__name__ != "_WallClockFired":
+            raise BudgetForfeit(state["ops"], max_ops) from None
+        raise
     finally:
         sys.settrace(previous)
 

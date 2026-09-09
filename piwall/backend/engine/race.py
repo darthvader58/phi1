@@ -452,6 +452,30 @@ class RaceEngine:
                     ))
                 except Exception:
                     decision = Decision(pit=False, compound=car.compound)
+                except BaseException as exc:
+                    # Resource-limit signals must pass straight through: they
+                    # are the machinery voiding this match, not a bot
+                    # misbehaving, and absorbing one would complete a race
+                    # whose outcome depended on elapsed time.
+                    #
+                    # The discriminator is the exception's defining module,
+                    # not its name. A bot can only raise builtin exception
+                    # types -- it cannot define a class, because neither
+                    # `type` nor `__build_class__` is reachable inside the
+                    # sandbox -- so anything defined in backend.* arrived from
+                    # our own limit machinery and belongs to the caller.
+                    if type(exc).__module__ != "builtins":
+                        raise
+                    # Otherwise the bot raised a BaseException itself. It
+                    # costs that car its decision; it does not get to end
+                    # everyone else's race. Without this, one player could
+                    # abort any match on demand and have it recorded as an
+                    # engine failure rather than as their own doing.
+                    decision = Decision(pit=False, compound=car.compound)
+                    self.events.append(RaceEvent(
+                        lap, "bot_error", car.car_id,
+                        "strategy raised a non-standard exception",
+                    ))
                 decisions[car.car_id] = decision
 
             # 5. Execute pit stops

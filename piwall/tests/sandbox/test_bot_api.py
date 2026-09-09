@@ -294,3 +294,77 @@ def test_inplacevar_rejects_an_unknown_operator():
 
     with pytest.raises(ValueError):
         _guarded_inplacevar("@=", 1, 2)
+
+
+# ─── The mro escape, and the two layers behind it ────────────────────
+
+@pytest.mark.parametrize("cls", ["Exception", "ValueError", "int", "str",
+                                 "dict", "list", "tuple", "bool"])
+def test_mro_is_not_readable_on_any_class_a_bot_can_name(cls):
+    """`Exception.mro()[1]` was BaseException, and that was an escape.
+
+    safer_getattr blocks leading-underscore names and INSPECT_ATTRIBUTES;
+    `mro` is in neither, being an ordinary public method on every type. A bot
+    holding BaseException could raise past the operation budget's forfeit
+    latch and past RaceEngine's per-car handler — voiding anyone's match on
+    demand, recorded as an engine fault rather than as the player's doing.
+    """
+    result = run(f"x = {cls}.mro()\nreturn {{'pit': False, 'compound': 'HARD'}}")
+    assert not decided(result), f"{cls}.mro() is reachable"
+    assert "mro" in result["error"]
+
+
+def test_classes_can_still_be_called_even_though_their_attributes_are_refused():
+    """The guard must not break the reason exception classes were exposed."""
+    result = run(
+        "try:\n"
+        "    raise ValueError('planned')\n"
+        "except ValueError as e:\n"
+        "    return {'pit': len(str(e)) > 0, 'compound': 'SOFT'}\n"
+        "return {'pit': False, 'compound': 'HARD'}"
+    )
+    assert decided(result), result
+    assert result["pit"] is True
+
+
+def test_a_swallowed_forfeit_still_counts_when_the_bot_raises_a_baseexception():
+    """Defence in depth: the latch must hold even if BaseException leaks again.
+
+    Exercised directly rather than through a bot, because the mro route that
+    made BaseException reachable is now closed — the point is that closing it
+    is not the only thing standing between a bot and a declined budget.
+    """
+    from backend.determinism.budget import run_with_budget
+
+    def swallow_then_raise():
+        try:
+            n = 0
+            while True:
+                n += 1
+        except BaseException:
+            pass
+        raise BaseException("no forfeit for me")
+
+    with pytest.raises(BudgetForfeit):
+        run_with_budget(swallow_then_raise, (), max_ops=2000)
+
+
+def test_builtins_are_copied_into_each_bots_globals():
+    """A bot's globals must not hold the module-level dict by reference.
+
+    The exec namespace is now shared with bot module-level code, so a
+    reference here would mean one future gap poisons every later bot in the
+    process rather than just the one that found it.
+    """
+    from backend.sandbox.runner import build_sandbox_globals
+
+    g = build_sandbox_globals(seed=1, slot=0)
+    assert g["__builtins__"] is not ALLOWED_BUILTINS
+    assert g["__builtins__"] == ALLOWED_BUILTINS
+
+
+def test_print_is_usable_and_silent():
+    """print was in the builtins but unusable: _print_ was never installed."""
+    result = run("print('hello')\nreturn {'pit': True, 'compound': 'SOFT'}")
+    assert decided(result), result
+    assert result["pit"] is True

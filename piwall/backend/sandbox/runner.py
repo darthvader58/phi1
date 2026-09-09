@@ -85,6 +85,12 @@ ALLOWED_BUILTINS = {
     "TypeError": TypeError,
     "ValueError": ValueError,
     "ZeroDivisionError": ZeroDivisionError,
+    "AssertionError": AssertionError,
+    "NameError": NameError,
+    "NotImplementedError": NotImplementedError,
+    "OverflowError": OverflowError,
+    "RecursionError": RecursionError,
+    "UnboundLocalError": UnboundLocalError,
 }
 
 
@@ -126,6 +132,52 @@ def _guarded_inplacevar(op: str, x, y):
     except KeyError:
         raise ValueError(f"operator {op!r} is not permitted in strategy code")
     return apply_op(x, y)
+
+
+def _guarded_getattr(obj, name, *args, **kwargs):
+    """safer_getattr, plus a refusal to read attributes off a class object.
+
+    safer_getattr blocks leading-underscore names and RestrictedPython's
+    INSPECT_ATTRIBUTES set. `mro` is in neither: it is an ordinary public
+    method on every type. Once exception classes became nameable that was
+    enough to escape the sandbox's exception model entirely --
+    `Exception.mro()[1]` is BaseException, and a bot holding BaseException can
+    raise past the operation budget's forfeit latch and past RaceEngine's
+    per-car handler, voiding anyone's match on demand and having it recorded
+    as an engine fault.
+
+    Blocking `mro` alone would fix today's route. Refusing the whole class
+    surface fixes the shape: any public method a type gains, now or in a
+    future Python, is refused by default rather than by enumeration. Nothing a
+    bot legitimately does needs it -- classes are for calling (`ValueError(x)`,
+    `int(s)`), and attributes belong to the instances they produce.
+    """
+    if isinstance(obj, type):
+        raise AttributeError(
+            f"attribute {name!r} is not readable on a class inside strategy code"
+        )
+    return safer_getattr(obj, name, *args, **kwargs)
+
+
+class _SilentPrint:
+    """Satisfies RestrictedPython's print protocol and discards the output.
+
+    `print` was in ALLOWED_BUILTINS but unusable: RestrictedPython rewrites
+    print statements to go through `_print_`, which was never installed, so
+    every print raised NameError and the silenced builtin was dead code.
+    """
+
+    def __init__(self, _getattr_=None):
+        pass
+
+    def write(self, text):
+        pass
+
+    def _call_print(self, *args, **kwargs):
+        pass
+
+    def __call__(self):
+        return ""
 
 
 def _guarded_apply(fn, *args, **kwargs):
@@ -286,10 +338,10 @@ class Namespace:
     # introspection attributes. No RaceState or CarState field starts
     # with "_" (see engine/serialize.py), so nothing legitimate is lost.
     def __getitem__(self, key):
-        return safer_getattr(self, key, None)
+        return _guarded_getattr(self, key, None)
 
     def get(self, key, default=None):
-        return safer_getattr(self, key, default)
+        return _guarded_getattr(self, key, default)
 
 
 # Everything Namespace itself defines that a key could overwrite. Derived
@@ -344,12 +396,15 @@ def build_sandbox_globals(seed: int, slot: int) -> dict:
     this car (see below) -- they carry no other effect on the globals.
     """
     restricted_globals = safe_globals.copy()
-    restricted_globals["__builtins__"] = ALLOWED_BUILTINS
-    restricted_globals["_getattr_"] = safer_getattr
+    # .copy(): a bot's globals must never hold a reference to the module-level
+    # dict, or one future gap would poison every later bot in the process.
+    restricted_globals["__builtins__"] = ALLOWED_BUILTINS.copy()
+    restricted_globals["_getattr_"] = _guarded_getattr
     restricted_globals["_getiter_"] = iter
     restricted_globals["_getitem_"] = _guarded_getitem
     restricted_globals["_inplacevar_"] = _guarded_inplacevar
     restricted_globals["_apply_"] = _guarded_apply
+    restricted_globals["_print_"] = _SilentPrint
     restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
     restricted_globals["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
     restricted_globals["_write_"] = full_write_guard
