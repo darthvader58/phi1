@@ -9,6 +9,8 @@ Runs user-submitted Python strategy functions in a restricted environment:
 """
 
 import math
+import operator
+import types
 import os
 import random
 import signal
@@ -26,6 +28,7 @@ from RestrictedPython.Guards import (
 )
 
 from backend.sandbox import isolation
+from backend.determinism.signals import MatchVoiding
 from backend.determinism.budget import (
     DEFAULT_DECISION_OPS,
     BudgetForfeit,
@@ -64,7 +67,135 @@ ALLOWED_BUILTINS = {
     "False": False,
     "None": None,
     "isinstance": isinstance,
+    # Exception classes. Without these a bot cannot write `except ValueError:`
+    # and is forced into a bare `except:` — which is precisely the construct
+    # that swallows the wall-clock signal, so their absence pushed authors
+    # toward the one pattern the resource limits least want to see.
+    #
+    # BaseException is deliberately NOT here, and must never be added: the
+    # operation budget (BudgetForfeit) and the wall-clock net (_WallClockFired)
+    # are BaseExceptions specifically so `except Exception` cannot swallow
+    # them. Exposing BaseException would let a bot decline its own limits.
+    "Exception": Exception,
+    "ArithmeticError": ArithmeticError,
+    "AttributeError": AttributeError,
+    "IndexError": IndexError,
+    "KeyError": KeyError,
+    "LookupError": LookupError,
+    "RuntimeError": RuntimeError,
+    "StopIteration": StopIteration,
+    "TypeError": TypeError,
+    "ValueError": ValueError,
+    "ZeroDivisionError": ZeroDivisionError,
+    "AssertionError": AssertionError,
+    "NameError": NameError,
+    "NotImplementedError": NotImplementedError,
+    "OverflowError": OverflowError,
+    "RecursionError": RecursionError,
+    "UnboundLocalError": UnboundLocalError,
 }
+
+
+# RestrictedPython rewrites `x += y` into `_inplacevar_('+=', x, y)`, passing
+# the operator as a STRING. The previous guard was `lambda op, x, y: op(x, y)`,
+# which called the string — so every augmented assignment a player wrote failed
+# with "'str' object is not callable".
+#
+# The values are the NON-in-place operators on purpose. operator.iadd would
+# call x.__iadd__, handing control to whatever object the bot holds a reference
+# to; operator.add never invokes it. The cost is value semantics — `a += b` is
+# `a = a + b`, so a list alias does not observe the append — which is a
+# defensible thing for a sandbox to guarantee and is pinned by a test.
+_INPLACE_OPS = {
+    "+=": operator.add,
+    "-=": operator.sub,
+    "*=": operator.mul,
+    "/=": operator.truediv,
+    "//=": operator.floordiv,
+    "%=": operator.mod,
+    "**=": operator.pow,
+    "<<=": operator.lshift,
+    ">>=": operator.rshift,
+    "&=": operator.and_,
+    "|=": operator.or_,
+    "^=": operator.xor,
+}
+
+
+def _guarded_inplacevar(op: str, x, y):
+    """Evaluate an augmented assignment from an allowlist of operators.
+
+    Unknown operators raise rather than falling through: `@=` (matrix multiply)
+    is excluded because nothing a bot can hold implements it and an allowlist
+    that grows by accident is not an allowlist.
+    """
+    try:
+        apply_op = _INPLACE_OPS[op]
+    except KeyError:
+        raise ValueError(f"operator {op!r} is not permitted in strategy code")
+    return apply_op(x, y)
+
+
+def _guarded_getattr(obj, name, *args, **kwargs):
+    """safer_getattr, plus a refusal to read attributes off a class object.
+
+    safer_getattr blocks leading-underscore names and RestrictedPython's
+    INSPECT_ATTRIBUTES set. `mro` is in neither: it is an ordinary public
+    method on every type. Once exception classes became nameable that was
+    enough to escape the sandbox's exception model entirely --
+    `Exception.mro()[1]` is BaseException, and a bot holding BaseException can
+    raise past the operation budget's forfeit latch and past RaceEngine's
+    per-car handler, voiding anyone's match on demand and having it recorded
+    as an engine fault.
+
+    Blocking `mro` alone would fix today's route. Refusing the whole class
+    surface fixes the shape: any public method a type gains, now or in a
+    future Python, is refused by default rather than by enumeration. Nothing a
+    bot legitimately does needs it -- classes are for calling (`ValueError(x)`,
+    `int(s)`), and attributes belong to the instances they produce.
+    """
+    # GenericAlias and not just type: isinstance(list[int], type) is False in
+    # 3.11+, and GenericAlias forwards attribute reads to its origin, so
+    # `list[int].mro()` walked straight past a bare isinstance(obj, type)
+    # check. Nothing dangerous was reachable through it today, but leaving it
+    # would mean the guard covered the instance and not the shape.
+    if isinstance(obj, (type, types.GenericAlias)):
+        raise AttributeError(
+            f"attribute {name!r} is not readable on a class inside strategy "
+            f"code. Classes are for calling -- use an instance, or a lambda "
+            f"such as `key=lambda s: s.lower()` instead of `key=str.lower`"
+        )
+    return safer_getattr(obj, name, *args, **kwargs)
+
+
+class _SilentPrint:
+    """Satisfies RestrictedPython's print protocol and discards the output.
+
+    `print` was in ALLOWED_BUILTINS but unusable: RestrictedPython rewrites
+    print statements to go through `_print_`, which was never installed, so
+    every print raised NameError and the silenced builtin was dead code.
+    """
+
+    def __init__(self, _getattr_=None):
+        pass
+
+    def write(self, text):
+        pass
+
+    def _call_print(self, *args, **kwargs):
+        pass
+
+    def __call__(self):
+        return ""
+
+
+def _guarded_apply(fn, *args, **kwargs):
+    """Support f(*args) / f(**kwargs), which RestrictedPython routes here.
+
+    This grants no reach a bot did not already have: fn is whatever it could
+    already name and call directly, and the arguments are its own values.
+    """
+    return fn(*args, **kwargs)
 
 # The wall-clock net for one decision. It is NOT the thing that decides a
 # race: the counted budget in backend/determinism/budget.py is. This exists
@@ -89,7 +220,7 @@ DEFAULT_DECISION_WALL_MS = 2000
 _MISSING_STRATEGY = object()
 
 
-class _WallClockFired(BaseException):
+class _WallClockFired(MatchVoiding):
     """Raised inside the bot by the SIGALRM handler when the net fires.
 
     A BaseException, and not the builtin TimeoutError it used to shadow, for
@@ -101,7 +232,7 @@ class _WallClockFired(BaseException):
     """
 
 
-class DecisionTimeout(BaseException):
+class DecisionTimeout(MatchVoiding):
     """The wall-clock net fired: this match must be voided, not completed.
 
     Where it lands depends on elapsed time, so recording it as a decision
@@ -216,10 +347,10 @@ class Namespace:
     # introspection attributes. No RaceState or CarState field starts
     # with "_" (see engine/serialize.py), so nothing legitimate is lost.
     def __getitem__(self, key):
-        return safer_getattr(self, key, None)
+        return _guarded_getattr(self, key, None)
 
     def get(self, key, default=None):
-        return safer_getattr(self, key, default)
+        return _guarded_getattr(self, key, default)
 
 
 # Everything Namespace itself defines that a key could overwrite. Derived
@@ -274,11 +405,15 @@ def build_sandbox_globals(seed: int, slot: int) -> dict:
     this car (see below) -- they carry no other effect on the globals.
     """
     restricted_globals = safe_globals.copy()
-    restricted_globals["__builtins__"] = ALLOWED_BUILTINS
-    restricted_globals["_getattr_"] = safer_getattr
+    # .copy(): a bot's globals must never hold a reference to the module-level
+    # dict, or one future gap would poison every later bot in the process.
+    restricted_globals["__builtins__"] = ALLOWED_BUILTINS.copy()
+    restricted_globals["_getattr_"] = _guarded_getattr
     restricted_globals["_getiter_"] = iter
     restricted_globals["_getitem_"] = _guarded_getitem
-    restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
+    restricted_globals["_inplacevar_"] = _guarded_inplacevar
+    restricted_globals["_apply_"] = _guarded_apply
+    restricted_globals["_print_"] = _SilentPrint
     restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
     restricted_globals["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
     restricted_globals["_write_"] = full_write_guard
@@ -346,7 +481,6 @@ def execute_strategy(
     restricted_globals["my_car"] = Namespace(my_car_dict)
 
     # Execute under the counted budget, with the wall-clock net outside it
-    restricted_locals = {}
 
     # Arm the wall-clock net (Unix, main thread only). The alarm *repeats*:
     # one shot would be a single catchable exception, and a bot is free to
@@ -367,8 +501,20 @@ def execute_strategy(
         whose runaway loop sits at module level costs exactly as much as one
         that hides it in my_strategy, and both must trip the same counter.
         """
-        exec(byte_code, restricted_globals, restricted_locals)
-        strategy_fn = restricted_locals.get("my_strategy")
+        # One namespace, not globals+locals. With two, a module-level `CLIFF =
+        # 12` landed in locals while my_strategy's __globals__ stayed the
+        # globals dict, so the name was invisible inside the function and every
+        # module-level constant or helper raised NameError.
+        #
+        # Merging them is safe ONLY because globals(), vars() and locals() are
+        # unreachable from bot code: a bot that could call globals() could
+        # assign over _getattr_ or __builtins__ in the very dict the guards live
+        # in. RestrictedPython rejects leading-underscore names at compile time,
+        # which closes the direct route; the indirect one stays closed only
+        # while those three builtins stay absent. Both halves are pinned by
+        # tests in tests/sandbox/test_bot_api.py.
+        exec(byte_code, restricted_globals)
+        strategy_fn = restricted_globals.get("my_strategy")
         if strategy_fn is None:
             return _MISSING_STRATEGY
         return strategy_fn(

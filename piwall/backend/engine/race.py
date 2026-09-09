@@ -11,7 +11,11 @@ from copy import deepcopy
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Dict, List, Optional, Tuple
 
-from backend.determinism.budget import BudgetForfeit
+from backend.determinism.signals import (
+    INTERPRETER_SIGNALS,
+    MatchVoiding,
+    RecordedOutcome,
+)
 from .physics import (
     TrackPhysics, TyreModel, compute_lap_time, compute_overtake_probability,
     check_dnf, compute_pit_stop_time, SC_GAP_COMPRESSION,
@@ -439,19 +443,43 @@ class RaceEngine:
                     decision = self.strategies[car.car_id](state, my_state)
                     if not isinstance(decision, Decision):
                         decision = Decision(pit=False, compound=car.compound)
-                except BudgetForfeit:
+                except RecordedOutcome:
                     # A forfeit is a recorded non-decision, not a crash. The
                     # car does nothing this lap and the race carries on, so
                     # the replay stays complete -- and because the budget is
-                    # counted in executed lines rather than elapsed time,
-                    # this lands on the same lap on every machine.
+                    # counted in executed lines rather than elapsed time, this
+                    # lands on the same lap on every machine.
                     decision = Decision(pit=False, compound=car.compound)
                     self.events.append(RaceEvent(
                         lap, "budget_forfeit", car.car_id,
                         "decision budget exhausted",
                     ))
+                except MatchVoiding:
+                    # Never absorbed. These describe conditions that are not
+                    # reproducible -- elapsed time, an exhausted rlimit -- so
+                    # recording one as a decision would put a machine-speed
+                    # dependent result into a replay that must be identical
+                    # everywhere. The match runner voids and requeues instead.
+                    raise
+                except INTERPRETER_SIGNALS:
+                    # Ctrl-C and interpreter teardown belong to the operator,
+                    # not to this race. Absorbing one swallowed it once per
+                    # car per lap.
+                    raise
                 except Exception:
                     decision = Decision(pit=False, compound=car.compound)
+                except BaseException:
+                    # A BaseException that is neither of ours, so the bot
+                    # raised it itself. It costs that car its decision; it does
+                    # not get to end everyone else's race. Reached only if a
+                    # future gap hands bot code a BaseException again -- the
+                    # sandbox refuses class attribute reads precisely so that
+                    # `Exception.mro()[1]` cannot.
+                    decision = Decision(pit=False, compound=car.compound)
+                    self.events.append(RaceEvent(
+                        lap, "bot_error", car.car_id,
+                        "strategy raised a non-standard exception",
+                    ))
                 decisions[car.car_id] = decision
 
             # 5. Execute pit stops
