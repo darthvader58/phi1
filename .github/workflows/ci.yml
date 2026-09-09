@@ -1,0 +1,179 @@
+name: CI
+
+# Until now the determinism gate only ran when a human typed the command, so a
+# red gate was visible to exactly one person: whoever broke it. The gate is the
+# single most valuable test in this repo — it asserts that a match replays
+# byte-identically from its manifest — and it belongs somewhere a second person
+# can see it go red.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Python 3.11)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: piwall
+
+    # A database, deliberately. The persistence tests skip themselves when one
+    # is unreachable, so a CI without Mongo would run green while five tests
+    # quietly never executed — and this project has already shipped a suite
+    # that silently ran zero tests.
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PYTHONPATH: .
+      # PYTHONHASHSEED is pinned in the runtime image for determinism; pin it
+      # here too so CI reproduces what production does rather than whatever
+      # the runner happened to seed.
+      PYTHONHASHSEED: "0"
+      MONGODB_URI: mongodb://localhost:27017/ci_test
+      MONGODB_DB: ci_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use the production interpreter
+        uses: actions/setup-python@v5
+        with:
+          # Must match Dockerfile.backend. The operation counter counts CPython
+          # line events, and their number is not guaranteed stable across
+          # versions — measured at +12.4% between 3.11 and 3.14 — so testing on
+          # anything else tests a different budget.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: piwall/backend/requirements.txt
+
+      - name: Install runtime dependencies only
+        # requirements.txt is the runtime set and deliberately excludes
+        # numpy/scipy/fastf1. If a test needs them, that is the finding.
+        run: pip install -r backend/requirements.txt
+
+      - name: Refuse to run a suite that collects nothing
+        # The failure this guards against is not hypothetical: a test that
+        # connected to a database at import time once aborted collection, and
+        # the whole suite reported success having run zero tests.
+        run: |
+          collected=$(python -m pytest --collect-only -q 2>/dev/null | tail -1 | grep -oE '^[0-9]+' || echo 0)
+          echo "collected: $collected"
+          if [ "${collected:-0}" -lt 200 ]; then
+            echo "::error::only $collected tests collected; expected at least 200"
+            exit 1
+          fi
+
+      - name: Full suite
+        run: python -m pytest -q
+
+      - name: The persistence tests must have run, not skipped
+        # Gating on "is MONGODB_URI set" rather than "is a database reachable"
+        # is what made these error under compose; assert they genuinely ran.
+        run: |
+          out=$(python -m pytest tests/determinism/test_persistence.py -q 2>&1 | tail -3)
+          echo "$out"
+          echo "$out" | grep -qE '5 passed' || {
+            echo "::error::persistence tests did not run against the database"
+            exit 1
+          }
+
+      - name: Determinism gate
+        # Golden manifests re-run and compared against committed replay hashes,
+        # plus 100 byte-identical runs per track.
+        run: python -m pytest tests/determinism/test_golden.py -v
+
+      - name: Golden hashes match on the production interpreter
+        run: python scripts/verify_determinism.py
+
+  sandbox-security:
+    name: Sandbox containment
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: piwall
+    env:
+      PYTHONPATH: .
+      PYTHONHASHSEED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: piwall/backend/requirements.txt
+      - run: pip install -r backend/requirements.txt
+
+      # Its own job so a containment failure is legible by name in the PR
+      # checks rather than buried in a suite summary. This code executes
+      # untrusted player-submitted Python.
+      - name: Containment and bot API
+        run: python -m pytest tests/sandbox -v
+
+      - name: Control-signal contract
+        # Fails if any BaseException subclass under backend/ bypasses every
+        # `except Exception:` without declaring whether the engine records it
+        # or must never absorb it.
+        run: python -m pytest tests/sandbox/test_signal_contract.py -v
+
+  frontend:
+    name: Frontend (Node 22)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: piwall/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Matches Dockerfile.frontend.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: piwall/frontend/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Build
+        run: npx next build
+
+  runtime-image:
+    name: Runtime image is lean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the backend image
+        run: docker build -f piwall/Dockerfile.backend -t piwall-backend piwall
+
+      - name: numpy and scipy must not be in the runtime
+        # Calibration is a frozen, committed artifact precisely so the runner
+        # never fits curves at race time: scipy's results shift with the
+        # BLAS/LAPACK backend, which would change every lap time in the game.
+        # If either lands back in the image, that guarantee is gone.
+        run: >-
+          docker run --rm piwall-backend python -c
+          "import importlib.util as u, sys;
+          leaked = [m for m in ('numpy', 'scipy', 'fastf1') if u.find_spec(m)];
+          sys.exit('these must not be in the runtime image: ' + repr(leaked)) if leaked
+          else print('runtime image is lean')"
+
+      - name: Determinism gate inside the production image
+        # The image is where untrusted code actually runs. A gate that only
+        # passes on a developer's interpreter proves less than it looks.
+        run: |
+          docker run --rm -e PYTHONPATH=. piwall-backend \
+            python -m pytest tests/determinism/test_golden.py -q
