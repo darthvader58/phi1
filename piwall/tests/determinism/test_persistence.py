@@ -17,7 +17,7 @@ def db():
     factory = init_db(engine)
     session = factory()
     yield session
-    session.manifests.delete_many({"match_id": {"$regex": "^t_"}})
+    session.db.manifests.delete_many({"match_id": {"$regex": "^t_"}})
     session.close()
 
 

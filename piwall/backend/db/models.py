@@ -27,11 +27,6 @@ class MongoSession:
     def close(self):
         return None
 
-    def __getattr__(self, name):
-        # Collections are also reachable directly off the session (session.foo),
-        # mirroring pymongo's own db.foo shorthand, in addition to session.db.foo.
-        return getattr(self.db, name)
-
 
 def create_db_engine(url: str | None = None):
     mongo_url = url or os.environ.get("MONGODB_URI") or "mongodb://127.0.0.1:27017/phi1"
