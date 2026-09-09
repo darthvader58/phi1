@@ -1,9 +1,33 @@
 import os
 import pytest
 
+def _database_is_reachable() -> bool:
+    """Reachable, not merely configured.
+
+    Gating on MONGODB_URI being set gates on a proxy for the thing we need.
+    Under compose the variable is always present and points at a service that
+    may not be running, so `docker compose run --no-deps backend pytest`
+    produced five errors and two and a half minutes of connection timeouts
+    where it should have produced five skips.
+
+    The short timeout matters: this runs at collection time, so a slow probe
+    is paid by every test session whether or not a database exists.
+    """
+    uri = os.environ.get("MONGODB_URI")
+    if not uri:
+        return False
+    try:
+        from pymongo import MongoClient
+
+        MongoClient(uri, serverSelectionTimeoutMS=500).admin.command("ping")
+        return True
+    except Exception:
+        return False
+
+
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("MONGODB_URI"),
-    reason="needs a database; the rest of the determinism suite is hermetic",
+    not _database_is_reachable(),
+    reason="needs a reachable database; the rest of the determinism suite is hermetic",
 )
 
 from backend.db import crud
