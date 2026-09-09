@@ -11,77 +11,16 @@ import json
 
 # Support both direct execution and module import
 try:
-    from ..data.calibration_store import load_calibration
     from ..data.tracks import TRACKS
-    from .physics import TyreModel, TrackPhysics
-    from .race import RaceEngine, Decision
+    from .build import build_engine, build_track_physics
+    from .race import Decision
     from .bots import BUILTIN_BOTS
 except ImportError:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-    from piwall.backend.data.calibration_store import load_calibration
     from piwall.backend.data.tracks import TRACKS
-    from piwall.backend.engine.physics import TyreModel, TrackPhysics
-    from piwall.backend.engine.race import RaceEngine, Decision
+    from piwall.backend.engine.build import build_engine, build_track_physics
+    from piwall.backend.engine.race import Decision
     from piwall.backend.engine.bots import BUILTIN_BOTS
-
-
-def build_track_physics(track_name: str) -> TrackPhysics:
-    """Build TrackPhysics from the frozen calibration artifact."""
-    track_cfg = TRACKS[track_name]
-    cal = load_calibration(track_name)
-
-    tyre_models = {}
-    # Compound speed hierarchy: SOFT fastest, HARD slowest
-    COMPOUND_ALPHA = {"SOFT": 0.0, "MEDIUM": 0.35, "HARD": 0.7}
-    # Compound deg multipliers: SOFT degrades most, HARD least
-    COMPOUND_K_SCALE = {"SOFT": 1.5, "MEDIUM": 1.0, "HARD": 0.65}
-
-    # Use average calibrated exponent and k as reference, then scale per compound
-    cal_compounds = list(cal.compounds.values())
-    ref_e = sum(p.e for p in cal_compounds) / len(cal_compounds) if cal_compounds else 1.1
-    ref_k = sum(p.k for p in cal_compounds) / len(cal_compounds) if cal_compounds else 0.05
-
-    for compound in cal.compounds:
-        tyre_models[compound] = TyreModel(
-            compound=compound,
-            alpha=COMPOUND_ALPHA.get(compound, 0.35),
-            k=ref_k * COMPOUND_K_SCALE.get(compound, 1.0),
-            e=ref_e,
-            base_lap_time=cal.base_lap_time,
-        )
-
-    # Add fallback compounds if missing
-    for fallback in ["SOFT", "MEDIUM", "HARD"]:
-        if fallback not in tyre_models:
-            tyre_models[fallback] = TyreModel(
-                compound=fallback,
-                alpha=COMPOUND_ALPHA.get(fallback, 0.35),
-                k=ref_k * COMPOUND_K_SCALE.get(fallback, 1.0),
-                e=ref_e,
-                base_lap_time=cal.base_lap_time,
-            )
-
-    # Add wet compound fallbacks
-    if "INTERMEDIATE" not in tyre_models:
-        ref = tyre_models.get("MEDIUM", list(tyre_models.values())[0])
-        tyre_models["INTERMEDIATE"] = TyreModel(
-            compound="INTERMEDIATE",
-            alpha=ref.alpha + 3.0,
-            k=ref.k * 0.5,
-            e=ref.e,
-            base_lap_time=ref.base_lap_time + 3.0,
-        )
-
-    return TrackPhysics(
-        name=track_name,
-        base_lap_time=cal.base_lap_time,
-        pit_loss_seconds=cal.pit_loss_seconds,
-        total_laps=track_cfg.total_laps,
-        drs_zones=track_cfg.drs_zones,
-        overtake_difficulty=track_cfg.overtake_difficulty,
-        fuel_load_kg=track_cfg.fuel_load_kg,
-        tyre_models=tyre_models,
-    )
 
 
 def print_race_report(result):
@@ -189,14 +128,7 @@ def main():
 
     # Create race engine
     track_cfg = TRACKS[track_name]
-    engine = RaceEngine(
-        track=track,
-        weather_transitions=track_cfg.weather_transitions,
-        initial_weather="dry",
-        seed=seed,
-        sc_prob_dry=track_cfg.safety_car_prob_dry,
-        sc_prob_wet=track_cfg.safety_car_prob_wet,
-    )
+    engine = build_engine(track_name, seed, track_physics=track)
 
     # Add all 5 built-in bots
     for pos, (bot_id, bot_info) in enumerate(BUILTIN_BOTS.items(), 1):
@@ -206,6 +138,15 @@ def main():
             strategy=bot_info["strategy"],
             starting_position=pos,
             starting_compound=bot_info["starting_compound"],
+            # Deliberately unlike the match job and the replay runner, which
+            # both leave this None and get belief.DEFAULT_TYPICAL_STINTS.
+            # This CLI is a calibration-inspection tool: seeding the belief
+            # models with the track's own stint lengths is what makes its
+            # report worth reading. Passing it in production would change
+            # every rival-pit prediction and so every race outcome, which is
+            # a game-balance decision, not a determinism fix -- so the two
+            # reproducible paths stay identical to each other and this one
+            # stays explicitly different.
             typical_stints=track_cfg.typical_stint,
         )
 

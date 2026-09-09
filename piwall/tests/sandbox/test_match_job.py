@@ -12,15 +12,13 @@ from backend.sandbox.match_job import run_match_isolated
 
 def make_spec():
     """Build a match spec. Track physics are built HERE, in the parent, because
-    build_track_physics writes a calibration cache file and the isolated child
-    forbids file writes (RLIMIT_FSIZE=0)."""
-    from backend.data.tracks import TRACKS
-    from backend.engine.cli_runner import build_track_physics
+    the isolated child forbids file writes (RLIMIT_FSIZE=0) and /api/test-bot
+    shortens total_laps on the built object before it is sent."""
+    from backend.engine.build import build_track_physics
 
     return {
         "track": "bahrain",
         "track_physics": build_track_physics("bahrain"),
-        "track_config": TRACKS["bahrain"],
         "seed": 42,
         "cars": [
             {"car_id": "c1", "player_id": "p1", "bot_id": "VEL-01",
@@ -170,9 +168,9 @@ def test_a_voided_match_is_not_reported_as_an_engine_bug():
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# Imports the child's whole graph: match_job statically, plus data.tracks and
-# engine.physics, which the child pulls in when it unpickles the spec's
-# track_config and track_physics.
+# Imports the child's whole graph: match_job statically (which pulls in
+# engine.build and so data.tracks), plus engine.physics, which the child
+# pulls in when it unpickles the spec's track_physics.
 NUMPY_PROBE = """
 import sys
 

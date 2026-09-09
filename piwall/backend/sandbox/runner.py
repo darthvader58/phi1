@@ -175,6 +175,76 @@ def compile_strategy(code: str) -> Optional[str]:
         return f"Compilation error: {e}"
 
 
+class Namespace:
+    """Attribute view over a state dict, handed to bot code as `state`/`my_car`.
+
+    Every key becomes an attribute, and not every key is ours to trust: a
+    car's `beliefs` dict is keyed by *rival car ids*, which are strings
+    another player chose. `setattr(self, "get", ...)` would replace the
+    accessor below for every bot in the race -- the shipped
+    STRATEGY_TEMPLATE calls `my_car.beliefs.get(rival.car_id, {})` -- and
+    `setattr(self, "__class__", ...)` raises TypeError out of the
+    constructor, which runs *before* execute_strategy's try block and so
+    escapes it entirely, aborting the whole match. One join request with a
+    chosen car_id could neutralise every opponent.
+
+    The API constrains car_id at the boundary, but belief keys reach this
+    constructor from more than one path (a replayed manifest, a match spec
+    assembled elsewhere), so unsafe keys are refused here as well. They are
+    dropped rather than raised on: raising from a constructor that sits
+    outside the try block is the failure mode being closed.
+    """
+
+    def __init__(self, d):
+        for k, v in d.items():
+            if not _is_safe_namespace_key(k):
+                continue
+            if isinstance(v, dict):
+                setattr(self, k, Namespace(v))
+            elif isinstance(v, list):
+                setattr(self, k, [
+                    Namespace(item) if isinstance(item, dict) else item
+                    for item in v
+                ])
+            else:
+                setattr(self, k, v)
+
+    # Both accessors take the field name as a *string*, which is the one
+    # thing RestrictedPython's rewriting cannot see. Routing them through
+    # safer_getattr applies the same rules the compiler applies to
+    # attribute syntax: no underscore-prefixed names, no frame or code
+    # introspection attributes. No RaceState or CarState field starts
+    # with "_" (see engine/serialize.py), so nothing legitimate is lost.
+    def __getitem__(self, key):
+        return safer_getattr(self, key, None)
+
+    def get(self, key, default=None):
+        return safer_getattr(self, key, default)
+
+
+# Everything Namespace itself defines that a key could overwrite. Derived
+# from the class so a method added later is covered without anyone
+# remembering to update a literal.
+NAMESPACE_RESERVED_KEYS = frozenset(
+    name for name in dir(Namespace) if not name.startswith("_")
+)
+
+
+def _is_safe_namespace_key(key) -> bool:
+    """A dict key that may become an attribute of a Namespace.
+
+    Underscore-prefixed names are refused for the same reason
+    `_guarded_getitem` refuses them -- `__class__` is three hops from the
+    real builtins -- and reserved names are refused so no key can shadow the
+    accessors bot code relies on.
+    """
+    return (
+        isinstance(key, str)
+        and not key.startswith("_")
+        and key not in NAMESPACE_RESERVED_KEYS
+    )
+
+
 def _guarded_getitem(obj, key):
     """Subscription guard for `obj[key]` in bot code.
 
@@ -272,31 +342,6 @@ def execute_strategy(
     restricted_globals = build_sandbox_globals(seed=seed, slot=slot)
 
     # Make state and car available as simple namespace objects
-    class Namespace:
-        def __init__(self, d):
-            for k, v in d.items():
-                if isinstance(v, dict):
-                    setattr(self, k, Namespace(v))
-                elif isinstance(v, list):
-                    setattr(self, k, [
-                        Namespace(item) if isinstance(item, dict) else item
-                        for item in v
-                    ])
-                else:
-                    setattr(self, k, v)
-
-        # Both accessors take the field name as a *string*, which is the one
-        # thing RestrictedPython's rewriting cannot see. Routing them through
-        # safer_getattr applies the same rules the compiler applies to
-        # attribute syntax: no underscore-prefixed names, no frame or code
-        # introspection attributes. No RaceState or CarState field starts
-        # with "_" (see engine/serialize.py), so nothing legitimate is lost.
-        def __getitem__(self, key):
-            return safer_getattr(self, key, None)
-
-        def get(self, key, default=None):
-            return safer_getattr(self, key, default)
-
     restricted_globals["state"] = Namespace(state_dict)
     restricted_globals["my_car"] = Namespace(my_car_dict)
 

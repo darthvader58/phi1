@@ -5,20 +5,60 @@ guarantee the determinism contract depends on (spec 5.4).
 """
 
 import random
+
+import pytest
+
+from backend.data.tracks import TRACKS
 from backend.engine.weather import DEFAULT_TRANSITIONS, WeatherEngine
+
+# The order WeatherEngine.step() walks each row, cumulating probabilities
+# against one RNG draw. Written out as a literal rather than derived from
+# any table, so a reordered table is a failure and not a moving target.
+EXPECTED_ORDER = {
+    "dry": ["dry", "damp", "wet"],
+    "damp": ["dry", "damp", "wet"],
+    "wet": ["dry", "damp", "wet"],
+    "drying": ["dry", "damp", "wet", "drying"],
+}
+
+
+def _assert_rows_iterate_in_the_pinned_order(transitions, label):
+    assert set(transitions) == set(EXPECTED_ORDER), f"{label}: state set changed"
+    for state, probs in transitions.items():
+        assert list(probs.keys()) == EXPECTED_ORDER[state], (
+            f"{label}: the {state!r} row iterates in a different order "
+            f"({list(probs.keys())}). step() cumulates probabilities in key "
+            f"order against a single RNG draw, so reordering a row changes "
+            f"which weather that draw selects -- every replay of every "
+            f"existing match then diverges."
+        )
+
+
+@pytest.mark.parametrize("track", sorted(TRACKS), ids=str)
+def test_per_track_transition_tables_iterate_in_a_fixed_order(track):
+    """The tables the determinism contract actually rests on (spec 5.4).
+
+    Every race is built from TRACKS[track].weather_transitions;
+    DEFAULT_TRANSITIONS is only the fallback for a track that defines none,
+    and all six define their own. Pinning the fallback alone left the real
+    tables free to be reordered -- the exact refactor this file exists to
+    catch -- with the whole suite still green.
+    """
+    _assert_rows_iterate_in_the_pinned_order(
+        TRACKS[track].weather_transitions, f"tracks.py:{track}"
+    )
+
+
+def test_every_track_defines_its_own_transition_table():
+    """Otherwise the test above passes vacuously on an empty dict while the
+    track silently races on DEFAULT_TRANSITIONS."""
+    missing = sorted(t for t, cfg in TRACKS.items() if not cfg.weather_transitions)
+    assert not missing, f"tracks with no weather_transitions of their own: {missing}"
 
 
 def test_transition_tables_iterate_in_a_fixed_order():
-    """step() walks probs.keys() cumulatively, so order changes outcomes."""
-    expected_order = {
-        "dry": ["dry", "damp", "wet"],
-        "damp": ["dry", "damp", "wet"],
-        "wet": ["dry", "damp", "wet"],
-        "drying": ["dry", "damp", "wet", "drying"],
-    }
-    assert set(DEFAULT_TRANSITIONS) == set(expected_order), "state set changed"
-    for state, probs in DEFAULT_TRANSITIONS.items():
-        assert list(probs.keys()) == expected_order[state], f"{state} iterates unstably"
+    """The fallback table, still reachable by any track that defines none."""
+    _assert_rows_iterate_in_the_pinned_order(DEFAULT_TRANSITIONS, "DEFAULT_TRANSITIONS")
 
 
 def test_weather_is_reproducible_from_a_seed():
