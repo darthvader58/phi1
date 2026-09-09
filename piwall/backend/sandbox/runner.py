@@ -9,6 +9,7 @@ Runs user-submitted Python strategy functions in a restricted environment:
 """
 
 import math
+import operator
 import os
 import random
 import signal
@@ -64,7 +65,76 @@ ALLOWED_BUILTINS = {
     "False": False,
     "None": None,
     "isinstance": isinstance,
+    # Exception classes. Without these a bot cannot write `except ValueError:`
+    # and is forced into a bare `except:` — which is precisely the construct
+    # that swallows the wall-clock signal, so their absence pushed authors
+    # toward the one pattern the resource limits least want to see.
+    #
+    # BaseException is deliberately NOT here, and must never be added: the
+    # operation budget (BudgetForfeit) and the wall-clock net (_WallClockFired)
+    # are BaseExceptions specifically so `except Exception` cannot swallow
+    # them. Exposing BaseException would let a bot decline its own limits.
+    "Exception": Exception,
+    "ArithmeticError": ArithmeticError,
+    "AttributeError": AttributeError,
+    "IndexError": IndexError,
+    "KeyError": KeyError,
+    "LookupError": LookupError,
+    "RuntimeError": RuntimeError,
+    "StopIteration": StopIteration,
+    "TypeError": TypeError,
+    "ValueError": ValueError,
+    "ZeroDivisionError": ZeroDivisionError,
 }
+
+
+# RestrictedPython rewrites `x += y` into `_inplacevar_('+=', x, y)`, passing
+# the operator as a STRING. The previous guard was `lambda op, x, y: op(x, y)`,
+# which called the string — so every augmented assignment a player wrote failed
+# with "'str' object is not callable".
+#
+# The values are the NON-in-place operators on purpose. operator.iadd would
+# call x.__iadd__, handing control to whatever object the bot holds a reference
+# to; operator.add never invokes it. The cost is value semantics — `a += b` is
+# `a = a + b`, so a list alias does not observe the append — which is a
+# defensible thing for a sandbox to guarantee and is pinned by a test.
+_INPLACE_OPS = {
+    "+=": operator.add,
+    "-=": operator.sub,
+    "*=": operator.mul,
+    "/=": operator.truediv,
+    "//=": operator.floordiv,
+    "%=": operator.mod,
+    "**=": operator.pow,
+    "<<=": operator.lshift,
+    ">>=": operator.rshift,
+    "&=": operator.and_,
+    "|=": operator.or_,
+    "^=": operator.xor,
+}
+
+
+def _guarded_inplacevar(op: str, x, y):
+    """Evaluate an augmented assignment from an allowlist of operators.
+
+    Unknown operators raise rather than falling through: `@=` (matrix multiply)
+    is excluded because nothing a bot can hold implements it and an allowlist
+    that grows by accident is not an allowlist.
+    """
+    try:
+        apply_op = _INPLACE_OPS[op]
+    except KeyError:
+        raise ValueError(f"operator {op!r} is not permitted in strategy code")
+    return apply_op(x, y)
+
+
+def _guarded_apply(fn, *args, **kwargs):
+    """Support f(*args) / f(**kwargs), which RestrictedPython routes here.
+
+    This grants no reach a bot did not already have: fn is whatever it could
+    already name and call directly, and the arguments are its own values.
+    """
+    return fn(*args, **kwargs)
 
 # The wall-clock net for one decision. It is NOT the thing that decides a
 # race: the counted budget in backend/determinism/budget.py is. This exists
@@ -278,7 +348,8 @@ def build_sandbox_globals(seed: int, slot: int) -> dict:
     restricted_globals["_getattr_"] = safer_getattr
     restricted_globals["_getiter_"] = iter
     restricted_globals["_getitem_"] = _guarded_getitem
-    restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
+    restricted_globals["_inplacevar_"] = _guarded_inplacevar
+    restricted_globals["_apply_"] = _guarded_apply
     restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
     restricted_globals["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
     restricted_globals["_write_"] = full_write_guard
@@ -346,7 +417,6 @@ def execute_strategy(
     restricted_globals["my_car"] = Namespace(my_car_dict)
 
     # Execute under the counted budget, with the wall-clock net outside it
-    restricted_locals = {}
 
     # Arm the wall-clock net (Unix, main thread only). The alarm *repeats*:
     # one shot would be a single catchable exception, and a bot is free to
@@ -367,8 +437,20 @@ def execute_strategy(
         whose runaway loop sits at module level costs exactly as much as one
         that hides it in my_strategy, and both must trip the same counter.
         """
-        exec(byte_code, restricted_globals, restricted_locals)
-        strategy_fn = restricted_locals.get("my_strategy")
+        # One namespace, not globals+locals. With two, a module-level `CLIFF =
+        # 12` landed in locals while my_strategy's __globals__ stayed the
+        # globals dict, so the name was invisible inside the function and every
+        # module-level constant or helper raised NameError.
+        #
+        # Merging them is safe ONLY because globals(), vars() and locals() are
+        # unreachable from bot code: a bot that could call globals() could
+        # assign over _getattr_ or __builtins__ in the very dict the guards live
+        # in. RestrictedPython rejects leading-underscore names at compile time,
+        # which closes the direct route; the indirect one stays closed only
+        # while those three builtins stay absent. Both halves are pinned by
+        # tests in tests/sandbox/test_bot_api.py.
+        exec(byte_code, restricted_globals)
+        strategy_fn = restricted_globals.get("my_strategy")
         if strategy_fn is None:
             return _MISSING_STRATEGY
         return strategy_fn(
