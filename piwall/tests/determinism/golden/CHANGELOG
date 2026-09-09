@@ -7,3 +7,11 @@ own -- unreviewable without the reason recorded here.
 
 Do not hand-edit this file. Do not hand-edit `*.expected.txt` either; both
 are written together by the same --record run.
+## 2026-09-09 -- replay now uses per-track weather transitions and safety-car probabilities, matching the production match path
+- bahrain.manifest: sha256:6fb866be9a5b970a43772ee0a9f7d490dbd477985564e3f8031811c5ba534d44 -> sha256:8b2fbbad44ccebc5fbf7b58152d8eea33d4b3ca91cc9d461b51ae4304fe9dc09
+- monaco.manifest: sha256:047f323ac4e9d11a6b44d54caba7e0607a5219de54317d57519c4d322dcd7c4f -> sha256:b1761f40e1a2aff8ca7fedaefb7ffe9ed1f60b3eb6948c0c0489cae6313f68e8
+- monza.manifest: sha256:e01166083fd78497d24eb9c654d2a4f330f148e2475b51dbcd2ebe69b8d2e4a1 -> sha256:01b522cb8de60199557f84b60eb8f618f8c9c3d6790c737bbd707f8bb9b8e367
+- silverstone.manifest: sha256:6c37cfc35ec8cfa73eca861b3113e75f0f3b36e02602f8f6a28eb13729acc9a3 -> sha256:a8098e70140c04e829e90666de3cbbc9116f8c77e50d91fd12a5a78a88bc8728
+- spa.manifest: sha256:163c8e326bd712ae97c43778509b044b76989ca3cb5de6b601fa088e73d02186 -> sha256:ed9e0c9cb448750eeeb082f736104072bfadadf37850c2a6cf8377fb7ee6d470
+- suzuka.manifest: sha256:7e5dfe266a0290b91003ec0740e0fc9c696bc2ce0c718de7691f93e3f6f3502e -> sha256:a3152b5798efe500bacb897e791c895dbeed366fce94fdc61ddb93e6f2d72a27
+
