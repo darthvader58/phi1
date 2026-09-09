@@ -1,0 +1,13 @@
+# Calibration tooling only — never installed into the runner image.
+# scipy's curve_fit results shift across BLAS/LAPACK backends, which is why
+# calibration is an offline build step and its output is committed.
+#
+# These are the exact versions that produced the artifacts committed under
+# piwall/calibration/ (measured from the repo-root .venv that ran
+# scripts/build_calibration.py, not assumed). If you recalibrate under
+# different versions, curve_fit's output can change and so can every lap
+# time — update this comment to the new versions when that happens.
+numpy==2.4.4
+scipy==1.17.1
+fastf1==3.8.2
+matplotlib==3.10.8

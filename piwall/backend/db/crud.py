@@ -283,6 +283,52 @@ def get_elo_history(db, player_id: str, limit: int = 100):
     return [to_namespace(doc) for doc in docs]
 
 
+def save_manifest(db, manifest) -> str:
+    """Write a manifest once. Raises ValueError on any attempt to change it.
+
+    A manifest is the definition of what a match was; rewriting one would
+    invalidate every replay recorded against it without leaving a trace.
+    Re-saving identical content is harmless -- the comparison is on the
+    canonical digest, never on Python object identity or dict ordering.
+    """
+    from dataclasses import asdict
+    from ..determinism.manifest import manifest_sha256
+
+    existing = db.db.manifests.find_one({"match_id": manifest.match_id})
+    digest = manifest_sha256(manifest)
+    if existing:
+        if existing.get("manifest_sha256") != digest:
+            raise ValueError(
+                f"manifest {manifest.match_id} already exists with different content"
+            )
+        return digest
+    db.db.manifests.insert_one({**asdict(manifest), "manifest_sha256": digest})
+    return digest
+
+
+def get_manifest(db, match_id: str):
+    from ..determinism.manifest import MatchManifest
+
+    raw = db.db.manifests.find_one({"match_id": match_id})
+    if not raw:
+        return None
+    raw.pop("_id", None)
+    raw.pop("manifest_sha256", None)
+    raw.pop("replay_sha256", None)
+    return MatchManifest.from_dict(raw)
+
+
+def save_replay_hash(db, match_id: str, replay_sha256: str) -> None:
+    db.db.manifests.update_one(
+        {"match_id": match_id}, {"$set": {"replay_sha256": replay_sha256}}
+    )
+
+
+def get_replay_hash(db, match_id: str):
+    raw = db.db.manifests.find_one({"match_id": match_id})
+    return raw.get("replay_sha256") if raw else None
+
+
 def get_player_race_results(db, player_id: str, limit: int = 50):
     results = list(db.db.race_results.find({"player_id": player_id}).sort("id", -1).limit(limit))
     race_lookup = {

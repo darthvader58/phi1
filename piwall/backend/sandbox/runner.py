@@ -2,12 +2,14 @@
 
 Runs user-submitted Python strategy functions in a restricted environment:
 - No imports except math, random, dataclasses
-- 50ms CPU time limit
+- A counted-operation budget per decision (see backend/determinism/budget.py)
+- A wall-clock net that voids the match rather than deciding its outcome
 - No file/network/system access
 - Returns a Decision object
 """
 
 import math
+import os
 import random
 import signal
 import textwrap
@@ -21,6 +23,13 @@ from RestrictedPython.Guards import (
     guarded_iter_unpack_sequence,
     guarded_unpack_sequence,
     safer_getattr,
+)
+
+from backend.sandbox import isolation
+from backend.determinism.budget import (
+    DEFAULT_DECISION_OPS,
+    BudgetForfeit,
+    run_with_budget,
 )
 
 
@@ -57,13 +66,92 @@ ALLOWED_BUILTINS = {
     "isinstance": isinstance,
 }
 
-# Timeout handler
-class TimeoutError(Exception):
-    pass
+# The wall-clock net for one decision. It is NOT the thing that decides a
+# race: the counted budget in backend/determinism/budget.py is. This exists
+# only for the two shapes the op counter cannot bound --
+#   1. a single line that does unbounded work inside C, e.g.
+#      `x = len(sorted(range(20_000)))` in a loop: 200k line events there
+#      measured ~19s of real work, all of it invisible to the counter;
+#   2. a bot that catches its own forfeit (CPython drops the trace function
+#      as soon as a trace callback raises, so the counter gets one shot).
+# The net is not a single catchable exception -- a bare `except:` would eat
+# that as readily as it eats the forfeit. It repeats, it latches, and in the
+# isolated child a bot still running one interval later is exited outright.
+# _make_wall_clock_handler has the details.
+# Sized far above the ~20ms it takes to burn DEFAULT_DECISION_OPS of ordinary
+# Python, so an honest bot that spends its whole budget is never cut short by
+# the clock. When it does fire the match is voided, never completed.
+DEFAULT_DECISION_WALL_MS = 2000
 
 
-def _timeout_handler(signum, frame):
-    raise TimeoutError("Strategy function exceeded 50ms CPU time limit")
+# Distinguishes "the bot defined no my_strategy" from "my_strategy returned
+# None", without a second pass over restricted_locals outside the budget.
+_MISSING_STRATEGY = object()
+
+
+class _WallClockFired(BaseException):
+    """Raised inside the bot by the SIGALRM handler when the net fires.
+
+    A BaseException, and not the builtin TimeoutError it used to shadow, for
+    two reasons. It must not be reinterpreted by run_with_budget's "the bot
+    swallowed its forfeit" recovery -- a fired net means unbounded time was
+    consumed, which outranks a forfeit and has to void rather than be
+    recorded. And no `except Exception:` between here and execute_strategy
+    should be able to absorb it.
+    """
+
+
+class DecisionTimeout(BaseException):
+    """The wall-clock net fired: this match must be voided, not completed.
+
+    Where it lands depends on elapsed time, so recording it as a decision
+    would put a machine-speed-dependent outcome into the replay -- exactly
+    what the counted budget exists to prevent (spec 5.5). Derived from
+    BaseException so that no `except Exception:` -- not the engine's
+    per-decision handler, not a line of bot code -- can quietly downgrade a
+    void into a completed race.
+    """
+
+
+def _make_wall_clock_handler(timeout_ms: int):
+    """Build the SIGALRM handler for one decision, plus its latch.
+
+    A single alarm is not enough on its own. Raising _WallClockFired into
+    the bot is only a *request* to stop: a bare `except:` in bot code catches it
+    exactly as readily as it catches BudgetForfeit, and RestrictedPython
+    permits bare except. A bot looping inside `try: ... except: pass` ran for
+    45s against an 800ms alarm, because the alarm fired once and its
+    exception was eaten.
+
+    So the alarm repeats, and what actually holds is:
+
+    * the latch. Once the net has fired, `state["fired"]` stays set, so no
+      matter what the bot swallows, the decision is voided the moment control
+      comes back to us -- whether it returns or raises.
+    * the second firing. A bot still running one interval after being told to
+      stop is provably ignoring the signal, and no in-process exception will
+      ever reach it. Inside the isolated child there is one door a bare
+      `except:` cannot cover, and it takes it: the process exits with
+      WALL_CLOCK_VOID_EXITCODE, which isolation.py classifies as the bot's
+      limit breach rather than as a crash of ours.
+
+    Outside the isolated child -- the API process, or a test run -- exiting
+    would take down a process that is not ours to end, so there the handler
+    only keeps raising. Nothing is lost: the API process never executes bots
+    (signal.signal cannot arm off the main thread), and the isolated child is
+    the only place a match actually runs.
+    """
+    state = {"fired": 0}
+
+    def handler(signum, frame):
+        state["fired"] += 1
+        if state["fired"] > 1 and isolation.IN_ISOLATED_CHILD:
+            os._exit(isolation.WALL_CLOCK_VOID_EXITCODE)
+        raise _WallClockFired(
+            f"strategy function exceeded its {timeout_ms}ms wall-clock limit"
+        )
+
+    return handler, state
 
 
 def compile_strategy(code: str) -> Optional[str]:
@@ -87,11 +175,133 @@ def compile_strategy(code: str) -> Optional[str]:
         return f"Compilation error: {e}"
 
 
+class Namespace:
+    """Attribute view over a state dict, handed to bot code as `state`/`my_car`.
+
+    Every key becomes an attribute, and not every key is ours to trust: a
+    car's `beliefs` dict is keyed by *rival car ids*, which are strings
+    another player chose. `setattr(self, "get", ...)` would replace the
+    accessor below for every bot in the race -- the shipped
+    STRATEGY_TEMPLATE calls `my_car.beliefs.get(rival.car_id, {})` -- and
+    `setattr(self, "__class__", ...)` raises TypeError out of the
+    constructor, which runs *before* execute_strategy's try block and so
+    escapes it entirely, aborting the whole match. One join request with a
+    chosen car_id could neutralise every opponent.
+
+    The API constrains car_id at the boundary, but belief keys reach this
+    constructor from more than one path (a replayed manifest, a match spec
+    assembled elsewhere), so unsafe keys are refused here as well. They are
+    dropped rather than raised on: raising from a constructor that sits
+    outside the try block is the failure mode being closed.
+    """
+
+    def __init__(self, d):
+        for k, v in d.items():
+            if not _is_safe_namespace_key(k):
+                continue
+            if isinstance(v, dict):
+                setattr(self, k, Namespace(v))
+            elif isinstance(v, list):
+                setattr(self, k, [
+                    Namespace(item) if isinstance(item, dict) else item
+                    for item in v
+                ])
+            else:
+                setattr(self, k, v)
+
+    # Both accessors take the field name as a *string*, which is the one
+    # thing RestrictedPython's rewriting cannot see. Routing them through
+    # safer_getattr applies the same rules the compiler applies to
+    # attribute syntax: no underscore-prefixed names, no frame or code
+    # introspection attributes. No RaceState or CarState field starts
+    # with "_" (see engine/serialize.py), so nothing legitimate is lost.
+    def __getitem__(self, key):
+        return safer_getattr(self, key, None)
+
+    def get(self, key, default=None):
+        return safer_getattr(self, key, default)
+
+
+# Everything Namespace itself defines that a key could overwrite. Derived
+# from the class so a method added later is covered without anyone
+# remembering to update a literal.
+NAMESPACE_RESERVED_KEYS = frozenset(
+    name for name in dir(Namespace) if not name.startswith("_")
+)
+
+
+def _is_safe_namespace_key(key) -> bool:
+    """A dict key that may become an attribute of a Namespace.
+
+    Underscore-prefixed names are refused for the same reason
+    `_guarded_getitem` refuses them -- `__class__` is three hops from the
+    real builtins -- and reserved names are refused so no key can shadow the
+    accessors bot code relies on.
+    """
+    return (
+        isinstance(key, str)
+        and not key.startswith("_")
+        and key not in NAMESPACE_RESERVED_KEYS
+    )
+
+
+def _guarded_getitem(obj, key):
+    """Subscription guard for `obj[key]` in bot code.
+
+    RestrictedPython rewrites attribute *syntax*, so `state.__class__` is
+    caught at compile time. It never sees a name that arrives as a string at
+    runtime, and `Namespace.__getitem__` maps subscription straight onto
+    getattr -- so `state['__class__']` was attribute access smuggled past the
+    rewriter, and from the class it is three hops to the real builtins and
+    `sys.settrace`. Every underscore-prefixed string key is refused here, and
+    Namespace refuses them again on its own, so neither route relies on the
+    other being right.
+
+    Non-string keys pass straight through: `beliefs[rival_id]`, `cars[0]` and
+    `pit_laps[-1]` are all ordinary indexing.
+    """
+    if isinstance(key, str) and key.startswith("_"):
+        raise KeyError(
+            f'"{key}" is an invalid key because it starts with "_"'
+        )
+    return obj[key]
+
+
+def build_sandbox_globals(seed: int, slot: int) -> dict:
+    """Build the RestrictedPython globals every bot's strategy executes under.
+
+    `seed` and `slot` exist to derive a private `random.Random` stream for
+    this car (see below) -- they carry no other effect on the globals.
+    """
+    restricted_globals = safe_globals.copy()
+    restricted_globals["__builtins__"] = ALLOWED_BUILTINS
+    restricted_globals["_getattr_"] = safer_getattr
+    restricted_globals["_getiter_"] = iter
+    restricted_globals["_getitem_"] = _guarded_getitem
+    restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
+    restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
+    restricted_globals["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
+    restricted_globals["_write_"] = full_write_guard
+
+    restricted_globals["math"] = math
+    # A private stream per slot, derived from the match seed. Binding the
+    # random *module* here gave every bot in the process one shared
+    # generator: draw order then depended on which bots raced alongside
+    # which, so no match could be reproduced from its seed.
+    restricted_globals["random"] = random.Random((seed << 8) ^ slot)
+
+    return restricted_globals
+
+
 def execute_strategy(
     code: str,
     state_dict: dict,
     my_car_dict: dict,
-    timeout_ms: int = 50,
+    timeout_ms: int = DEFAULT_DECISION_WALL_MS,
+    *,
+    seed: int,
+    slot: int,
+    max_ops: int = DEFAULT_DECISION_OPS,
 ) -> dict:
     """Execute a user strategy function in a sandboxed environment.
 
@@ -99,10 +309,24 @@ def execute_strategy(
         code: User's Python code (must define `my_strategy(state, my_car)`)
         state_dict: Serialized RaceState as dict
         my_car_dict: Serialized CarState as dict
-        timeout_ms: CPU time limit in milliseconds
+        timeout_ms: wall-clock net for this decision; see
+            DEFAULT_DECISION_WALL_MS. Not a budget -- exceeding it voids the
+            match instead of producing a decision.
+        seed: Match seed, mixed into this car's private random stream
+        slot: This car's stable index in the match, mixed into its stream
+        max_ops: executed-line budget for this decision. This is the limit
+            that decides races, because where it lands depends only on the
+            code and its inputs.
 
     Returns:
         {"pit": bool, "compound": str} or {"error": str}
+
+    Raises:
+        BudgetForfeit: the bot spent its whole operation budget. Deliberately
+            not swallowed into an {"error": ...}: the caller owns the lap
+            number and car id this happened on, and RaceEngine turns it into
+            a recorded no-op decision plus a "budget_forfeit" replay event.
+        DecisionTimeout: the wall-clock net fired; the match is void.
     """
     try:
         byte_code = compile_restricted(
@@ -115,68 +339,48 @@ def execute_strategy(
     except Exception as e:
         return {"error": f"Compilation error: {e}"}
 
-    # Build restricted globals
-    restricted_globals = safe_globals.copy()
-    restricted_globals["__builtins__"] = ALLOWED_BUILTINS
-    restricted_globals["_getattr_"] = safer_getattr
-    restricted_globals["_getiter_"] = iter
-    restricted_globals["_getitem_"] = lambda obj, key: obj[key]
-    restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
-    restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
-    restricted_globals["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
-    restricted_globals["_write_"] = full_write_guard
-
-    # Inject math and random modules (safe)
-    restricted_globals["math"] = math
-    restricted_globals["random"] = random
+    restricted_globals = build_sandbox_globals(seed=seed, slot=slot)
 
     # Make state and car available as simple namespace objects
-    class Namespace:
-        def __init__(self, d):
-            for k, v in d.items():
-                if isinstance(v, dict):
-                    setattr(self, k, Namespace(v))
-                elif isinstance(v, list):
-                    setattr(self, k, [
-                        Namespace(item) if isinstance(item, dict) else item
-                        for item in v
-                    ])
-                else:
-                    setattr(self, k, v)
-
-        def __getitem__(self, key):
-            return getattr(self, key, None)
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
     restricted_globals["state"] = Namespace(state_dict)
     restricted_globals["my_car"] = Namespace(my_car_dict)
 
-    # Execute with timeout
+    # Execute under the counted budget, with the wall-clock net outside it
     restricted_locals = {}
 
-    # Set alarm for timeout (Unix only)
+    # Arm the wall-clock net (Unix, main thread only). The alarm *repeats*:
+    # one shot would be a single catchable exception, and a bot is free to
+    # catch it. See _make_wall_clock_handler.
+    wall_handler, wall_state = _make_wall_clock_handler(timeout_ms)
     old_handler = None
     try:
-        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        # Convert ms to microseconds for setitimer
-        signal.setitimer(signal.ITIMER_REAL, timeout_ms / 1000.0)
+        old_handler = signal.signal(signal.SIGALRM, wall_handler)
+        seconds = timeout_ms / 1000.0
+        signal.setitimer(signal.ITIMER_REAL, seconds, seconds)
     except (ValueError, AttributeError):
         pass  # Signal not available (Windows, or not main thread)
 
-    try:
-        exec(byte_code, restricted_globals, restricted_locals)
+    def _define_and_decide():
+        """Everything the bot gets to run, under one counted budget.
 
-        # Find and call my_strategy
+        The module body is inside the budget too, not just the call: a bot
+        whose runaway loop sits at module level costs exactly as much as one
+        that hides it in my_strategy, and both must trip the same counter.
+        """
+        exec(byte_code, restricted_globals, restricted_locals)
         strategy_fn = restricted_locals.get("my_strategy")
         if strategy_fn is None:
-            return {"error": "Code must define a function called 'my_strategy'"}
-
-        result = strategy_fn(
+            return _MISSING_STRATEGY
+        return strategy_fn(
             restricted_globals["state"],
             restricted_globals["my_car"],
         )
+
+    try:
+        result, _ops_used = run_with_budget(_define_and_decide, (), max_ops)
+
+        if result is _MISSING_STRATEGY:
+            return {"error": "Code must define a function called 'my_strategy'"}
 
         # Parse result
         if isinstance(result, dict):
@@ -192,8 +396,12 @@ def execute_strategy(
         else:
             return {"error": f"my_strategy must return a dict with 'pit' and 'compound' keys"}
 
-    except TimeoutError:
-        return {"error": "Strategy exceeded 50ms CPU time limit"}
+    except BudgetForfeit:
+        # Explicit, even though BudgetForfeit is a BaseException and the
+        # handler below would not catch it: the forfeit belongs to the
+        # caller, which knows the lap and car it happened to. The latch in
+        # the finally still outranks it.
+        raise
     except Exception as e:
         return {"error": f"Runtime error: {type(e).__name__}: {e}"}
     finally:
@@ -204,6 +412,21 @@ def execute_strategy(
                 signal.signal(signal.SIGALRM, old_handler)
         except (ValueError, AttributeError):
             pass
+
+        # The latch, on *every* way out of a decision: a normal return, a
+        # forfeit, a bot error, the net's own exception. Raising from finally
+        # supersedes whatever was propagating or being returned, which is
+        # exactly the ordering wanted -- a fired net means unbounded time was
+        # consumed, and that outranks every other verdict including a forfeit.
+        #
+        # This lives here rather than in each except branch because the two
+        # bugs found in review were both a branch that forgot to ask. There
+        # is no branch to forget now: the only way past this line is for the
+        # net not to have fired.
+        if wall_state["fired"]:
+            raise DecisionTimeout(
+                f"a decision exceeded the {timeout_ms}ms wall-clock limit"
+            ) from None
 
 
 # Default user strategy template

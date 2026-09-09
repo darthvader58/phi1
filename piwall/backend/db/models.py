@@ -105,6 +105,8 @@ def init_db(db):
     db.elo_history.create_index([("id", ASCENDING)], unique=True)
     db.elo_history.create_index([("player_id", ASCENDING), ("created_at", ASCENDING)])
 
+    db.manifests.create_index([("match_id", ASCENDING)], unique=True)
+
     return lambda: MongoSession(db)
 
 

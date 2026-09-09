@@ -1,0 +1,1 @@
+{"base_lap_time":93.725,"compounds":{"HARD":{"alpha":0.5126,"base_lap_time":93.725,"compound":"HARD","e":1.2111,"k":0.047657,"n_samples":728,"r_squared":0.4085,"track":"bahrain"},"SOFT":{"alpha":0.6115,"base_lap_time":93.893,"compound":"SOFT","e":0.9316,"k":0.068167,"n_samples":292,"r_squared":0.0789,"track":"bahrain"}},"pit_loss_seconds":22.7,"track":"bahrain"}

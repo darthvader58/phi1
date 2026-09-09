@@ -7,9 +7,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ backend/
 
+# Frozen calibration artifacts: committed and content-addressed, read at
+# race-build time by backend/data/calibration_store.py. Without this the
+# image builds and imports fine but every race build fails with
+# FileNotFoundError the moment a match tries to run.
+COPY calibration/ calibration/
+
 # Create cache directories
 RUN mkdir -p fastf1_cache processed_cache
 
 ENV PYTHONPATH=/app
+ENV PYTHONHASHSEED=0
+COPY tests/ ./tests/
+COPY pytest.ini ./pytest.ini
 
 CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

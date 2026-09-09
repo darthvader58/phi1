@@ -13,13 +13,14 @@ degradation signal from the fuel burn-off effect.
 """
 
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 from scipy.optimize import curve_fit
 
+from .calibration_types import TrackCalibration, TyreDegParams
 from .fastf1_loader import (
     load_race_data,
     extract_stint_data,
@@ -29,28 +30,6 @@ from .fastf1_loader import (
 from .tracks import TRACKS, TrackConfig
 
 CALIBRATION_CACHE = Path(__file__).parent.parent.parent / "processed_cache"
-
-
-@dataclass
-class TyreDegParams:
-    """Fitted parameters for a single compound at a single track."""
-    compound: str
-    track: str
-    alpha: float   # Base compound offset (seconds from track base time)
-    k: float       # Degradation rate coefficient
-    e: float       # Degradation exponent
-    r_squared: float  # Goodness of fit
-    n_samples: int    # Number of data points used
-    base_lap_time: float  # Estimated base fuel-corrected lap time
-
-
-@dataclass
-class TrackCalibration:
-    """Full calibration result for a track."""
-    track: str
-    base_lap_time: float
-    pit_loss_seconds: float
-    compounds: Dict[str, TyreDegParams]
 
 
 def _deg_model(age: np.ndarray, alpha: float, k: float, e: float) -> np.ndarray:

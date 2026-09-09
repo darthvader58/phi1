@@ -17,6 +17,7 @@ const EVENT_CONFIG: Record<string, { label: string; color: string; bg: string }>
   weather: { label: "WX", color: "text-cyan-400", bg: "bg-cyan-400/10" },
   penalty: { label: "PEN", color: "text-orange-400", bg: "bg-orange-400/10" },
   undercut: { label: "UCT", color: "text-pink-400", bg: "bg-pink-400/10" },
+  budget_forfeit: { label: "BGT", color: "text-orange-400", bg: "bg-orange-400/10" },
 };
 
 export default function EventLog({ events, maxVisible = 50 }: Props) {

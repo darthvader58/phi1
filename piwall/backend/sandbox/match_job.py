@@ -6,8 +6,10 @@ the whole match from a plain dict, with no reference to server state.
 
 from typing import Any, Dict
 
+from backend.determinism.budget import DEFAULT_DECISION_OPS
 from backend.engine.bots import BUILTIN_BOTS
-from backend.engine.race import Decision, RaceEngine
+from backend.engine.build import build_engine
+from backend.engine.race import Decision
 from backend.sandbox.isolation import (
     DEFAULT_CPU_SECONDS,
     DEFAULT_MEMORY_MB,
@@ -15,13 +17,19 @@ from backend.sandbox.isolation import (
     run_isolated,
 )
 from backend.engine.serialize import car_state_to_dict, race_state_to_dict
-from backend.sandbox.runner import execute_strategy
+from backend.sandbox.runner import DEFAULT_DECISION_WALL_MS, execute_strategy
 
 
-def _make_user_strategy(code: str):
+def _make_user_strategy(code: str, seed: int, slot: int,
+                        max_ops: int = DEFAULT_DECISION_OPS,
+                        timeout_ms: int = DEFAULT_DECISION_WALL_MS):
     def strategy(state, my_car):
+        # BudgetForfeit and DecisionTimeout deliberately travel straight
+        # through: only RaceEngine knows the lap this happened on, and only
+        # it can record the forfeit as a replay event.
         result = execute_strategy(code, race_state_to_dict(state),
-                                  car_state_to_dict(my_car))
+                                  car_state_to_dict(my_car), timeout_ms,
+                                  seed=seed, slot=slot, max_ops=max_ops)
         if "error" in result:
             return Decision(pit=False, compound=my_car.compound)
         return Decision(pit=result["pit"], compound=result["compound"])
@@ -32,28 +40,24 @@ def _make_user_strategy(code: str):
 def run_match(spec: Dict[str, Any]) -> Dict[str, Any]:
     """Run one full match. Module-level and picklable for the spawn context.
 
-    Track physics arrive prebuilt in the spec. The child never calls
-    build_track_physics: that runs a scipy curve fit and writes
-    processed_cache/calibration_<track>.json, and the child sets
-    RLIMIT_FSIZE=0, so the write fails with OSError. Calibrating outside the
-    sandbox is also correct on its own terms -- it keeps an expensive fit off
-    the per-match path and is the seam where Phase 1 swaps in a frozen
-    calibration artifact (spec 5.3).
+    Track physics arrive prebuilt in the spec and are passed to build_engine
+    rather than rebuilt here: building them reads the frozen calibration
+    artifact from disk, and /api/test-bot shortens total_laps on that object
+    before handing it over, so a rebuild in the child would silently restore
+    the full race distance. Everything else about the race -- weather
+    transitions, safety-car probabilities -- build_engine reads from TRACKS
+    under spec["track"], which is the same table the replay runner reads.
     """
-    track = spec["track_physics"]
-    config = spec["track_config"]
-
-    engine = RaceEngine(
-        track=track,
-        weather_transitions=config.weather_transitions,
-        seed=spec["seed"],
-        sc_prob_dry=config.safety_car_prob_dry,
-        sc_prob_wet=config.safety_car_prob_wet,
+    # build_engine, not a hand-rolled RaceEngine(...): the replay runner and
+    # the dev CLI go through the same function, so a race here and its replay
+    # cannot be given different weather or safety-car parameters.
+    engine = build_engine(
+        spec["track"], spec["seed"], track_physics=spec["track_physics"],
     )
 
-    for car in spec["cars"]:
+    for slot, car in enumerate(spec["cars"]):
         if car.get("code"):
-            strategy = _make_user_strategy(car["code"])
+            strategy = _make_user_strategy(car["code"], spec["seed"], slot)
         else:
             strategy = BUILTIN_BOTS[car["bot_id"]]["strategy"]
         engine.add_car(

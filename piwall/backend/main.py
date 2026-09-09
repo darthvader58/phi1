@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo.errors import DuplicateKeyError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -37,12 +37,11 @@ from slowapi.util import get_remote_address
 from .db.models import MongoSession, create_db_engine, init_db, to_namespace
 from .db import crud
 from .data.tracks import TRACKS
-from .data.calibration import calibrate_track
 from .engine.physics import TyreModel, TrackPhysics
 from .engine.race import RaceEngine
 from .engine.bots import BUILTIN_BOTS
-from .engine.cli_runner import build_track_physics
-from .sandbox.runner import STRATEGY_TEMPLATE
+from .engine.build import build_track_physics
+from .sandbox.runner import NAMESPACE_RESERVED_KEYS, STRATEGY_TEMPLATE
 from backend.sandbox.validation import validate_submission
 from backend.sandbox.isolation import ChildFailed, LimitExceeded, MatchAborted
 from backend.sandbox.match_job import run_match_isolated
@@ -259,9 +258,40 @@ class CreateRaceRequest(BaseModel):
     race_type: str = "quick"
     speed: float = 5.0
 
+# A car_id is not just a label: belief dicts are keyed by it, and those keys
+# become attributes of the Namespace object every bot in the race receives
+# (see sandbox/runner.py). An unconstrained one let a player pick a name that
+# shadowed `Namespace.get` -- breaking `my_car.beliefs.get(...)`, the line in
+# the shipped STRATEGY_TEMPLATE, for every *opponent* -- or `__class__`,
+# whose TypeError escapes execute_strategy and aborts the match. Letters,
+# digits, hyphen and underscore only, which is what the house bot ids
+# ("VEL-01") and the generated defaults ("P01") already use. The leading
+# character may not be an underscore, which is what rules out "__class__".
+CAR_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,15}$"
+
+
 class JoinRaceRequest(BaseModel):
-    car_id: Optional[str] = None
+    car_id: Optional[str] = Field(default=None, pattern=CAR_ID_PATTERN)
     starting_compound: str = "MEDIUM"
+
+    @field_validator("car_id")
+    @classmethod
+    def car_id_must_not_shadow_a_namespace_attribute(cls, value):
+        """CAR_ID_PATTERN alone still admits "get", which is a plain word.
+
+        Namespace drops such a key rather than letting it shadow the
+        accessor, so this is not the load-bearing guard -- but a name that
+        would be silently dropped there should be refused here, where the
+        player can still be told about it.
+        """
+        if value is not None and value in NAMESPACE_RESERVED_KEYS:
+            raise ValueError(
+                f"car_id {value!r} is reserved: rival ids become attribute "
+                f"names in every bot's view of the race, and this one would "
+                f"shadow the accessor bots use to read beliefs"
+            )
+        return value
+
 
 class SubmitBotRequest(BaseModel):
     code: str
@@ -582,7 +612,6 @@ def test_bot(request: Request, req: TestBotRequest, x_api_key: str = Header()):
     spec = {
         "track": req.track,
         "track_physics": track,
-        "track_config": track_cfg,
         "seed": random.randint(0, 99999),
         "cars": [{
             "car_id": "USER", "player_id": player["id"], "code": req.code,
@@ -913,7 +942,6 @@ async def _run_race(race_id: str):
     spec = {
         "track": lobby.track,
         "track_physics": track,
-        "track_config": TRACKS[lobby.track],
         "seed": seed,
         "cars": [],
     }
