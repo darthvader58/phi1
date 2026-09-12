@@ -70,11 +70,12 @@ Nothing in the codebase imports Redis yet, though `redis==8.1.0` has been pinned
 **Files:**
 - Create: `piwall/backend/state/__init__.py`
 - Create: `piwall/backend/state/redis_client.py`
+- Modify: `piwall/backend/db/models.py` (add `mongo_url()`)
 - Create: `piwall/tests/state/__init__.py`
 - Test: `piwall/tests/state/test_redis_client.py`
 
 **Interfaces:**
-- Produces: `REDIS_URL: str`, `get_redis() -> redis.Redis`, `redis_is_reachable(timeout: float = 0.5) -> bool`, `close_redis() -> None`
+- Produces: `REDIS_URL: str`, `get_redis() -> redis.Redis`, `redis_is_reachable(timeout: float = 0.5) -> bool`, `close_redis() -> None`, and in `backend/db/models.py`: `mongo_url() -> str`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -257,8 +258,25 @@ Expected: 6 skipped, no errors. If they error, the reachability gate is wrong â€
 
 - [ ] **Step 6: Commit**
 
+Also add to `piwall/backend/db/models.py`, beside the existing `os.environ` reads:
+
+```python
+def mongo_url() -> str:
+    """The Mongo connection string, for callers that must not import main.
+
+    main imports the health router, and the worker imports neither â€” so both
+    need this without reaching back into the API module. Same precedence main
+    itself uses, kept here because this module already owns database config.
+    """
+    return (
+        os.environ.get("MONGODB_URI")
+        or os.environ.get("DATABASE_URL")
+        or "mongodb://127.0.0.1:27017/phi1"
+    )
+```
+
 ```bash
-git add piwall/backend/state/ piwall/tests/state/
+git add piwall/backend/state/ piwall/tests/state/ piwall/backend/db/models.py
 git commit -m "feat: add the single Redis connection factory and a reachability probe"
 ```
 
@@ -621,12 +639,16 @@ health_router = APIRouter(tags=["health"])
 
 
 def _mongo_is_reachable(timeout: float = 0.5) -> bool:
-    """Ping Mongo without importing main and its whole dependency graph."""
-    try:
-        from ..db.models import create_db_engine
-        from ..main import DB_URL
+    """Ping Mongo without importing main.
 
-        engine = create_db_engine(DB_URL)
+    main imports this module's router, so importing main back would be a
+    circular import held apart only by call timing. backend/db/models.py
+    already owns database configuration and imports main nowhere.
+    """
+    try:
+        from ..db.models import create_db_engine, mongo_url
+
+        engine = create_db_engine(mongo_url())
         engine.admin.command("ping")
         return True
     except Exception:
@@ -1676,10 +1698,11 @@ def run_forever(consumer: str = WORKER_NAME) -> None:
     signal.signal(signal.SIGINT, _request_shutdown)
 
     from .db.crud import save_replay_hash
-    from .db.models import create_db_engine, init_db
-    from .main import DB_URL
+    from .db.models import create_db_engine, init_db, mongo_url
 
-    session_factory = init_db(create_db_engine(DB_URL))
+    # mongo_url() rather than importing main: the worker serves no HTTP and
+    # has no business importing FastAPI, slowapi and the whole API surface.
+    session_factory = init_db(create_db_engine(mongo_url()))
 
     def persist(result: dict) -> None:
         db = session_factory()
