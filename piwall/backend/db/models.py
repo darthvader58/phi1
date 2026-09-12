@@ -35,6 +35,20 @@ def create_db_engine(url: str | None = None):
     return db
 
 
+def mongo_url() -> str:
+    """The Mongo connection string, for callers that must not import main.
+
+    main imports the health router, and the worker imports neither -- so both
+    need this without reaching back into the API module. Same precedence main
+    itself uses, kept here because this module already owns database config.
+    """
+    return (
+        os.environ.get("MONGODB_URI")
+        or os.environ.get("DATABASE_URL")
+        or "mongodb://127.0.0.1:27017/phi1"
+    )
+
+
 # MongoDB reports "an index with this name exists but with different options"
 # as IndexOptionsConflict (85); older servers used IndexKeySpecsConflict (86)
 # for the same situation when the key pattern also differed.
