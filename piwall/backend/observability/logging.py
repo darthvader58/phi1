@@ -55,6 +55,23 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+# Third-party loggers that log routine activity at INFO. Before this module
+# raises the root level to INFO, their effective level resolved to root's
+# previous default (WARNING) and that traffic was silent. Raising root to
+# INFO for our own code's benefit would otherwise also unmute every request
+# uvicorn.access logs, every topology event pymongo logs, and every retry
+# urllib3 logs -- none of which anyone asks "what happened to match X" about.
+# Pinned to WARNING here, explicitly, rather than left to inherit root's
+# level, so a future change to root's level cannot silently unmute them
+# again.
+_NOISY_THIRD_PARTY_LOGGERS = (
+    "uvicorn.access",
+    "uvicorn.error",
+    "pymongo",
+    "urllib3",
+)
+
+
 def configure_logging(service: str) -> None:
     """Install the JSON formatter on the root logger, once.
 
@@ -70,6 +87,8 @@ def configure_logging(service: str) -> None:
     handler.setFormatter(JsonFormatter(service))
     root.handlers = [handler]
     root.setLevel(logging.INFO)
+    for name in _NOISY_THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def bind_match(match_id: str) -> None:

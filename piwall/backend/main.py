@@ -145,6 +145,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="PIT WALL", version="0.1.0", lifespan=lifespan)
 
+from .observability.health import health_router
+from .observability.logging import configure_logging
+
+configure_logging("api")
+app.include_router(health_router)
+
 
 def rate_limit_key(request: Request) -> str:
     """Bucket rate limits per player, not per socket address.
