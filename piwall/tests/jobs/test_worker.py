@@ -6,6 +6,8 @@ the worst case is running the match twice, which Phase 1's determinism makes
 harmless: the same manifest yields byte-identical output.
 """
 
+import uuid
+
 import pytest
 
 from backend.jobs.queue import STREAM, MatchJobQueue
@@ -32,12 +34,34 @@ JOB = {"match_id": "m_worker_1", "track": "bahrain", "seed": 1000,
            {"slot": 1, "house_bot": "NXS-07"}]}
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _stream_is_gone_when_this_file_is_done():
+    """Module-level safety net on top of every per-test teardown below.
+
+    Mirrors tests/jobs/test_queue.py's fixture of the same name: the `wiring`
+    fixture already deletes STREAM after each test, but this guarantees one
+    more delete after the *last* test in this file too, so this file can
+    never be the reason the shared stream key survives past it.
+    """
+    yield
+    get_redis().delete(STREAM)
+
+
 @pytest.fixture
 def wiring():
     client = get_redis()
     client.delete(STREAM)
     queue = MatchJobQueue()
-    events = MatchEvents()
+    # An isolated channel per test, exactly like test_events.py's `events`
+    # fixture -- CHANNEL is one fixed name every worker and API replica in
+    # production must share, but that same fixed name means two copies of
+    # this file (or this file and test_events.py) running at once against
+    # this shared Redis would cross-deliver: one test's "here is the event I
+    # expect" could see a different concurrent run's publish, or vice versa.
+    # process_one takes `events` as an argument specifically so a test can do
+    # this without touching worker.py's own default-channel MatchEvents() in
+    # run_forever, which production still needs to keep matching everywhere.
+    events = MatchEvents(channel=f"piwall:events:match:test-{uuid.uuid4()}")
     yield queue, events
     client.delete(STREAM)
 
@@ -127,3 +151,65 @@ def test_a_stalled_job_is_reclaimed_and_completed(wiring):
                            consumer="worker-2", min_idle_ms=0)
     assert match_id == "m_worker_1"
     assert queue.pending_count() == 0
+
+
+def test_the_sandboxed_replay_bytes_match_an_independently_built_replay():
+    """_replay_bytes_from_result must agree, byte for byte, with
+    determinism.replay.replay_bytes -- an independently implemented
+    encoding of the same replay contract.
+
+    test_running_the_same_job_twice_produces_the_same_replay_hash cannot
+    catch a format bug: it only ever compares two hashes produced by the
+    SAME code path, so it is self-satisfying against a change to the
+    payload's shape (a renamed field, a dropped format_version, a dropped
+    manifest -- all invisible to it). This test builds the replay two
+    different, independent ways and checks they land on the same bytes:
+
+    - via_worker: run_match_isolated (the real sandboxed path, crossing a
+      pickle boundary) followed by _replay_bytes_from_result -- exactly what
+      process_one does.
+    - via_engine: build_engine + engine.run() (the same construction
+      replay_from_manifest and scripts/verify_determinism.py exercise)
+      followed by replay_bytes directly.
+
+    via_engine deliberately reads grid position (participant.slot + 1) and
+    seed from the manifest, and car identity/compound from JOB's raw
+    participants -- never from _spec_from_job's output. Comparing against a
+    value _spec_from_job itself produced would let a bug in its own
+    position or seed arithmetic (e.g. hardcoding start_position or seed)
+    cancel out against itself, since both sides would then run the same
+    wrong race and still agree.
+    """
+    from backend.determinism.replay import replay_bytes
+    from backend.engine.bots import BUILTIN_BOTS
+    from backend.engine.build import build_engine
+    from backend.sandbox.match_job import _make_user_strategy, run_match_isolated
+    from backend.worker import _manifest_from_job, _spec_from_job, _replay_bytes_from_result
+
+    manifest = _manifest_from_job(JOB)
+    spec = _spec_from_job(JOB)
+
+    via_worker = _replay_bytes_from_result(run_match_isolated(spec), manifest)
+
+    participants_by_slot = {int(p["slot"]): p for p in JOB["participants"]}
+    engine = build_engine(manifest.track, manifest.seed)
+    for participant in sorted(manifest.participants, key=lambda p: p.slot):
+        raw = participants_by_slot[participant.slot]
+        house_bot = raw.get("house_bot")
+        if raw.get("code"):
+            strategy = _make_user_strategy(raw["code"], manifest.seed, participant.slot)
+            starting_compound = raw.get("starting_compound", "MEDIUM")
+        else:
+            bot = BUILTIN_BOTS[house_bot]
+            strategy = bot["strategy"]
+            starting_compound = bot["starting_compound"]
+        engine.add_car(
+            car_id=raw.get("car_id") or house_bot,
+            player_id=raw.get("player_id") or house_bot,
+            strategy=strategy,
+            starting_position=participant.slot + 1,
+            starting_compound=starting_compound,
+        )
+    via_engine = replay_bytes(engine.run(), manifest)
+
+    assert via_worker == via_engine

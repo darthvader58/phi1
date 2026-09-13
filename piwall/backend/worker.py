@@ -15,12 +15,14 @@ import hashlib
 import os
 import signal
 import socket
+import time
 from dataclasses import asdict
 from typing import Callable, Optional
 
 from .determinism.canonical import canonical_json
 from .determinism.manifest import Participant, build_manifest
 from .determinism.replay import REPLAY_FORMAT_VERSION
+from .engine.bots import BUILTIN_BOTS
 from .sandbox.match_job import run_match_isolated
 from .jobs.events import MatchEvents
 from .jobs.queue import MatchJobQueue
@@ -32,11 +34,31 @@ WORKER_NAME = f"{socket.gethostname()}-{os.getpid()}"
 
 _shutting_down = False
 
+# Cap for run_forever's exponential backoff after a failed process_one --
+# e.g. Redis unreachable. Without a cap, a long-broken dependency would push
+# the delay towards minutes; 30s is well inside "an operator will notice and
+# is watching logs anyway" territory.
+_MAX_BACKOFF_SECONDS = 30.0
+_BACKOFF_STEP_SECONDS = 0.5
+
 
 def _request_shutdown(_signum, _frame) -> None:
     """Finish the job in hand, then stop. Never abandon a claimed match."""
     global _shutting_down
     _shutting_down = True
+
+
+def _sleep_unless_shutting_down(seconds: float) -> None:
+    """Sleep in short steps, stopping early if a shutdown signal lands.
+
+    A single time.sleep(seconds) would make SIGTERM/SIGINT during backoff
+    wait out the whole delay before the main loop checks _shutting_down
+    again; stepping keeps shutdown responsive even while backing off.
+    """
+    remaining = seconds
+    while remaining > 0 and not _shutting_down:
+        time.sleep(min(_BACKOFF_STEP_SECONDS, remaining))
+        remaining -= _BACKOFF_STEP_SECONDS
 
 
 def _manifest_from_job(job: dict):
@@ -77,16 +99,26 @@ def _spec_from_job(job: dict) -> dict:
     }
     for participant in sorted(job["participants"], key=lambda p: int(p["slot"])):
         position = int(participant["slot"]) + 1
+        house_bot = participant.get("house_bot")
+        # A house bot's starting compound is fixed per bot (three of the five
+        # builtins start on SOFT, not MEDIUM) -- both replay_from_manifest and
+        # main.py read it from BUILTIN_BOTS rather than defaulting it, and this
+        # spec must agree or it simulates a different race on the same seed.
+        # "MEDIUM" is only a real default for a player car, which has no such
+        # fixed compound of its own.
+        default_compound = (
+            BUILTIN_BOTS[house_bot]["starting_compound"] if house_bot else "MEDIUM"
+        )
         car = {
-            "car_id": participant.get("car_id") or participant.get("house_bot"),
-            "player_id": participant.get("player_id") or participant.get("house_bot"),
+            "car_id": participant.get("car_id") or house_bot,
+            "player_id": participant.get("player_id") or house_bot,
             "start_position": position,
-            "starting_compound": participant.get("starting_compound", "MEDIUM"),
+            "starting_compound": participant.get("starting_compound", default_compound),
         }
         if participant.get("code"):
             car["code"] = participant["code"]
-        elif participant.get("house_bot"):
-            car["bot_id"] = participant["house_bot"]
+        elif house_bot:
+            car["bot_id"] = house_bot
         spec["cars"].append(car)
     return spec
 
@@ -186,7 +218,19 @@ def run_forever(consumer: str = WORKER_NAME) -> None:
     def persist(result: dict) -> None:
         db = session_factory()
         try:
-            save_replay_hash(db, result["match_id"], result["replay_sha256"])
+            update = save_replay_hash(db, result["match_id"], result["replay_sha256"])
+            if update.matched_count == 0:
+                # save_replay_hash is update-only and never upserts, so a
+                # match_id with no manifest document already means this
+                # write touched nothing. "Ack only after the result is
+                # durable" is enforced here, not just in ordering: silently
+                # continuing would let process_one persist(), publish() and
+                # ack() a job whose result was never actually written down.
+                raise RuntimeError(
+                    f"save_replay_hash matched no manifest document for "
+                    f"match {result['match_id']!r} -- refusing to treat "
+                    f"this result as persisted"
+                )
         finally:
             db.close()
 
@@ -195,13 +239,24 @@ def run_forever(consumer: str = WORKER_NAME) -> None:
     # redundant BUSYGROUP round trip on every single claim.
     queue, events = MatchJobQueue(), MatchEvents()
     log.info("worker ready")
+    consecutive_failures = 0
     while not _shutting_down:
         try:
             process_one(queue, events, persist, consumer=consumer)
+            consecutive_failures = 0
         except Exception:
             # An unacked job stays pending and is reclaimed; a crashed
             # worker loop would stop draining the queue entirely.
             log.exception("job failed, leaving it pending for reclaim")
+            consecutive_failures += 1
+            # Backoff, not a bare retry: with Redis unreachable, a bare
+            # `while not _shutting_down: try/except` loop spins as fast as
+            # the exception can be raised and caught -- millions of
+            # iterations a second, logging a traceback on every one. The
+            # sleep is broken into short steps and re-checks _shutting_down
+            # between them so a signal during backoff still stops promptly
+            # instead of waiting out the full delay.
+            _sleep_unless_shutting_down(min(2 ** consecutive_failures, _MAX_BACKOFF_SECONDS))
     log.info("worker stopped")
 
 

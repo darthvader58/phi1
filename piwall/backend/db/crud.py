@@ -318,8 +318,16 @@ def get_manifest(db, match_id: str):
     return MatchManifest.from_dict(raw)
 
 
-def save_replay_hash(db, match_id: str, replay_sha256: str) -> None:
-    db.db.manifests.update_one(
+def save_replay_hash(db, match_id: str, replay_sha256: str):
+    """Record a replay's hash against its manifest.
+
+    Returns the raw UpdateResult (matched_count == 0 means no manifest
+    document exists for match_id yet, since this is update-only and never
+    upserts) so a caller that must not treat this as durable unless a row
+    was actually touched -- the worker, ack-ing only once persistence is
+    real -- can check that itself instead of trusting a silent no-op.
+    """
+    return db.db.manifests.update_one(
         {"match_id": match_id}, {"$set": {"replay_sha256": replay_sha256}}
     )
 

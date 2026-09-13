@@ -20,6 +20,24 @@ pytestmark = pytest.mark.skipif(
 JOB = {"match_id": "m_test_1", "track": "bahrain", "seed": "1000"}
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _stream_is_gone_when_this_file_is_done():
+    """A module-level safety net on top of every per-test teardown below.
+
+    Each test's own `queue` fixture (or, for the one test that skips it,
+    its own try/finally) already deletes STREAM after itself. This adds one
+    more delete after the *last* test in the file, so a stream created by
+    this file can never survive past it even if some single test's own
+    cleanup were ever skipped -- a raised BaseException that unwinds past a
+    fixture's teardown, or this file run standalone against a Redis a
+    concurrent process is also using and momentarily racing this module's
+    own per-test deletes. Belt and suspenders: cheap, and it can't make a
+    passing run behave any differently.
+    """
+    yield
+    get_redis().delete(STREAM)
+
+
 @pytest.fixture
 def queue():
     client = get_redis()

@@ -76,9 +76,20 @@ class MatchJobQueue:
         The idle threshold is the whole safety margin: too low and a live
         worker's job gets stolen mid-match, too high and a crashed worker's
         match waits. 30s default is well above a match's runtime.
+
+        count=1, not a larger batch: XAUTOCLAIM reassigns every entry it
+        returns to `consumer` and resets each one's idle timer, whether or
+        not the caller goes on to process it. A caller that only acts on the
+        first entry of a bigger batch (this queue's only caller, worker.py's
+        process_one, processes one match per call) would silently strand the
+        rest -- reassigned to a consumer that never touches them, with a
+        freshly reset idle timer, unreachable by reclaim_stalled again until
+        another full min_idle_ms passes. One entry per call means nothing is
+        ever claimed without also being handed back to a caller that acts on
+        it immediately.
         """
         _next, entries, _deleted = self._redis.xautoclaim(
-            STREAM, GROUP, consumer, min_idle_time=min_idle_ms, count=10
+            STREAM, GROUP, consumer, min_idle_time=min_idle_ms, count=1
         )
         return [(eid, json.loads(f["payload"])) for eid, f in entries]
 
