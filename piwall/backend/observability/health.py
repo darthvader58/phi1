@@ -16,20 +16,40 @@ health_router = APIRouter(tags=["health"])
 
 
 def _mongo_is_reachable(timeout: float = 0.5) -> bool:
-    """Ping Mongo without importing main.
+    """Ping Mongo without importing main, and without leaking a connection.
 
     main imports this module's router, so importing main back would be a
     circular import held apart only by call timing. backend/db/models.py
     already owns database configuration and imports main nowhere.
-    """
-    try:
-        from ..db.models import create_db_engine, mongo_url
 
-        engine = create_db_engine(mongo_url())
-        engine.command("ping")
+    Builds its own short-lived client rather than reusing create_db_engine()'s
+    long-lived one: this runs on every /ready poll, and every other caller of
+    create_db_engine builds one at startup and holds it for the process
+    lifetime. A fresh, never-closed client per call leaks three background
+    threads (server monitor, kill-cursors, RTT) per call, forever. The
+    timeout is threaded into the client for the same reason redis_is_reachable
+    threads it into its probe: pymongo's default serverSelectionTimeoutMS is
+    30 seconds, and a readiness probe that takes 30 seconds to say "no" reads
+    to an orchestrator as a hung process.
+    """
+    from pymongo import MongoClient
+
+    from ..db.models import mongo_url
+
+    client = None
+    try:
+        client = MongoClient(
+            mongo_url(),
+            serverSelectionTimeoutMS=int(timeout * 1000),
+            connectTimeoutMS=int(timeout * 1000),
+        )
+        client.admin.command("ping")
         return True
     except Exception:
         return False
+    finally:
+        if client is not None:
+            client.close()
 
 
 def check_dependencies() -> dict:

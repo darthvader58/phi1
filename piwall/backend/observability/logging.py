@@ -58,15 +58,19 @@ class JsonFormatter(logging.Formatter):
 # Third-party loggers that log routine activity at INFO. Before this module
 # raises the root level to INFO, their effective level resolved to root's
 # previous default (WARNING) and that traffic was silent. Raising root to
-# INFO for our own code's benefit would otherwise also unmute every request
-# uvicorn.access logs, every topology event pymongo logs, and every retry
-# urllib3 logs -- none of which anyone asks "what happened to match X" about.
-# Pinned to WARNING here, explicitly, rather than left to inherit root's
-# level, so a future change to root's level cannot silently unmute them
-# again.
+# INFO for our own code's benefit would otherwise also unmute every topology
+# event pymongo logs and every retry urllib3 logs -- none of which anyone
+# asks "what happened to match X" about. uvicorn.access is included for the
+# same reason but for a different tradeoff: per-request access logging is
+# deliberately left to the ingress layer (the load balancer / reverse proxy
+# in front of these replicas already logs each request), not treated as
+# free to keep. uvicorn.error is deliberately NOT in this list -- it is
+# where uvicorn's startup/shutdown banner and worker errors are logged, and
+# quieting it would suppress a real signal, not noise. Pinned to WARNING
+# here, explicitly, rather than left to inherit root's level, so a future
+# change to root's level cannot silently unmute them again.
 _NOISY_THIRD_PARTY_LOGGERS = (
     "uvicorn.access",
-    "uvicorn.error",
     "pymongo",
     "urllib3",
 )

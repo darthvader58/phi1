@@ -85,3 +85,26 @@ def test_check_dependencies_returns_both_flags(monkeypatch):
     monkeypatch.setattr(mod, "redis_is_reachable", lambda **kw: True)
     monkeypatch.setattr(mod, "_mongo_is_reachable", lambda **kw: False)
     assert check_dependencies() == {"redis": True, "mongo": False}
+
+
+def test_mongo_probe_is_false_and_fast_for_a_dead_address(monkeypatch):
+    """The Mongo probe must not reuse the long-lived client or its defaults.
+
+    Mirrors tests/state/test_redis_client.py::test_reachability_is_false_for_a_dead_address.
+    pymongo's default serverSelectionTimeoutMS is 30 seconds; a readiness
+    probe that takes 30 seconds to say "no" reads to an orchestrator as a
+    hung process, not a fast, cheap check that failed.
+    """
+    import time
+
+    import backend.db.models as models
+    from backend.observability.health import _mongo_is_reachable
+
+    monkeypatch.setattr(models, "mongo_url", lambda: "mongodb://127.0.0.1:59999/dead")
+
+    start = time.monotonic()
+    result = _mongo_is_reachable(timeout=0.2)
+    elapsed = time.monotonic() - start
+
+    assert result is False
+    assert elapsed < 5, f"probe took {elapsed:.2f}s -- the timeout is not being honored"
