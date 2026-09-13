@@ -8,6 +8,7 @@ reclaim_stalled possible.
 """
 
 import pytest
+from redis.exceptions import ResponseError
 
 from backend.jobs.queue import GROUP, STREAM, MatchJobQueue
 from backend.state.redis_client import get_redis, redis_is_reachable
@@ -113,3 +114,21 @@ def test_creating_the_group_twice_is_harmless(queue):
     MatchJobQueue()
     MatchJobQueue()
     assert get_redis().xinfo_groups(STREAM)[0]["name"] == GROUP
+
+
+def test_ensure_group_does_not_swallow_a_non_busygroup_error():
+    """The BUSYGROUP-only guard is not decorative.
+
+    Widen it to a bare `except ResponseError: pass` and a stream key of the
+    wrong type stops raising: construction "succeeds" and the queue is
+    silently empty forever, instead of the worker crashing loudly on a
+    genuinely broken stream at startup.
+    """
+    client = get_redis()
+    client.delete(STREAM)
+    client.set(STREAM, "not a stream")
+    try:
+        with pytest.raises(ResponseError, match="WRONGTYPE"):
+            MatchJobQueue()
+    finally:
+        client.delete(STREAM)
