@@ -31,12 +31,19 @@ _SUBSCRIBE_CONFIRM_TIMEOUT = 5.0
 
 
 class MatchEvents:
-    def __init__(self, redis_client=None):
+    def __init__(self, redis_client=None, channel: str = CHANNEL):
+        """`channel` defaults to the production `CHANNEL` and should stay that
+        way for real callers — a worker and an API replica are deployed
+        separately and must agree on one name. The parameter exists so tests
+        can run several copies of themselves against the same shared Redis
+        without a channel collision; it is not meant to vary in production.
+        """
         self._redis = redis_client or get_redis()
+        self._channel = channel
 
     def publish(self, event: dict) -> int:
         """Publish one event. Returns the number of subscribers that got it."""
-        return int(self._redis.publish(CHANNEL, json.dumps(event)))
+        return int(self._redis.publish(self._channel, json.dumps(event)))
 
     def subscribe(self):
         """Subscribe to the channel. Caller owns closing the returned pubsub.
@@ -53,7 +60,7 @@ class MatchEvents:
         confirmation from ever surfacing to callers of `listen()`.
         """
         pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
-        pubsub.subscribe(CHANNEL)
+        pubsub.subscribe(self._channel)
         pubsub.get_message(timeout=_SUBSCRIBE_CONFIRM_TIMEOUT)
         return pubsub
 

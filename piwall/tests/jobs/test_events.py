@@ -6,6 +6,8 @@ shape because delivery is to every subscriber (each replica has its own
 sockets to serve) rather than to one consumer.
 """
 
+import uuid
+
 import pytest
 
 from backend.jobs.events import CHANNEL, MatchEvents
@@ -18,7 +20,20 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def events():
-    return MatchEvents()
+    """A fresh, uniquely-named channel per test.
+
+    `CHANNEL` is one fixed name shared by every worker and API replica in
+    production, which is the point of a constant — they have to agree on it.
+    But that same fixed name means two copies of this file running at once
+    (this Redis is shared with other processes on the machine, and CI can run
+    suites concurrently) would subscribe to and publish on the same channel
+    and cross-deliver each other's events: a "nothing was published" check in
+    one run would see the other run's publish, and a "here is the message I
+    just sent" check would see a message the wrong run sent. A random channel
+    per test isolates each test from every other test and every other
+    process, while leaving the production CHANNEL untouched.
+    """
+    return MatchEvents(channel=f"piwall:events:match:test-{uuid.uuid4()}")
 
 
 def test_a_subscriber_receives_a_published_event(events):
