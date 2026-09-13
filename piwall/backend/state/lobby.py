@@ -11,8 +11,13 @@ Redis. Each replica keeps its own set and learns when to use it from the
 pub/sub events in backend/jobs/events.py.
 
 Fields are stored as a JSON document under one key rather than as a Redis hash
-of loose fields, because a lobby is read as a whole and a hash would invite
-partial reads that see a half-updated lobby.
+of loose fields. Redis is single-threaded and HGETALL is atomic, so that is
+not about partial reads — it is because one key keeps the TTL and `delete`
+semantics simple: a hash of loose fields would mean separate expirations and
+a multi-field delete to get the same guarantee. The document is always read
+whole, and every mutating write goes through a Lua script (below) rather than
+a client-side get-modify-set, so the read-modify-write itself is atomic too:
+two replicas racing to mutate the same lobby cannot lose one of their writes.
 """
 
 import json
@@ -27,12 +32,47 @@ OPEN_STATUSES = ("lobby", "countdown", "running")
 # is far longer than any match and short enough that a leak is self-healing.
 TTL_SECONDS = 6 * 60 * 60
 
+# A client-side GET, modify in Python, SET is correct with one process and
+# wrong with two: replica A's GET can be followed by replica B's complete
+# GET-modify-SET, after which replica A's SET writes back a version that
+# never saw B's change, overwriting it — a lost update, and nothing raises.
+# This script runs the whole get-decode-modify-encode-set cycle as one
+# atomic step inside Redis (Redis is single-threaded and EVAL blocks the
+# keyspace only for the script's own duration), so there is no window for
+# another replica's write to land in between.
+#
+# KEYS[1] = the lobby key
+# ARGV[1] = TTL seconds, re-applied on every write so a mutation refreshes it
+# ARGV[2] = "field" to set a top-level field, or "player" to set one player
+# ARGV[3] = the field name (mode "field") or player id (mode "player")
+# ARGV[4] = the new value, JSON-encoded
+#
+# Returns false (-> None in Python) if the lobby does not exist, else 1.
+_MUTATE_SCRIPT = """
+local raw = redis.call('GET', KEYS[1])
+if raw == false then
+    return false
+end
+local lobby = cjson.decode(raw)
+if ARGV[2] == 'player' then
+    if lobby.players == nil then
+        lobby.players = {}
+    end
+    lobby.players[ARGV[3]] = cjson.decode(ARGV[4])
+else
+    lobby[ARGV[3]] = cjson.decode(ARGV[4])
+end
+redis.call('SET', KEYS[1], cjson.encode(lobby), 'EX', ARGV[1])
+return 1
+"""
+
 
 class LobbyStore:
     """Reads and writes lobby documents. Safe to instantiate per request."""
 
     def __init__(self, redis_client=None):
         self._redis = redis_client or get_redis()
+        self._mutate = self._redis.register_script(_MUTATE_SCRIPT)
 
     def _key(self, race_id: str) -> str:
         return f"{KEY_PREFIX}{race_id}"
@@ -51,36 +91,46 @@ class LobbyStore:
 
     def get(self, race_id: str) -> Optional[dict]:
         raw = self._redis.get(self._key(race_id))
-        return json.loads(raw) if raw else None
+        return self._decode(raw) if raw else None
+
+    def _decode(self, raw: str) -> dict:
+        lobby = json.loads(raw)
+        # Redis has no float type; a whole-number speed (5.0) comes back
+        # from Lua/JSON as the int 5, and 11.0 / 5 behaves very differently
+        # from 11.0 / 5.0 the moment someone divides by it. Restoring the
+        # type here, once, means every caller gets a real float regardless
+        # of how the value happened to be encoded on the way in.
+        if "speed" in lobby:
+            lobby["speed"] = float(lobby["speed"])
+        return lobby
 
     def _write(self, lobby: dict) -> None:
         self._redis.set(
             self._key(lobby["race_id"]), json.dumps(lobby), ex=TTL_SECONDS
         )
 
-    def _require(self, race_id: str) -> dict:
+    def _atomic_set(self, race_id: str, mode: str, name: str, value) -> None:
+        ok = self._mutate(
+            keys=[self._key(race_id)],
+            args=[TTL_SECONDS, mode, name, json.dumps(value)],
+        )
+        if not ok:
+            raise KeyError(f"no lobby {race_id!r}")
+
+    def set_status(self, race_id: str, status: str) -> None:
+        self._atomic_set(race_id, "field", "status", status)
+
+    def set_speed(self, race_id: str, speed: float) -> None:
+        self._atomic_set(race_id, "field", "speed", float(speed))
+
+    def add_player(self, race_id: str, player_id: str, data: dict) -> None:
+        self._atomic_set(race_id, "player", player_id, data)
+
+    def players(self, race_id: str) -> dict:
         lobby = self.get(race_id)
         if lobby is None:
             raise KeyError(f"no lobby {race_id!r}")
-        return lobby
-
-    def set_status(self, race_id: str, status: str) -> None:
-        lobby = self._require(race_id)
-        lobby["status"] = status
-        self._write(lobby)
-
-    def set_speed(self, race_id: str, speed: float) -> None:
-        lobby = self._require(race_id)
-        lobby["speed"] = float(speed)
-        self._write(lobby)
-
-    def add_player(self, race_id: str, player_id: str, data: dict) -> None:
-        lobby = self._require(race_id)
-        lobby["players"][player_id] = data
-        self._write(lobby)
-
-    def players(self, race_id: str) -> dict:
-        return self._require(race_id)["players"]
+        return lobby["players"]
 
     def list_open(self) -> list:
         """Every lobby not yet finished or aborted.
@@ -93,7 +143,7 @@ class LobbyStore:
             raw = self._redis.get(key)
             if not raw:
                 continue
-            lobby = json.loads(raw)
+            lobby = self._decode(raw)
             if lobby.get("status") in OPEN_STATUSES:
                 out.append(lobby)
         return sorted(out, key=lambda l: l["race_id"])
