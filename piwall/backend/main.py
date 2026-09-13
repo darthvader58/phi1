@@ -16,6 +16,7 @@ Endpoints:
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -34,39 +35,36 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from .db.models import MongoSession, create_db_engine, init_db, to_namespace
+from .db.models import MongoSession, create_db_engine, init_db
 from .db import crud
 from .data.tracks import TRACKS
+from .determinism.manifest import Participant, build_manifest
 from .engine.physics import TyreModel, TrackPhysics
-from .engine.race import RaceEngine
 from .engine.bots import BUILTIN_BOTS
 from .engine.build import build_track_physics
+from .jobs.events import MatchEvents
+from .jobs.queue import MatchJobQueue
 from .sandbox.runner import NAMESPACE_RESERVED_KEYS, STRATEGY_TEMPLATE
+from .state.lobby import LobbyStore
 from backend.sandbox.validation import validate_submission
-from backend.sandbox.isolation import ChildFailed, LimitExceeded, MatchAborted
+from backend.sandbox.isolation import ChildFailed, LimitExceeded
 from backend.sandbox.match_job import run_match_isolated
-from .season.elo import compute_elo_updates
 
 
-# ─── State management (in-memory, Redis replacement for MVP) ─────────
+# ─── State management ──────────────────────────────────────────────────
 
-class RaceLobby:
-    """In-memory race lobby state."""
-    def __init__(self, race_id: str, track: str, race_type: str = "quick"):
-        self.race_id = race_id
-        self.track = track
-        self.race_type = race_type
-        self.players: Dict[str, dict] = {}  # player_id -> {username, car_id, code, ...}
-        self.status = "lobby"  # lobby/countdown/running/finished
-        self.engine: Optional[RaceEngine] = None
-        self.result = None
-        self.websockets: Set[WebSocket] = set()
-        self.speed = 1.0  # 1x / 5x / 20x
-        self.current_state: Optional[dict] = None
+# Lobby state lives in Redis so both API replicas see the same lobby. A
+# lobby is a plain dict (fields: race_id, track, race_type, status, speed,
+# players) — this replaces active_lobbies, a module-global dict invisible
+# to any replica that did not happen to create or mutate a given lobby.
+LOBBIES = LobbyStore()
+JOBS = MatchJobQueue()
+EVENTS = MatchEvents()
 
-
-# Global state
-active_lobbies: Dict[str, RaceLobby] = {}
+# This replica's own WebSocket connections, keyed by race id. Deliberately
+# NOT in Redis: a socket is a live object owned by one process. Each replica
+# serves the clients attached to it and learns when to do so from EVENTS.
+SOCKETS: Dict[str, Set[WebSocket]] = {}
 
 logger = logging.getLogger("piwall")
 
@@ -139,7 +137,16 @@ async def lifespan(app: FastAPI):
             "on both the backend and the Next.js server to open registration."
         )
     _session_factory = init_db(db_engine)
+    # Relays finished-match events to whichever sockets this replica holds.
+    # Runs on every replica; cancelled on shutdown so it never outlives the
+    # app it belongs to.
+    event_task = asyncio.create_task(_relay_match_events())
     yield
+    event_task.cancel()
+    try:
+        await event_task
+    except asyncio.CancelledError:
+        pass
     print("PIT WALL shutting down...")
 
 
@@ -359,9 +366,8 @@ def create_race(request: Request, req: CreateRaceRequest, x_api_key: str = Heade
 
         race = crud.create_race(db, req.track, req.race_type, season_id=season_id,
                                 owner_id=player["id"])
-        lobby = RaceLobby(race.id, req.track, req.race_type)
-        lobby.speed = req.speed
-        active_lobbies[race.id] = lobby
+        LOBBIES.create(race.id, track=req.track, race_type=req.race_type)
+        LOBBIES.set_speed(race.id, req.speed)
         return {"race_id": race.id, "track": req.track, "status": "lobby",
                 "race_type": req.race_type, "season_id": season_id}
     finally:
@@ -371,31 +377,32 @@ def create_race(request: Request, req: CreateRaceRequest, x_api_key: str = Heade
 @app.post("/api/race/{race_id}/join")
 def join_race(race_id: str, req: JoinRaceRequest, x_api_key: str = Header()):
     player = authenticate(x_api_key)
-    lobby = active_lobbies.get(race_id)
+    lobby = LOBBIES.get(race_id)
     if not lobby:
         raise HTTPException(404, "Race not found")
-    if lobby.status != "lobby":
+    if lobby["status"] != "lobby":
         raise HTTPException(400, "Race already started")
-    if len(lobby.players) >= 8:
+    player_count = len(lobby["players"])
+    if player_count >= 8:
         raise HTTPException(400, "Race is full (8 players max)")
 
-    car_id = req.car_id or f"P{len(lobby.players) + 1:02d}"
-    lobby.players[player["id"]] = {
+    car_id = req.car_id or f"P{player_count + 1:02d}"
+    LOBBIES.add_player(race_id, player["id"], {
         "username": player["username"],
         "car_id": car_id,
         "code": STRATEGY_TEMPLATE,
         "starting_compound": req.starting_compound,
-    }
-    return {"car_id": car_id, "position": len(lobby.players)}
+    })
+    return {"car_id": car_id, "position": player_count + 1}
 
 
 @app.post("/api/race/{race_id}/submit-bot")
 def submit_bot(race_id: str, req: SubmitBotRequest, x_api_key: str = Header()):
     player = authenticate(x_api_key)
-    lobby = active_lobbies.get(race_id)
+    lobby = LOBBIES.get(race_id)
     if not lobby:
         raise HTTPException(404, "Race not found")
-    if player["id"] not in lobby.players:
+    if player["id"] not in lobby["players"]:
         raise HTTPException(400, "Not in this race")
 
     # Validate code
@@ -403,7 +410,9 @@ def submit_bot(race_id: str, req: SubmitBotRequest, x_api_key: str = Header()):
     if error:
         raise HTTPException(400, error)
 
-    lobby.players[player["id"]]["code"] = req.code
+    player_data = dict(lobby["players"][player["id"]])
+    player_data["code"] = req.code
+    LOBBIES.add_player(race_id, player["id"], player_data)
 
     # Save to DB
     db = SessionLocal()
@@ -412,16 +421,16 @@ def submit_bot(race_id: str, req: SubmitBotRequest, x_api_key: str = Header()):
     finally:
         db.close()
 
-    return {"status": "submitted", "car_id": lobby.players[player["id"]]["car_id"]}
+    return {"status": "submitted", "car_id": player_data["car_id"]}
 
 
 @app.post("/api/race/{race_id}/start")
 async def start_race(race_id: str, x_api_key: str = Header()):
     player = authenticate(x_api_key)
-    lobby = active_lobbies.get(race_id)
+    lobby = LOBBIES.get(race_id)
     if not lobby:
         raise HTTPException(404, "Race not found")
-    if lobby.status != "lobby":
+    if lobby["status"] != "lobby":
         raise HTTPException(400, "Race already started")
 
     db = SessionLocal()
@@ -434,7 +443,7 @@ async def start_race(race_id: str, x_api_key: str = Header()):
     if getattr(race, "owner_id", None) not in (None, player["id"]):
         raise HTTPException(403, "Only the race owner can start this race")
 
-    lobby.status = "countdown"
+    LOBBIES.set_status(race_id, "countdown")
 
     db = SessionLocal()
     try:
@@ -449,16 +458,17 @@ async def start_race(race_id: str, x_api_key: str = Header()):
 
 @app.get("/api/race/{race_id}")
 def get_race(race_id: str):
-    lobby = active_lobbies.get(race_id)
+    lobby = LOBBIES.get(race_id)
     if lobby:
+        result = lobby.get("result")
         return {
             "race_id": race_id,
-            "track": lobby.track,
-            "status": lobby.status,
+            "track": lobby["track"],
+            "status": lobby["status"],
             "players": {pid: {"username": p["username"], "car_id": p["car_id"]}
-                        for pid, p in lobby.players.items()},
-            "current_state": lobby.current_state,
-            "result": _serialize_result(lobby.result) if lobby.result else None,
+                        for pid, p in lobby["players"].items()},
+            "current_state": lobby.get("current_state"),
+            "result": _serialize_result(result) if result else None,
         }
 
     # Check DB for finished races
@@ -493,16 +503,16 @@ def get_race(race_id: str):
 
 @app.get("/api/races")
 def list_races():
-    result = []
-    for rid, lobby in active_lobbies.items():
-        result.append({
-            "race_id": rid,
-            "track": lobby.track,
-            "status": lobby.status,
-            "player_count": len(lobby.players),
-            "race_type": lobby.race_type,
-        })
-    return result
+    return [
+        {
+            "race_id": lobby["race_id"],
+            "track": lobby["track"],
+            "status": lobby["status"],
+            "player_count": len(lobby["players"]),
+            "race_type": lobby["race_type"],
+        }
+        for lobby in LOBBIES.list_open()
+    ]
 
 
 @app.get("/api/leaderboard")
@@ -841,27 +851,27 @@ def suggest_match(x_api_key: str = Header()):
 
     # Find active lobbies with players within ELO range
     suggestions = []
-    for rid, lobby in active_lobbies.items():
-        if lobby.status != "lobby":
+    for lobby in LOBBIES.list_open():
+        if lobby["status"] != "lobby":
             continue
-        if len(lobby.players) >= 8:
+        if len(lobby["players"]) >= 8:
             continue
 
         # Calculate average ELO of players in lobby
         db = SessionLocal()
         try:
             elos = []
-            for pid in lobby.players:
+            for pid in lobby["players"]:
                 p = crud.get_player_by_id(db, pid)
                 if p:
                     elos.append(p.elo)
             avg_elo = sum(elos) / len(elos) if elos else 1200.0
             elo_diff = abs(player["elo"] - avg_elo)
             suggestions.append({
-                "race_id": rid,
-                "track": lobby.track,
-                "race_type": lobby.race_type,
-                "player_count": len(lobby.players),
+                "race_id": lobby["race_id"],
+                "track": lobby["track"],
+                "race_type": lobby["race_type"],
+                "player_count": len(lobby["players"]),
                 "avg_elo": round(avg_elo, 0),
                 "elo_diff": round(elo_diff, 0),
             })
@@ -878,188 +888,188 @@ def suggest_match(x_api_key: str = Header()):
 @app.websocket("/ws/race/{race_id}")
 async def websocket_race(websocket: WebSocket, race_id: str):
     await websocket.accept()
-    lobby = active_lobbies.get(race_id)
+    lobby = LOBBIES.get(race_id)
     if not lobby:
         await websocket.send_json({"error": "Race not found"})
         await websocket.close()
         return
 
-    lobby.websockets.add(websocket)
+    SOCKETS.setdefault(race_id, set()).add(websocket)
     try:
         # Send current state if race is in progress
-        if lobby.current_state:
-            await websocket.send_json({"type": "state", "data": lobby.current_state})
+        current_state = lobby.get("current_state")
+        if current_state:
+            await websocket.send_json({"type": "state", "data": current_state})
 
         # Keep connection alive, listen for speed control messages
         while True:
             try:
                 msg = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
                 if msg.get("type") == "speed":
-                    lobby.speed = float(msg.get("speed", 1.0))
+                    LOBBIES.set_speed(race_id, float(msg.get("speed", 1.0)))
             except asyncio.TimeoutError:
                 # Send ping to keep alive
                 await websocket.send_json({"type": "ping"})
             except WebSocketDisconnect:
                 break
     finally:
-        lobby.websockets.discard(websocket)
+        SOCKETS.get(race_id, set()).discard(websocket)
 
 
 # ─── Race execution ─────────────────────────────────────────────────
 
-async def _broadcast(lobby: RaceLobby, message: dict):
-    """Send message to all connected WebSocket clients."""
+async def _broadcast(race_id: str, message: dict) -> None:
+    """Send to this replica's sockets for a race, dropping dead ones."""
     dead = set()
-    for ws in lobby.websockets:
+    for ws in SOCKETS.get(race_id, set()):
         try:
             await ws.send_json(message)
         except Exception:
             dead.add(ws)
-    lobby.websockets -= dead
+    for ws in dead:
+        SOCKETS.get(race_id, set()).discard(ws)
+
+
+def _build_job_and_manifest(race_id: str, lobby: dict):
+    """Assemble a worker job and the manifest that describes it.
+
+    Slots are dense and contiguous starting at 0: the worker derives each
+    bot's RNG stream from its index in the spec while grid position comes
+    from the slot, and sparse slots would make those two disagree. Sorted
+    by player id first so the grid is deterministic across replicas -- a
+    dict's insertion order is not something two processes are guaranteed
+    to agree on.
+    """
+    participants = []
+    manifest_participants = []
+    slot = 0
+    for pid, pdata in sorted(lobby["players"].items()):
+        code = pdata.get("code") or ""
+        participants.append({
+            "slot": slot,
+            "player_id": pid,
+            "car_id": pdata.get("car_id"),
+            "code": code,
+            "starting_compound": pdata.get("starting_compound"),
+        })
+        manifest_participants.append(Participant(
+            slot=slot,
+            player_id=pid,
+            bot_version_id=None,
+            code_sha256="sha256:" + hashlib.sha256(code.encode()).hexdigest(),
+            house_bot=None,
+        ))
+        slot += 1
+    for bot_id in BUILTIN_BOTS:
+        if slot >= 10:
+            break
+        participants.append({"slot": slot, "player_id": bot_id, "house_bot": bot_id})
+        manifest_participants.append(Participant(
+            slot=slot, player_id=bot_id, bot_version_id=None,
+            code_sha256=None, house_bot=bot_id,
+        ))
+        slot += 1
+
+    seed = int(lobby.get("seed") or random.randint(0, 99999))
+    manifest = build_manifest(race_id, seed, lobby["track"], manifest_participants)
+    job = {
+        "match_id": race_id,
+        "track": lobby["track"],
+        "seed": seed,
+        "participants": participants,
+    }
+    return job, manifest
 
 
 async def _run_race(race_id: str):
-    """Background task that runs the race simulation and broadcasts state."""
-    lobby = active_lobbies.get(race_id)
-    if not lobby:
+    """Countdown, hand the match to a worker, then stream the stored replay.
+
+    The API no longer simulates. It never did so incrementally — the
+    previous code computed the whole race in one shot and then re-played
+    lap_data for display pacing — so this changes which process holds the
+    race while it runs, not what a spectator eventually sees finish.
+    """
+    lobby = LOBBIES.get(race_id)
+    if lobby is None:
         return
 
-    # Countdown: 5, 4, 3, 2, 1 — one broadcast per second
-    for seconds in [5, 4, 3, 2, 1]:
-        await _broadcast(lobby, {"type": "countdown", "seconds": seconds})
+    for seconds in (5, 4, 3, 2, 1):
+        await _broadcast(race_id, {"type": "countdown", "seconds": seconds})
         await asyncio.sleep(1.0)
+    await _broadcast(race_id, {"type": "lights_out"})
 
-    # Immediately broadcast lights out so the frontend transitions
-    await _broadcast(lobby, {"type": "lights_out"})
-
-    lobby.status = "running"
+    LOBBIES.set_status(race_id, "running")
     db = SessionLocal()
     try:
         crud.update_race_status(db, race_id, "running")
     finally:
         db.close()
 
-    # Build the match spec. Track physics are built here, in the parent: the
-    # isolated child forbids file writes and build_track_physics writes a
-    # calibration cache.
-    track = build_track_physics(lobby.track)
-    seed = random.randint(0, 99999)
+    job, manifest = _build_job_and_manifest(race_id, lobby)
 
-    spec = {
-        "track": lobby.track,
-        "track_physics": track,
-        "seed": seed,
-        "cars": [],
-    }
-    pos = 1
-    for pid, pdata in lobby.players.items():
-        spec["cars"].append({
-            "car_id": pdata["car_id"], "player_id": pid,
-            "code": pdata["code"], "start_position": pos,
-            "starting_compound": pdata.get("starting_compound", "MEDIUM"),
-        })
-        pos += 1
-    for bot_id, bot_info in BUILTIN_BOTS.items():
-        if pos > 10:
-            break
-        spec["cars"].append({
-            "car_id": bot_id, "player_id": bot_id, "bot_id": bot_id,
-            "start_position": pos,
-            "starting_compound": bot_info["starting_compound"],
-        })
-        pos += 1
-
-    # Run the match in a resource-limited child process, off the event loop.
-    loop = asyncio.get_event_loop()
-    try:
-        result = await loop.run_in_executor(None, run_match_isolated, spec)
-    except MatchAborted as exc:
-        if isinstance(exc, ChildFailed):
-            logger.error("race %s aborted by an internal failure: %s", race_id, exc.detail)
-        lobby.status = "aborted"
-        # str() only: spectators on this socket are unauthenticated, and
-        # ChildFailed keeps its raw text off str() for exactly that reason.
-        await _broadcast(lobby, {"type": "aborted", "reason": str(exc)})
-        db = SessionLocal()
-        try:
-            crud.update_race_status(db, race_id, "aborted")
-        finally:
-            db.close()
-        return
-
-    lobby.result = result
-    total_laps = track.total_laps
-
-    # Pre-index events by lap for fast lookup
-    events_by_lap: Dict[int, list] = {}
-    for e in result["events"]:
-        events_by_lap.setdefault(e["lap"], []).append(
-            {"lap": e["lap"], "type": e["event_type"],
-             "car_id": e["car_id"], "detail": e["detail"]}
-        )
-
-    # Broadcast each lap with pacing for an enjoyable viewing experience
-    # Speed: 1x = 3.75s/lap, 5x = 0.75s/lap, 20x = 0.1875s/lap
-    for lap_snapshot in result["lap_data"]:
-        lap_num = lap_snapshot["lap"]
-
-        state_msg = {
-            "type": "lap",
-            "lap": lap_num,
-            "total_laps": total_laps,
-            "data": lap_snapshot,
-            "events": events_by_lap.get(lap_num, []),
-        }
-        lobby.current_state = state_msg
-        await _broadcast(lobby, state_msg)
-
-        # Cinematic pacing: ~11s per lap at 1x, ~2.2s at 5x, ~0.55s at 20x
-        delay = max(0.05, 11.0 / lobby.speed)
-        await asyncio.sleep(delay)
-
-    # Race finished
-    lobby.status = "finished"
-
-    # Save results to DB
+    # save_manifest before enqueue, not after: the worker's persist step
+    # only ever UPDATEs the manifest row for a match id (it never upserts),
+    # and it now raises rather than ack a match with nothing durable
+    # written. Enqueueing first would let the worker claim the job before a
+    # manifest exists for it, so every persist attempt would match zero
+    # documents and the job would fail, get reclaimed, and fail forever.
     db = SessionLocal()
     try:
-        crud.update_race_status(db, race_id, "finished")
-        # crud reads standings and events by attribute; the isolated child
-        # hands them back as plain dicts, so adapt at this boundary.
-        crud.save_race_results(
-            db, race_id, [to_namespace(c) for c in result["standings"]]
-        )
-        crud.save_race_data(
-            db, race_id, result["lap_data"],
-            [to_namespace(e) for e in result["events"]],
-        )
-
-        # Update ELO
-        standings_tuples = [
-            (c["player_id"], c["position"], c["retired"])
-            for c in result["standings"]
-        ]
-        current_ratings = {}
-        for pid, _, _ in standings_tuples:
-            player = crud.get_player_by_id(db, pid)
-            current_ratings[pid] = player.elo if player else 1200.0
-
-        k_factor = 48.0 if lobby.race_type == "season" else 32.0
-        new_ratings = compute_elo_updates(standings_tuples, current_ratings, k_factor)
-
-        for pid, new_elo in new_ratings.items():
-            player = crud.get_player_by_id(db, pid)
-            if player:
-                old_elo = player.elo
-                crud.update_player_elo(db, pid, new_elo)
-                crud.save_elo_history(db, pid, race_id, old_elo, new_elo)
+        crud.save_manifest(db, manifest)
     finally:
         db.close()
 
-    # Broadcast final results
-    await _broadcast(lobby, {
+    JOBS.enqueue(job)
+
+
+async def _relay_match_events() -> None:
+    """Stream finished matches to whichever sockets this replica holds.
+
+    Runs on every replica. A replica with no sockets for a match does
+    nothing, which is why publishing to all of them is correct rather than
+    wasteful.
+    """
+    pubsub = EVENTS.subscribe()
+    try:
+        while True:
+            event = await asyncio.get_running_loop().run_in_executor(
+                None, EVENTS.listen, pubsub, 1.0
+            )
+            if not event or event.get("type") != "match_finished":
+                continue
+            race_id = event["match_id"]
+            if race_id not in SOCKETS:
+                continue
+            await _stream_stored_replay(race_id)
+    finally:
+        pubsub.close()
+
+
+async def _stream_stored_replay(race_id: str) -> None:
+    """Tell this replica's sockets the match is done.
+
+    The worker persists the manifest and the replay's hash (see
+    backend/worker.py) but not yet the replay body itself -- object storage
+    for replay bodies is deferred beyond this phase (see the phase plan's
+    "Deferred beyond this phase" section), so there is no lap-by-lap body to
+    re-stream here yet. This sends one terminal "finished" event rather than
+    the paced per-lap messages the old in-process simulation produced.
+    Standings, points and ELO -- previously computed by this same function
+    right after `run_match_isolated` returned -- are not recomputed here:
+    they depended on the full result, which now lives only inside the
+    worker's process. This is a known gap, not a silently dropped feature.
+    """
+    db = SessionLocal()
+    try:
+        crud.update_race_status(db, race_id, "finished")
+        replay_sha256 = crud.get_replay_hash(db, race_id)
+    finally:
+        db.close()
+    LOBBIES.set_status(race_id, "finished")
+
+    await _broadcast(race_id, {
         "type": "finished",
-        "result": _serialize_result(result),
+        "result": {"race_id": race_id, "replay_sha256": replay_sha256},
     })
 
 
