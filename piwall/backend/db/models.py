@@ -119,6 +119,17 @@ def init_db(db):
     db.elo_history.create_index([("id", ASCENDING)], unique=True)
     db.elo_history.create_index([("player_id", ASCENDING), ("created_at", ASCENDING)])
 
+    # The worker's job queue is at-least-once: a redelivered match must not
+    # apply its Elo update twice. The check-then-act guard in
+    # backend/worker.py's _persist_result is what's supposed to prevent that
+    # in the normal case, but a unique index is what makes the guarantee
+    # real rather than a check a sufficiently unlucky interleaving can walk
+    # through -- a second save_elo_history for the same (player_id, race_id)
+    # fails loudly instead of silently drifting a rating.
+    db.elo_history.create_index(
+        [("player_id", ASCENDING), ("race_id", ASCENDING)], unique=True
+    )
+
     db.manifests.create_index([("match_id", ASCENDING)], unique=True)
 
     return lambda: MongoSession(db)

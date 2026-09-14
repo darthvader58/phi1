@@ -19,6 +19,8 @@ import time
 from dataclasses import asdict
 from typing import Callable, Optional
 
+from .db import crud
+from .db.models import to_namespace
 from .determinism.canonical import canonical_json
 from .determinism.manifest import Participant, build_manifest
 from .determinism.replay import REPLAY_FORMAT_VERSION
@@ -27,6 +29,7 @@ from .sandbox.match_job import run_match_isolated
 from .jobs.events import MatchEvents
 from .jobs.queue import MatchJobQueue
 from .observability.logging import configure_logging, get_logger, match_context
+from .season.elo import compute_elo_updates
 
 log = get_logger("piwall.worker")
 
@@ -155,6 +158,97 @@ def _replay_sha256_of(replay: bytes) -> str:
     return "sha256:" + hashlib.sha256(replay).hexdigest()
 
 
+def _persist_result(db, result: dict) -> None:
+    """Write everything a finished match must leave behind, exactly once.
+
+    Spec 4.1 puts result persistence here -- `result -> Mongo (atomic Elo)
+    -> pub/sub notify` -- and it belongs in the worker rather than the API
+    because the worker is the only place that ever holds the full result;
+    the API enqueues a job and later learns only a race id and a replay
+    hash (see backend/main.py's `_stream_stored_replay`).
+
+    The replay hash is written unconditionally: save_replay_hash is a $set
+    against the manifest's own row, so re-writing the same digest on a
+    redelivered job (the queue is at-least-once -- reclaim_stalled
+    redelivers a job whose worker died after running the match but before
+    acking) is harmless, and it must happen before the guard below or a
+    worker that dies between them would leave save_replay_hash's "the
+    result is durable" promise unmet forever.
+
+    Everything after the guard is NOT naturally idempotent the way the
+    replay hash is: save_race_results and save_elo_history both insert_one
+    per call, and update_player_elo writes an absolute rating computed from
+    the CURRENT one. Determinism guarantees a redelivered job recomputes
+    the identical race, but it says nothing about a read-modify-write
+    against state that has already moved -- applying the same Elo delta
+    twice does not average out, it compounds. The guard (does this race
+    already have result rows?) makes that whole block run at most once per
+    match id in the normal case; the unique index on
+    elo_history(player_id, race_id) (backend/db/models.py) is the second
+    line of defense if that check-then-act is ever raced.
+    """
+    match_id = result["match_id"]
+
+    update = crud.save_replay_hash(db, match_id, result["replay_sha256"])
+    if update.matched_count == 0:
+        # save_replay_hash is update-only and never upserts, so a
+        # match_id with no manifest document already means this write
+        # touched nothing. "Ack only after the result is durable" is
+        # enforced here, not just in ordering: silently continuing would
+        # let process_one persist(), publish() and ack() a job whose
+        # result was never actually written down.
+        raise RuntimeError(
+            f"save_replay_hash matched no manifest document for "
+            f"match {match_id!r} -- refusing to treat this result as "
+            f"persisted"
+        )
+
+    if crud.get_race_results(db, match_id):
+        # A prior delivery of this exact job already applied results and
+        # Elo. Re-running the block would duplicate the results rows and,
+        # worse, re-apply an Elo delta on top of a rating it already moved.
+        return
+
+    crud.update_race_status(db, match_id, "finished")
+    # crud reads standings and events by attribute; the isolated child
+    # hands them back as plain dicts, so adapt at this boundary.
+    crud.save_race_results(
+        db, match_id, [to_namespace(c) for c in result["standings"]]
+    )
+    crud.save_race_data(
+        db, match_id, result["lap_data"],
+        [to_namespace(e) for e in result["events"]],
+    )
+
+    # k_factor's source used to be the in-memory lobby (lobby.race_type),
+    # which no longer exists by the time a match finishes. The job payload
+    # does not carry race_type either -- adding it there would be a second
+    # copy that could drift from the one create_race() already wrote
+    # durably before this job ever existed, so the race document is read
+    # instead, as the single authority for it.
+    race = crud.get_race(db, match_id)
+    race_type = race.race_type if race is not None else "quick"
+    k_factor = 48.0 if race_type == "season" else 32.0
+
+    standings_tuples = [
+        (c["player_id"], c["position"], c["retired"])
+        for c in result["standings"]
+    ]
+    current_ratings = {}
+    for pid, _, _ in standings_tuples:
+        player = crud.get_player_by_id(db, pid)
+        current_ratings[pid] = player.elo if player else 1200.0
+
+    new_ratings = compute_elo_updates(standings_tuples, current_ratings, k_factor)
+
+    for pid, new_elo in new_ratings.items():
+        player = crud.get_player_by_id(db, pid)
+        if player:
+            old_elo = player.elo
+            crud.update_player_elo(db, pid, new_elo)
+            crud.save_elo_history(db, pid, match_id, old_elo, new_elo)
+
+
 def process_one(
     queue: MatchJobQueue,
     events: MatchEvents,
@@ -195,7 +289,9 @@ def process_one(
         # record; acking last means the worst case is a harmless re-run
         # under the same match id (see module docstring).
         persist({"match_id": match_id, "replay_sha256": digest,
-                 "replay_bytes": replay, "manifest": manifest})
+                 "replay_bytes": replay, "manifest": manifest,
+                 "standings": result["standings"], "lap_data": result["lap_data"],
+                 "events": result["events"]})
         events.publish({"type": "match_finished", "match_id": match_id,
                         "replay_sha256": digest})
         queue.ack(entry_id)
@@ -208,7 +304,6 @@ def run_forever(consumer: str = WORKER_NAME) -> None:
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
 
-    from .db.crud import save_replay_hash
     from .db.models import create_db_engine, init_db, mongo_url
 
     # mongo_url() rather than importing main: the worker serves no HTTP and
@@ -218,19 +313,7 @@ def run_forever(consumer: str = WORKER_NAME) -> None:
     def persist(result: dict) -> None:
         db = session_factory()
         try:
-            update = save_replay_hash(db, result["match_id"], result["replay_sha256"])
-            if update.matched_count == 0:
-                # save_replay_hash is update-only and never upserts, so a
-                # match_id with no manifest document already means this
-                # write touched nothing. "Ack only after the result is
-                # durable" is enforced here, not just in ordering: silently
-                # continuing would let process_one persist(), publish() and
-                # ack() a job whose result was never actually written down.
-                raise RuntimeError(
-                    f"save_replay_hash matched no manifest document for "
-                    f"match {result['match_id']!r} -- refusing to treat "
-                    f"this result as persisted"
-                )
+            _persist_result(db, result)
         finally:
             db.close()
 
