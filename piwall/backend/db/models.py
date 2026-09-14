@@ -1,11 +1,12 @@
 """MongoDB helpers for PIT WALL persistent data."""
 
+import logging
 import os
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
-from pymongo.errors import OperationFailure
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 
 def _resolve_database_name(url: str) -> str:
@@ -33,6 +34,20 @@ def create_db_engine(url: str | None = None):
     client = MongoClient(mongo_url)
     db = client[_resolve_database_name(mongo_url)]
     return db
+
+
+def mongo_url() -> str:
+    """The Mongo connection string, for callers that must not import main.
+
+    main imports the health router, and the worker imports neither -- so both
+    need this without reaching back into the API module. Same precedence main
+    itself uses, kept here because this module already owns database config.
+    """
+    return (
+        os.environ.get("MONGODB_URI")
+        or os.environ.get("DATABASE_URL")
+        or "mongodb://127.0.0.1:27017/phi1"
+    )
 
 
 # MongoDB reports "an index with this name exists but with different options"
@@ -104,6 +119,32 @@ def init_db(db):
 
     db.elo_history.create_index([("id", ASCENDING)], unique=True)
     db.elo_history.create_index([("player_id", ASCENDING), ("created_at", ASCENDING)])
+
+    # The worker's job queue is at-least-once: a redelivered match must not
+    # apply its Elo update twice. backend/worker.py's _persist_result writes
+    # each player's history row BEFORE moving their rating specifically so
+    # this index can refuse a duplicate before the damage is done, rather
+    # than merely reporting it afterwards.
+    #
+    # create_index(unique=True) raises DuplicateKeyError if the collection
+    # already holds a duplicate (player_id, race_id) pair -- exactly the
+    # kind of row the bug this index exists to prevent could have already
+    # written on a live deployment, before this index existed. init_db()
+    # runs from both the API's lifespan and the worker's run_forever, so an
+    # uncaught raise here would refuse to let either process start at all
+    # over a data problem a boot cannot fix. Logging and continuing without
+    # the index is safer than bricking the boot; _persist_result's ordering
+    # is still in effect either way, just without this line's extra check.
+    try:
+        db.elo_history.create_index(
+            [("player_id", ASCENDING), ("race_id", ASCENDING)], unique=True
+        )
+    except DuplicateKeyError as exc:
+        logging.getLogger("piwall").error(
+            "elo_history already has a duplicate (player_id, race_id) pair; "
+            "the protective unique index was NOT created. Dedupe the "
+            "collection and restart to re-enable it. %s", exc,
+        )
 
     db.manifests.create_index([("match_id", ASCENDING)], unique=True)
 
