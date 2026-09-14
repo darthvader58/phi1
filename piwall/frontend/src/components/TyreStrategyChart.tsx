@@ -1,9 +1,9 @@
 "use client";
 
-import { CarState, getCarColor, COMPOUND_COLORS } from "@/lib/types";
+import { TyreStrategyCar, getCarColor, COMPOUND_COLORS } from "@/lib/types";
 
 interface Props {
-  cars: CarState[];
+  cars: TyreStrategyCar[];
   totalLaps: number;
 }
 
@@ -13,10 +13,12 @@ interface StintInfo {
   endLap: number;
 }
 
-function parseStints(car: CarState, totalLaps: number): StintInfo[] {
+function parseStints(car: TyreStrategyCar, totalLaps: number): StintInfo[] {
   const stints: StintInfo[] = [];
   const pitLaps = car.pit_laps || [];
-  const compounds = car.compounds_used || [car.compound];
+  const compounds = (car.compounds_used?.length ? car.compounds_used : [car.compound]).filter(
+    (c): c is string => Boolean(c)
+  );
 
   if (compounds.length === 0) return stints;
 

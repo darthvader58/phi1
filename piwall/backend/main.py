@@ -46,6 +46,7 @@ from .engine.build import build_track_physics
 from .jobs.events import MatchEvents
 from .jobs.queue import MatchJobQueue
 from .sandbox.runner import NAMESPACE_RESERVED_KEYS, STRATEGY_TEMPLATE
+from .state.car_ids import assert_unique_car_ids
 from .state.lobby import CarIdTakenError, LobbyFullError, LobbyStore
 from backend.sandbox.validation import validate_submission
 from backend.sandbox.isolation import ChildFailed, LimitExceeded
@@ -1117,6 +1118,24 @@ def _build_job_and_manifest(race_id: str, lobby: dict):
         ))
         slot += 1
 
+    # The chokepoint for the car_id uniqueness invariant (state/car_ids.py).
+    # Every source of a car_id converges here -- lobby players above, house
+    # bots just now -- and this is the last point before the manifest, and
+    # therefore the replay hash, seals whatever the grid turned out to be.
+    # Prevention lives with each source (LobbyStore.join() refuses a taken
+    # or reserved id); this is the detection that sees all of them at once,
+    # so a THIRD source cannot be added without passing through it. That is
+    # precisely what was missing when the same corruption arrived by a new
+    # route in three consecutive rounds.
+    #
+    # `car_id or house_bot` is exactly how worker._spec_from_job derives the
+    # id it hands engine.add_car, so this checks the values the engine will
+    # actually see -- including a player row with no car_id at all, which
+    # would reach the engine as None.
+    assert_unique_car_ids(
+        p.get("car_id") or p.get("house_bot") for p in participants
+    )
+
     seed = int(lobby.get("seed") or random.randint(0, 99999))
     manifest = build_manifest(race_id, seed, lobby["track"], manifest_participants)
     job = {
@@ -1319,11 +1338,21 @@ async def _stream_stored_replay(race_id: str) -> None:
     The rows come from race_results (the post-race authority: it is
     written after the engine applies its end-of-race compound-rule time
     penalties, so positions and total_time here are final) rather than
-    from the last lap_data snapshot (taken before them). gap_to_leader
-    and pit_count are not stored -- they are derived from total_time and
-    pit_laps, which are. A race with no document or no rows yet sends an
-    empty standings list, which renders as an empty result panel rather
-    than crashing the page.
+    from the last lap_data snapshot (taken before them). gap_to_leader,
+    pit_count and the finishing compound are not stored -- they are
+    derived from total_time, pit_laps and compounds_used, which are. A
+    race with no document or no rows yet sends an empty standings list,
+    which renders as an empty result panel rather than crashing the page.
+
+    Round 5 added the race's events for the same reason the standings
+    were added in round 4: crud.save_race_data persists them durably, the
+    worker sends no per-lap messages that could carry them, and nothing
+    re-fetches -- so EventLog sat permanently empty on a finished race
+    (NEW-12). What is still NOT here is per-lap state: tyre age, fuel,
+    DRS and beliefs exist only while a race runs, and bringing them back
+    means replay bodies, which are Phase 4. frontend types.ts's
+    DisplayCar marks exactly those fields optional so a component has to
+    say what it shows in their place rather than rendering a zero.
     """
     db = SessionLocal()
     try:
@@ -1331,6 +1360,8 @@ async def _stream_stored_replay(race_id: str) -> None:
         race = crud.get_race(db, race_id)
         results = crud.get_race_results(db, race_id) if race else []
         lap_data = getattr(race, "lap_data_json", None) or [] if race else []
+        events = getattr(race, "events_json", None) or [] if race else []
+        track = getattr(race, "track", None) if race else None
     finally:
         db.close()
 
@@ -1360,6 +1391,14 @@ async def _stream_stored_replay(race_id: str) -> None:
             "pit_laps": row.pit_laps,
             "pit_count": len(row.pit_laps or []),
             "compounds_used": row.compounds_used,
+            # The tyre the car finished on. Not stored as its own column,
+            # but compounds_used is an ordered stint history, so the last
+            # entry is exactly it -- the one live-timing field the result
+            # row can honestly supply (round 5, NEW-11). tyre_age,
+            # drs_available and beliefs genuinely cannot be: they are
+            # per-lap state that only a replay body brings back, which is
+            # Phase 4 work.
+            "compound": (row.compounds_used or [None])[-1],
         }
         for row in results
     ]
@@ -1369,11 +1408,28 @@ async def _stream_stored_replay(race_id: str) -> None:
         "result": {
             "race_id": race_id,
             "replay_sha256": replay_sha256,
-            "track": getattr(race, "track", None) if race else None,
-            # The number of laps actually run, which is what the tyre
-            # strategy chart scales its stint bars against.
-            "total_laps": lap_data[-1].get("lap", len(lap_data)) if lap_data else 0,
+            "track": track,
+            # The number of laps actually run. TyreStrategyChart scales
+            # every stint bar by this, as ((endLap - startLap) / totalLaps),
+            # so a 0 alongside non-empty standings renders width:Infinity%
+            # (round 5, NEW-13). Falling back to the track's scheduled
+            # distance keeps it a real number whenever lap_data is missing
+            # but result rows are not; only a race with no document at all
+            # reaches 0, and that case sends no standings to divide.
+            "total_laps": (
+                lap_data[-1].get("lap", len(lap_data)) if lap_data
+                else getattr(TRACKS.get(track), "total_laps", 0)
+            ),
             "standings": standings,
+            # Persisted by crud.save_race_data and then dropped from this
+            # payload until round 5 (NEW-12), which left EventLog
+            # permanently empty on a finished decoupled race -- including
+            # the +30s compound-rule penalty event that explains the
+            # standings sitting next to it. The rows are already read
+            # above; nothing new is fetched to send them. Shape is
+            # {lap, type, car_id, detail}, which is frontend
+            # types.ts's RaceEvent exactly.
+            "events": events,
         },
     })
 

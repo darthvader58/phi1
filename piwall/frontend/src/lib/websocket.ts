@@ -70,6 +70,17 @@ export function useRaceWebSocket(raceId: string | null) {
         case "finished":
           setStatus("finished");
           if (msg.result) setResult(msg.result);
+          // The decoupled worker runs a match to completion in one shot
+          // and never sends the per-lap "lap" messages that used to fill
+          // `events`, so without this EventLog stays permanently empty on
+          // a finished race -- including the penalty events that explain
+          // the standings next to it (round 5, NEW-12). The finished
+          // payload's list is the whole race's events, read straight from
+          // the persisted race document, so it REPLACES rather than
+          // appends: re-delivering it is then idempotent, and a race that
+          // did stream laps ends up with the durable list rather than two
+          // copies of it.
+          if (msg.result?.events?.length) setEvents(msg.result.events);
           break;
 
         case "aborted":

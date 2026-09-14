@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useCallback } from "react";
-import { CarState, getCarColor, getCompoundColor, CAR_COLORS } from "@/lib/types";
+import { DisplayCar, getCarColor, getCompoundColor, CAR_COLORS } from "@/lib/types";
 import {
   TRACK_DEFS,
   buildTrackPath,
@@ -10,7 +10,7 @@ import {
 } from "@/lib/trackData";
 
 interface Props {
-  cars: CarState[];
+  cars: DisplayCar[];
   trackName: string;
   weather: string;
   safetyCar: boolean;
@@ -57,7 +57,7 @@ export default function TrackMap({ cars, trackName, weather, safetyCar, raceFini
   const trackPathRef = useRef<TrackPath | null>(null);
   const animFrameRef = useRef<number>(0);
   const lastFrameRef = useRef<number>(0);
-  const carsRef = useRef<CarState[]>(cars);
+  const carsRef = useRef<DisplayCar[]>(cars);
   const propsRef = useRef({ weather, safetyCar, trackName, raceFinished });
 
   // Animation state per car — persists across renders

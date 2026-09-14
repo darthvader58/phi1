@@ -18,6 +18,37 @@ export interface CarState {
   beliefs: Record<string, RivalBelief>;
 }
 
+/**
+ * A car as the live-timing panels (TrackMap, Leaderboard, BeliefPanel)
+ * see it.
+ *
+ * Identical to CarState except that the fields only a running race can
+ * supply are optional, because after the race they are genuinely absent:
+ * a finished result row is rebuilt from race_results and has no tyre age,
+ * fuel load, last lap time, DRS state or beliefs. Marking them optional
+ * rather than zero-filling them means every component that reads one has
+ * to say what it shows when it is missing, instead of silently rendering
+ * a 0 that reads as real (round 5, NEW-11). CarState is assignable to
+ * this, so a live snapshot still flows through unchanged.
+ */
+export type DisplayCar = Omit<
+  CarState,
+  "player_id" | "tyre_age" | "fuel_kg" | "last_lap_time" | "drs_available" | "beliefs"
+> &
+  Partial<
+    Pick<
+      CarState,
+      "player_id" | "tyre_age" | "fuel_kg" | "last_lap_time" | "drs_available" | "beliefs"
+    >
+  >;
+
+/** The fields TyreStrategyChart needs, which both a live snapshot and a
+ *  finished result row carry. */
+export type TyreStrategyCar = Pick<
+  CarState,
+  "car_id" | "position" | "retired" | "pit_laps" | "compounds_used" | "pit_count"
+> & { compound?: string | null };
+
 export interface RivalBelief {
   estimated_tyre_age: number;
   estimated_compound: string;
@@ -50,12 +81,40 @@ export interface RaceEvent {
   detail: string;
 }
 
+/**
+ * One car's row in the "finished" event that backend/main.py's
+ * _stream_stored_replay broadcasts.
+ *
+ * Deliberately NOT CarState. These rows are rebuilt from the persisted
+ * race_results documents after the race is over, so they carry only what
+ * survives it. The live-timing fields -- tyre_age, fuel_kg, last_lap_time,
+ * drs_available and beliefs -- are per-lap state that exists only while a
+ * race is running; the decoupled worker runs a match to completion in one
+ * shot and does not stream them, and getting them back means replay
+ * bodies, which are Phase 4 work. Declaring these rows as CarState told
+ * the reader they carried beliefs and tyre ages when they never do.
+ */
+export interface FinishedStandingsRow {
+  car_id: string;
+  position: number;
+  retired: boolean;
+  points: number;
+  total_time: number | null;
+  gap_to_leader: number;
+  pit_laps: number[];
+  pit_count: number;
+  compounds_used: string[];
+  /** The tyre the car finished on: the last stint in compounds_used. */
+  compound: string | null;
+}
+
 export interface RaceResult {
-  track: string;
+  race_id: string;
+  replay_sha256: string | null;
+  track: string | null;
   total_laps: number;
-  standings: CarState[];
+  standings: FinishedStandingsRow[];
   events: RaceEvent[];
-  weather_history: string[];
 }
 
 export interface TrackInfo {

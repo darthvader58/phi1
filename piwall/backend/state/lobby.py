@@ -23,6 +23,7 @@ two replicas racing to mutate the same lobby cannot lose one of their writes.
 import json
 from typing import Optional
 
+from .car_ids import RESERVED_CAR_IDS
 from .redis_client import get_redis
 
 KEY_PREFIX = "piwall:lobby:"
@@ -82,6 +83,9 @@ return 1
 # ARGV[3] = player id
 # ARGV[4] = player data, JSON-encoded. If data.car_id is missing/empty the
 #           script supplies one -- see below.
+# ARGV[5] = JSON array of car_ids reserved by cars that are not lobby
+#           players (the house bots), which no player may be assigned or
+#           claim
 #
 # A read-count-then-decide-then-write across an HTTP handler -- what
 # join_race used to do with .get() plus a Python-side len() check -- lets
@@ -98,22 +102,33 @@ return 1
 # that decides a car_id therefore happens HERE, inside the one atomic step
 # that can see the lobby's true pre-write contents:
 #
-#   * A RE-JOIN keeps the car_id the player already holds. Round 3 derived
-#     the default from the pre-write player count, which for a re-join
-#     already counts the rejoining player -- so re-joining moved that
-#     player to a fresh label and left the one they vacated free for the
-#     next genuinely-new player to be handed as well. Four sequential API
-#     calls (join A, join B, re-join A, join C) were enough to put two
-#     'P03's in one lobby, and the shipped frontend never sends a car_id at
-#     all (frontend/src/lib/api.ts), so that was the DEFAULT path.
-#   * A NEW player with no car_id gets the lowest P%02d that nobody else in
-#     the lobby holds, rather than count + 1 -- a label derived from the
+#   * A RE-JOIN that supplies NO car_id keeps the one the player already
+#     holds. Round 3 derived the default from the pre-write player count,
+#     which for a re-join already counts the rejoining player -- so
+#     re-joining moved that player to a fresh label and left the one they
+#     vacated free for the next genuinely-new player to be handed as well.
+#     Four sequential API calls (join A, join B, re-join A, join C) were
+#     enough to put two 'P03's in one lobby, and the shipped frontend never
+#     sends a car_id at all (frontend/src/lib/api.ts), so that was the
+#     DEFAULT path. A re-join that supplies a DIFFERENT unclaimed car_id is
+#     honoured and frees the old label -- deliberate, see join()'s
+#     docstring.
+#   * A NEW player with no car_id gets the lowest P%02d that no other car
+#     in the race holds, rather than count + 1 -- a label derived from the
 #     count is only unique while no label has ever been vacated, which is
 #     precisely the assumption the re-join bug broke.
 #   * An EXPLICIT car_id that another player in this lobby already holds is
 #     refused. That is the same collision by a different route, and a
 #     caller cannot check for it beforehand without reopening the very
 #     read-then-write window this script exists to close.
+#   * A car_id belonging to a HOUSE BOT is refused, and never assigned as a
+#     default, the same way. House bots are not lobby players, so the
+#     "taken" set built from the lobby alone never covered them -- and
+#     every race gets them appended, so claiming one put two cars called
+#     VEL-01 on the grid. They are passed in as ARGV[5] (see
+#     state/car_ids.py, which states this invariant once for every source
+#     of a car_id) rather than hardcoded here, because Lua cannot see
+#     BUILTIN_BOTS and a set that drifts from it would be worse than none.
 #
 # A re-join (the player id is already present) never counts against the
 # cap and always succeeds -- it can only ever shrink or hold steady the
@@ -122,7 +137,7 @@ return 1
 # Returns false if the lobby does not exist, else a JSON object:
 #   {"full": true}                    new player, lobby already at max
 #   {"full": false, "taken": true, "car_id": <id>}
-#                                     explicit car_id held by someone else
+#                                     car_id held by another car in the race
 #   {"full": false, "taken": false, "is_new": bool,
 #    "count": <player count after this write>,
 #    "car_id": <the car_id actually stored>}
@@ -153,10 +168,15 @@ local function blank(value)
     return value == nil or value == cjson.null or value == ''
 end
 
--- Every car_id held by somebody OTHER than the player being written. The
--- rejoining player's own current label is deliberately excluded, so
--- re-sending it (or keeping it, below) is never mistaken for a clash.
+-- Every car_id already spoken for by a car OTHER than the one being
+-- written: first the identities house bots bring to every race, then the
+-- other players in this lobby. The rejoining player's own current label
+-- is deliberately excluded, so re-sending it (or keeping it, below) is
+-- never mistaken for a clash.
 local taken = {}
+for _, reserved in ipairs(cjson.decode(ARGV[5])) do
+    taken[reserved] = true
+end
 for pid, p in pairs(lobby.players) do
     if pid ~= player_id and type(p) == 'table' and not blank(p.car_id) then
         taken[p.car_id] = true
@@ -297,16 +317,31 @@ class LobbyStore:
         that in. Every decision about it is therefore made inside the
         script, where the read and the write are a single atomic step:
 
-        - A re-join (this player id is already present) KEEPS the car_id
-          it already holds whenever data["car_id"] is missing or empty.
-          Deriving a fresh default for a re-join is what round 3 did, and
-          it both moved that player and freed their old label for the
-          next new player to be handed too.
-        - A new player with no car_id gets the lowest "P%02d" no other
-          player in the lobby holds -- not one derived from the player
+        - A re-join (this player id is already present) that supplies NO
+          car_id -- data["car_id"] missing, empty or JSON null, which is
+          every join the shipped frontend makes -- KEEPS the car_id it
+          already holds. Deriving a fresh default for a re-join is what
+          round 3 did, and it both moved that player and freed their old
+          label for the next new player to be handed too.
+        - A re-join that supplies a DIFFERENT, unclaimed car_id is
+          honoured, and the label it vacates becomes available again.
+          This is deliberate, not an oversight (round 5, NEW-10): car_id
+          is a documented field of the join request, and refusing it on
+          a re-join would make the identical request succeed or fail
+          depending on whether the caller had joined before, leaving a
+          player no way to correct an id they regret. Nothing durable is
+          keyed on it yet either -- join_race refuses any status but
+          "lobby", and the identity is only sealed when
+          _build_job_and_manifest builds the manifest at race start. The
+          rename goes through the same collision check as any other
+          explicit id, so uniqueness holds at every step.
+        - A new player with no car_id gets the lowest "P%02d" that no
+          other car in the race holds -- not one derived from the player
           count, which stops being unique the moment any label is
           vacated.
-        - An explicit car_id another player already holds is refused.
+        - An explicit car_id another car in the race already holds is
+          refused, whether that car is another lobby player or one of
+          the house bots appended to every race (see state/car_ids.py).
 
         Returns (is_new, player_count, car_id) — player_count is the
         lobby's total after this write and car_id is whatever was
@@ -315,12 +350,26 @@ class LobbyStore:
         afterwards (which would itself race a concurrent join). Raises
         KeyError if the lobby does not exist, LobbyFullError if this is a
         new player and the lobby is already at max_players, and
-        CarIdTakenError if an explicitly requested car_id belongs to
-        somebody else in this lobby.
+        CarIdTakenError if the car_id being stored belongs to another car
+        in this race.
+
+        One consequence of applying that last check to a KEPT id too: a
+        lobby written before house-bot ids were reserved could hold a
+        player on "VEL-01", and their next re-join is refused rather than
+        silently renamed. That is the loud outcome -- the race would not
+        start either way (assert_unique_car_ids refuses the grid) -- and
+        the way out is a re-join carrying a different explicit car_id,
+        which the rename rule above allows.
         """
         raw = self._join_script(
             keys=[self._key(race_id)],
-            args=[TTL_SECONDS, max_players, player_id, json.dumps(data)],
+            args=[
+                TTL_SECONDS, max_players, player_id, json.dumps(data),
+                # Imported rather than passed in by the caller: every
+                # caller of join() must get this guarantee, and a
+                # parameter is something a future one can forget.
+                json.dumps(sorted(RESERVED_CAR_IDS)),
+            ],
         )
         # A Lua `false` return arrives via RESP as nil, which redis-py
         # decodes as None, not Python False -- checking `is False` here
@@ -334,7 +383,7 @@ class LobbyStore:
         if result["taken"]:
             raise CarIdTakenError(
                 f"car_id {result['car_id']!r} is already held by another "
-                f"player in lobby {race_id!r}"
+                f"car in race {race_id!r}"
             )
         return result["is_new"], result["count"], result["car_id"]
 

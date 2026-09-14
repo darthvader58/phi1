@@ -6,6 +6,7 @@ import { useState, useEffect, useRef } from "react";
 import { useRaceWebSocket } from "@/lib/websocket";
 import { api } from "@/lib/api";
 import { COMPOUND_COLORS } from "@/lib/types";
+import type { DisplayCar, FinishedStandingsRow } from "@/lib/types";
 import Leaderboard from "@/components/Leaderboard";
 import GapChart from "@/components/GapChart";
 import LapTimeChart from "@/components/LapTimeChart";
@@ -14,6 +15,29 @@ import EventLog from "@/components/EventLog";
 import TyreStrategyChart from "@/components/TyreStrategyChart";
 import BeliefPanel from "@/components/BeliefPanel";
 import { useToast } from "@/components/Toast";
+
+/**
+ * A finished race's result row, as much of a car as it can honestly be.
+ *
+ * tyre_age, fuel_kg, last_lap_time, drs_available and beliefs are
+ * deliberately not set: they are live-timing state that no longer exists
+ * once the race is over, and inventing a 0 for them would render as a
+ * real reading. Getting them back means replay bodies (Phase 4). See
+ * backend/main.py's _stream_stored_replay for what the payload carries.
+ */
+function finishedRowToDisplayCar(row: FinishedStandingsRow): DisplayCar {
+  return {
+    car_id: row.car_id,
+    position: row.position,
+    gap_to_leader: row.gap_to_leader,
+    compound: row.compound ?? "",
+    pit_count: row.pit_count,
+    pit_laps: row.pit_laps,
+    compounds_used: row.compounds_used,
+    total_time: row.total_time ?? 0,
+    retired: row.retired,
+  };
+}
 
 export default function RacePage() {
   const params = useParams();
@@ -231,7 +255,15 @@ export default function RacePage() {
     );
   }
 
-  const cars = lapData?.cars || result?.standings || [];
+  // Which cars the live-timing panels show, stated explicitly rather than
+  // left to a `||` chain (round 5, NEW-11). While a race runs these are
+  // the per-lap snapshot's cars; once it has finished the only cars that
+  // still exist are the persisted result rows, which carry no per-lap
+  // state -- so they are adapted here, with the unavailable fields left
+  // ABSENT rather than zero-filled, and each component decides what to
+  // render in their place.
+  const cars: DisplayCar[] =
+    lapData?.cars ?? result?.standings.map(finishedRowToDisplayCar) ?? [];
   const trackName = raceInfo?.track || "bahrain";
   const weather = lapData?.weather || "dry";
   const safetyCar = lapData?.safety_car || false;
