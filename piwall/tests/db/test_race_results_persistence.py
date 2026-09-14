@@ -147,45 +147,113 @@ def test_the_unique_index_is_what_prevents_a_double_insert(throwaway_db):
     once (a stalled reclaim firing while the first worker is still
     running) must not double a race's rows.
 
-    A real thread race against MongoDB's own server-side atomicity is not
-    a reliable way to prove this from a client test -- find_one_and_update
-    is a single atomic server operation, and two pymongo threads racing to
-    call it do not reliably lose against the server's own document-level
-    locking within the timing budget a unit test can afford, index or no
-    index. This instead does what the sibling elo_history test does: on a
-    throwaway database, create the collection with NO unique index, show
-    MongoDB genuinely accepts two rows with the same (race_id,
-    player_id), then add the index and show the identical second insert
-    is refused.
+    Round 3's version of this test hand-wrote a row dict, hand-created an
+    index with a literal key pattern and called insert_one twice. It ran
+    no piwall code at all, so it stayed green with the production index
+    line deleted -- it asserted that MongoDB enforces unique indexes
+    (re-review of round 3, NEW-2). This goes through the real path
+    instead: init_db() builds the index, crud.save_race_results() writes
+    the first row, and the duplicate that must be refused is the one the
+    losing side of the concurrent-upsert race would insert.
+
+    The interleaving is written out rather than raced for, deliberately:
+    find_one_and_update is one atomic server operation, so two pymongo
+    threads calling it do not reliably lose against MongoDB's own
+    document-level locking inside a unit test's timing budget -- with or
+    without the index. What the index actually has to refuse is the
+    insert half of a "no match -> insert" decision another writer made
+    before this one's row existed, which is exactly the write below.
+
+    Red line: `_create_unique_index_or_log(db.race_results, [("race_id",
+    ASCENDING), ("player_id", ASCENDING)], "race_results")` in
+    backend/db/models.py. Delete it and the duplicate is accepted.
     """
-    row = {
-        "id": str(uuid.uuid4()), "race_id": "r1", "player_id": "p1",
+    session = init_db(throwaway_db)()
+    race_id = f"r_double_insert_{uuid.uuid4().hex[:8]}"
+    standings = [_Namespace(s) for s in _standings(race_id)]
+
+    written = crud.save_race_results(session, race_id, standings)
+    assert len(written) == 2
+
+    # The losing writer in the race the index exists to settle: it read
+    # "no row for (race_id, p1_...)" before the write above landed, and
+    # now goes on to insert one.
+    duplicate = {
+        "id": str(uuid.uuid4()),
+        "race_id": race_id,
+        "player_id": standings[0].player_id,
         "car_id": "P01", "position": 1, "points": 25, "total_time": 100.0,
         "pit_laps": [], "compounds_used": ["MEDIUM"], "strategy_json": None,
         "retired": False,
     }
-
-    throwaway_db.race_results.insert_one({**row, "id": str(uuid.uuid4())})
-    throwaway_db.race_results.insert_one({**row, "id": str(uuid.uuid4())})
-    assert throwaway_db.race_results.count_documents(
-        {"race_id": "r1", "player_id": "p1"}
-    ) == 2, (
-        "without the index, MongoDB must actually accept the second "
-        "insert -- this is the vulnerability the index exists to close, "
-        "reproduced directly rather than assumed"
-    )
-
-    throwaway_db.race_results.delete_many({})
-    throwaway_db.race_results.create_index(
-        [("race_id", 1), ("player_id", 1)], unique=True
-    )
-
-    throwaway_db.race_results.insert_one({**row, "id": str(uuid.uuid4())})
     with pytest.raises(DuplicateKeyError):
-        throwaway_db.race_results.insert_one({**row, "id": str(uuid.uuid4())})
+        throwaway_db.race_results.insert_one(duplicate)
+
     assert throwaway_db.race_results.count_documents(
-        {"race_id": "r1", "player_id": "p1"}
-    ) == 1, "with the index in place, the second insert must be refused"
+        {"race_id": race_id, "player_id": standings[0].player_id}
+    ) == 1, "the index init_db creates must refuse the second row"
+    assert throwaway_db.race_results.count_documents({"race_id": race_id}) == 2, (
+        "and the race must still hold exactly one row per car, so its "
+        "championship points cannot have been doubled"
+    )
+
+
+def test_a_losing_upsert_retries_instead_of_escaping_to_the_worker(db, monkeypatch):
+    """NEW-6: with the unique index in place, an upsert that finds no
+    matching row decides to insert -- and loses if another worker's
+    insert for the same key lands first. pymongo surfaces that as
+    DuplicateKeyError and leaves the retry to the caller. Unhandled, it
+    escapes _persist_result and strands the whole job unacked until
+    reclaim_stalled picks it up.
+
+    The losing writer is simulated rather than raced for, and at the one
+    layer that makes the simulation faithful: the FIRST find_one_and_update
+    call has the competing row inserted underneath it and then raises
+    DuplicateKeyError, which is exactly the sequence the real loser sees.
+
+    Red line: the `except DuplicateKeyError:` retry in
+    crud.save_race_results.
+    """
+    from pymongo.collection import Collection
+
+    race_id = f"r_upsert_retry_{uuid.uuid4().hex[:8]}"
+    standings = [_Namespace(s) for s in _standings(race_id)]
+    real = Collection.find_one_and_update
+    calls = []
+
+    def losing_once(self, filter, *args, **kwargs):
+        calls.append(filter)
+        if len(calls) == 1:
+            # The other worker's insert lands first...
+            self.insert_one({
+                "id": str(uuid.uuid4()), "race_id": race_id,
+                "player_id": standings[0].player_id, "car_id": "P01",
+                "position": 1, "points": 25, "total_time": 100.0,
+                "pit_laps": [], "compounds_used": ["MEDIUM"],
+                "strategy_json": None, "retired": False,
+            })
+            # ...and this one's own insert is refused by the index.
+            raise DuplicateKeyError("simulated concurrent insert race")
+        return real(self, filter, *args, **kwargs)
+
+    monkeypatch.setattr(Collection, "find_one_and_update", losing_once)
+
+    try:
+        rows = crud.save_race_results(db, race_id, standings)
+
+        assert len(rows) == 2
+        assert len(calls) == 3, "the losing car must have been retried exactly once"
+        assert db.db.race_results.count_documents({"race_id": race_id}) == 2, (
+            "the retry must land on the row the winner inserted, not add "
+            "a third"
+        )
+        winner = db.db.race_results.find_one(
+            {"race_id": race_id, "player_id": standings[0].player_id}
+        )
+        assert winner["position"] == 1 and winner["car_id"] == "P01"
+    finally:
+        monkeypatch.undo()
+        db.db.race_results.delete_many({"race_id": race_id})
 
 
 def test_init_db_creates_the_race_results_unique_index(throwaway_db):

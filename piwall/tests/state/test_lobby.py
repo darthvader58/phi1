@@ -299,49 +299,185 @@ def test_set_player_field_on_a_missing_lobby_raises(replica_a):
 
 
 def test_join_never_hands_two_concurrent_new_players_the_same_default_car_id(
-    replica_a, replica_b
+    replica_a,
 ):
     """N2 (fix round 3): car_id is an engine identity, not a display
     label -- main.py keys belief dicts by it, and engine/race.py keys
     self.strategies and self.belief_models by it. Two concurrent
     brand-new joins with no explicit car_id used to both default to
     "P01" from a snapshot read before the write, handing one player's
-    bot both cars. The default is now assigned inside the same atomic
-    step that determines the pre-write count, so this must not happen no
-    matter how the two joins interleave.
+    bot both cars.
+
+    Round 3's version of this test hooked replica_a._redis.get to stall
+    one join mid-read, which is how the SEQUENTIAL lobby mutators are
+    tested elsewhere in this file -- but join() goes through an EVALSHA
+    and never calls _redis.get at all, so the hook fired zero times and
+    the two joins ran strictly in sequence (re-review of round 3,
+    NEW-5). This interleaves for real instead: eight threads, each with
+    its own LobbyStore on its own connection, all released from one
+    threading.Barrier into the same empty lobby.
+
+    Red line: the default assignment inside _JOIN_SCRIPT --
+    `player_data.car_id = string.format('P%02d', n)`. Replace it with a
+    constant, or move the choice back out of the script into Python
+    where each thread picks from its own pre-read snapshot, and the
+    eight ids stop being eight.
     """
     replica_a.create(RACE, track="bahrain", race_type="quick")
 
-    a_read = threading.Event()
-    b_done = threading.Event()
-    real_get = replica_a._redis.get
+    thread_count = 8
+    barrier = threading.Barrier(thread_count)
+    car_ids = {}
+    clients = []
 
-    def delayed_get(*args, **kwargs):
-        result = real_get(*args, **kwargs)
-        a_read.set()
-        b_done.wait(timeout=2)
-        return result
+    def joiner(index):
+        client = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
+        clients.append(client)
+        store = LobbyStore(redis_client=client)
+        # register_script does not touch the network, so every thread is
+        # already loaded and waiting when the barrier releases.
+        barrier.wait(timeout=5)
+        car_ids[index] = store.join(
+            RACE, f"p_{index}", {"username": f"u{index}"}, max_players=thread_count
+        )[2]
 
-    replica_a._redis.get = delayed_get
-    outcomes = {}
-
-    def try_join(store, key, player_id):
-        outcomes[key] = store.join(RACE, player_id, {"username": player_id})
-
+    threads = [
+        threading.Thread(target=joiner, args=(i,)) for i in range(thread_count)
+    ]
     try:
-        thread = threading.Thread(target=try_join, args=(replica_a, "a", "p_a"))
-        thread.start()
-        a_read.wait(timeout=0.5)
-        try_join(replica_b, "b", "p_b")
-        b_done.set()
-        thread.join(timeout=2)
-        assert not thread.is_alive()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
     finally:
-        replica_a._redis.get = real_get
+        for client in clients:
+            client.close()
 
-    car_id_a = outcomes["a"][2]
-    car_id_b = outcomes["b"][2]
-    assert car_id_a != car_id_b, (
-        f"two concurrent new joins were both assigned {car_id_a!r} -- "
-        f"one player's bot now drives both cars"
+    assert len(car_ids) == thread_count, "every concurrent join must have returned"
+    assert len(set(car_ids.values())) == thread_count, (
+        f"eight concurrent new joins shared a default car_id: "
+        f"{sorted(car_ids.values())} -- one player's bot now drives two cars"
     )
+    stored = {p["car_id"] for p in replica_a.players(RACE).values()}
+    assert stored == set(car_ids.values()), (
+        "the car_ids join() reported must be the ones actually stored"
+    )
+
+
+def test_a_rejoin_without_a_car_id_keeps_the_one_the_player_already_has(
+    replica_a, replica_b
+):
+    """A re-join must not silently rename the player. Round 3 recomputed
+    the default on every join, so pressing the frontend's Join button a
+    second time (the natural way to change starting compound -- and it
+    never sends a car_id, frontend/src/lib/api.ts) moved that player to
+    a different engine identity.
+
+    The player here holds a car_id of their own choosing, which is what
+    makes this test about the re-join rule specifically: "lowest label
+    nobody else holds" would answer "P01" and rename them, so only the
+    re-join branch can keep VEL-01.
+
+    Red line: `player_data.car_id = existing.car_id` in _JOIN_SCRIPT.
+    """
+    replica_a.create(RACE, track="bahrain")
+    _, _, first = replica_a.join(RACE, "p_a", {"username": "alex", "car_id": "VEL-01"})
+
+    # Same player, no car_id -- exactly what the frontend sends.
+    is_new, _count, rejoined = replica_b.join(
+        RACE, "p_a", {"username": "alex", "starting_compound": "SOFT"}
+    )
+
+    assert is_new is False
+    assert rejoined == first == "VEL-01", (
+        f"a re-join reassigned {first!r} -> {rejoined!r}; car_id is an "
+        f"engine identity, not a label the server may re-pick at will"
+    )
+    assert replica_b.players(RACE)["p_a"]["car_id"] == "VEL-01"
+
+
+def test_a_new_player_after_a_rejoin_does_not_collide_with_it(replica_a):
+    """The harm NEW-1 actually reproduced, end to end and with no
+    concurrency at all: A joins, B joins, A re-joins, C joins -- and C
+    was handed the same label the re-join had just moved A onto. Both
+    reached _build_job_and_manifest, and engine/race.py keys
+    self.strategies and self.belief_models by car_id, so one player's
+    bot drove both cars, sealed into a manifest and a replay hash.
+
+    Red line: round 3's `player_data.car_id = string.format("P%02d",
+    count + 1)` -- the unconditional default this round replaced. Round
+    4 replaced that one line with two independent guards (keep a
+    re-join's existing id; derive a new player's from the lowest unheld
+    label), and for THIS four-call sequence either guard alone is enough
+    to prevent the collision, so each has its own single-line test above
+    and below. This one pins the reported behaviour end to end.
+    """
+    replica_a.create(RACE, track="bahrain")
+    replica_a.join(RACE, "p_a", {"username": "alex"})
+    replica_a.join(RACE, "p_b", {"username": "bo"})
+    replica_a.join(RACE, "p_a", {"username": "alex"})  # re-join, no car_id
+    replica_a.join(RACE, "p_c", {"username": "cass"})
+
+    car_ids = [p["car_id"] for p in replica_a.players(RACE).values()]
+    assert sorted(car_ids) == ["P01", "P02", "P03"], (
+        f"lobby ended with {sorted(car_ids)} -- two players sharing a car_id "
+        f"means engine/race.py keys one strategy and one BeliefModel for both"
+    )
+
+
+def test_a_default_car_id_fills_the_lowest_label_nobody_holds(replica_a):
+    """A default derived from the player count stops being unique the
+    moment any label is out of sequence -- an explicit "P01" from one
+    player is enough. The lowest unheld label is chosen instead.
+
+    Red line: the `while taken[string.format('P%02d', n)] do` loop in
+    _JOIN_SCRIPT. Replace it with `count + 1` and the second join here
+    collides with the first.
+    """
+    replica_a.create(RACE, track="bahrain")
+    replica_a.join(RACE, "p_a", {"username": "alex", "car_id": "P02"})
+
+    _, _, car_id = replica_a.join(RACE, "p_b", {"username": "bo"})
+
+    assert car_id == "P01", f"expected the lowest free label, got {car_id!r}"
+    _, _, third = replica_a.join(RACE, "p_c", {"username": "cass"})
+    assert third == "P03"
+
+
+def test_join_refuses_a_car_id_another_player_in_the_lobby_holds(
+    replica_a, replica_b
+):
+    """The same collision by its other route: an explicitly-requested
+    car_id somebody else already holds. Checking for it in the handler
+    would reopen the read-then-write window the script exists to close,
+    so the refusal lives in the script.
+
+    Red line: the `elseif taken[player_data.car_id] then` branch in
+    _JOIN_SCRIPT.
+    """
+    from backend.state.lobby import CarIdTakenError
+
+    replica_a.create(RACE, track="bahrain")
+    replica_a.join(RACE, "p_a", {"username": "alex", "car_id": "VEL-01"})
+
+    with pytest.raises(CarIdTakenError):
+        replica_b.join(RACE, "p_b", {"username": "bo", "car_id": "VEL-01"})
+
+    assert set(replica_a.players(RACE)) == {"p_a"}, (
+        "the refused join must not have been written at all"
+    )
+
+
+def test_a_player_may_resend_the_car_id_it_already_holds(replica_a):
+    """The refusal above must not lock a player out of their own
+    re-join: a client that echoes back the car_id it was given (or asks
+    for the one it already has) is not a collision."""
+    replica_a.create(RACE, track="bahrain")
+    replica_a.join(RACE, "p_a", {"username": "alex", "car_id": "VEL-01"})
+
+    is_new, count, car_id = replica_a.join(
+        RACE, "p_a", {"username": "alex", "car_id": "VEL-01"}
+    )
+
+    assert (is_new, count, car_id) == (False, 1, "VEL-01")

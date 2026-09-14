@@ -7,6 +7,7 @@ import uuid
 from typing import List, Optional
 
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from .models import to_namespace
 
@@ -162,6 +163,18 @@ def save_race_results(db, race_id: str, standings: list):
     and create two rows), which is exactly how two workers persisting the
     same match concurrently (reclaim_stalled firing while the first
     worker is still running) could double a race's championship points.
+
+    That index is also why this retries once. An upsert that finds no
+    matching document decides to insert, and if the other worker's insert
+    for the same key lands in between, the index refuses this one with
+    DuplicateKeyError -- documented pymongo behaviour, with the retry left
+    to the caller. Letting it escape would mean escaping _persist_result,
+    which strands the whole job unacked until reclaim_stalled picks it up:
+    survivable, but it is the same "something escapes persist()" shape
+    that has already cost this task two rounds, and the retry is one line.
+    The retry cannot loop: the only way to get here is that the row now
+    exists, so the second attempt matches it and takes the plain-update
+    path, which no unique index can refuse.
     """
     rows = []
     for car in standings:
@@ -177,14 +190,21 @@ def save_race_results(db, race_id: str, standings: list):
             "strategy_json": None,
             "retired": car.retired,
         }
-        updated = db.db.race_results.find_one_and_update(
-            {"race_id": race_id, "player_id": car.player_id},
-            {"$set": row, "$setOnInsert": {"id": _id()}},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
+        try:
+            updated = _upsert_race_result(db, race_id, car.player_id, row)
+        except DuplicateKeyError:
+            updated = _upsert_race_result(db, race_id, car.player_id, row)
         rows.append(to_namespace(updated))
     return rows
+
+
+def _upsert_race_result(db, race_id: str, player_id: str, row: dict):
+    return db.db.race_results.find_one_and_update(
+        {"race_id": race_id, "player_id": player_id},
+        {"$set": row, "$setOnInsert": {"id": _id()}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
 
 
 def save_bot_submission(db, player_id: str, code: str, race_id: Optional[str] = None):

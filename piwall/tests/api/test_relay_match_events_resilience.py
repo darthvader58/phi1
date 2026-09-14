@@ -126,3 +126,48 @@ def test_relay_retries_subscribe_after_a_failure_at_startup(monkeypatch):
         f"the relay must recover and process events after a subscribe "
         f"retry; got {calls}"
     )
+
+
+def test_shutdown_survives_the_relay_raising_on_its_way_out():
+    """N4's residual (round 3), closed. `lifespan` cancels the relay and
+    awaits it; cancelling runs the relay's own `finally`, which closes
+    the pub/sub connection. Against a Redis that has already gone away
+    that raises, and the raise arrives at `await event_task` as itself,
+    not as CancelledError -- so catching only CancelledError let it
+    propagate out of ASGI shutdown and turn a clean stop into a failed
+    one.
+
+    The relay is replaced wholesale here rather than having Redis torn
+    out from under a real one: what is being pinned is lifespan's
+    handling of a task that raises while being cancelled, and a stand-in
+    reproduces exactly that with no dependence on which call inside the
+    real relay's finally happens to fail.
+
+    Red line: `except Exception:` in backend/main.py's lifespan.
+    """
+    import backend.main as main
+    from fastapi import FastAPI
+
+    started = asyncio.Event()
+
+    async def exploding_relay():
+        try:
+            started.set()
+            await asyncio.sleep(3600)
+        finally:
+            # pubsub.close() against a dead connection.
+            raise RuntimeError("simulated pubsub.close() against a dead Redis")
+
+    async def scenario():
+        app = FastAPI()
+        async with main.lifespan(app):
+            await asyncio.wait_for(started.wait(), timeout=2)
+        # Reaching here at all is the assertion: the relay's exception
+        # must not have escaped the shutdown half of the context manager.
+
+    real_relay = main._relay_match_events
+    main._relay_match_events = exploding_relay
+    try:
+        asyncio.run(scenario())
+    finally:
+        main._relay_match_events = real_relay

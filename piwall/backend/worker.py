@@ -197,7 +197,11 @@ def _persist_result(db, result: dict) -> None:
       version of this made it idempotent too, but briefly left the
       collection with zero rows for an already-finished race that
       GET /api/race/{id} and /api/season both read live -- see crud.py's
-      docstring on save_race_results.)
+      docstring on save_race_results.) Its own DuplicateKeyError -- two
+      workers' upserts both deciding "no match, insert" for the same key
+      -- is retried inside save_race_results rather than escaping into
+      here (round 4, closing NEW-6), because the retry turns it into the
+      plain update it would have been had the two not overlapped.
     - save_race_data is already idempotent ($set).
     - Each player's Elo transition is its own unit: the elo_history row is
       written BEFORE the rating moves, using the unique index on
@@ -241,6 +245,35 @@ def _persist_result(db, result: dict) -> None:
             f"persisted"
         )
 
+    # Every reason to refuse this job is established BEFORE any status is
+    # marked finished. k_factor's source used to be the in-memory lobby
+    # (lobby.race_type), which no longer exists by the time a match
+    # finishes. The job payload does not carry race_type either -- adding
+    # it there would be a second copy that could drift from the one
+    # create_race() already wrote durably before this job ever existed, so
+    # the race document is read instead, as the single authority for it. A
+    # missing race document is refused rather than guessed: silently
+    # defaulting to k=32 would apply the wrong K-factor to what may have
+    # been a season race and write that durably, with nothing to say it
+    # was ever in doubt.
+    #
+    # This read sits here, above the writes, rather than beside the Elo
+    # loop that consumes it (round 3, N7's residual). It depends on
+    # nothing any write below produces, and while it sat lower a job with
+    # no race document marked the Redis lobby "finished" and only THEN
+    # raised -- so /api/races reported the race finished while
+    # GET /api/race/{id} 404'd on the DB read, and the job retried
+    # forever in that state. Refusing first leaves the lobby untouched,
+    # which is the honest report of a job that did not complete.
+    race = crud.get_race(db, match_id)
+    if race is None:
+        raise RuntimeError(
+            f"no race document for {match_id!r} -- refusing to guess a "
+            f"k_factor rather than silently apply the wrong one"
+        )
+    race_type = getattr(race, "race_type", "quick")
+    k_factor = 48.0 if race_type == "season" else 32.0
+
     # The lobby's terminal status is durable, cross-replica state, and it
     # must not depend on whether any API replica happens to have a
     # spectator socket open for this race -- that was F2: SOCKETS gating a
@@ -253,13 +286,7 @@ def _persist_result(db, result: dict) -> None:
     # ordering means a reader who sees the lobby as "finished" (main.py's
     # get_race falls through to Mongo for a terminal lobby) is more likely
     # to find the race document already there too, not the other way
-    # round. It does not fully close the interaction with the F16 path
-    # below: if this match_id turns out to have no race document at all,
-    # update_race_status is a harmless no-op (matched_count 0) and the
-    # lobby still gets marked "finished" a few lines later, before the
-    # RuntimeError -- so that poison-pill job still reports "finished"
-    # while GET /api/race/{id} 404s on the DB read. Both are edge cases
-    # the ordering alone cannot remove; noted rather than silently left.
+    # round.
     crud.update_race_status(db, match_id, "finished")
     # A KeyError means the lobby already aged past its 6h TTL (or, in a
     # test, was never created at all) -- the database row above is the
@@ -278,24 +305,6 @@ def _persist_result(db, result: dict) -> None:
         db, match_id, result["lap_data"],
         [to_namespace(e) for e in result["events"]],
     )
-
-    # k_factor's source used to be the in-memory lobby (lobby.race_type),
-    # which no longer exists by the time a match finishes. The job payload
-    # does not carry race_type either -- adding it there would be a second
-    # copy that could drift from the one create_race() already wrote
-    # durably before this job ever existed, so the race document is read
-    # instead, as the single authority for it. A missing race document is
-    # refused rather than guessed: silently defaulting to k=32 would apply
-    # the wrong K-factor to what may have been a season race and write
-    # that durably, with nothing to say it was ever in doubt.
-    race = crud.get_race(db, match_id)
-    if race is None:
-        raise RuntimeError(
-            f"no race document for {match_id!r} -- refusing to guess a "
-            f"k_factor rather than silently apply the wrong one"
-        )
-    race_type = getattr(race, "race_type", "quick")
-    k_factor = 48.0 if race_type == "season" else 32.0
 
     standings_tuples = [
         (c["player_id"], c["position"], c["retired"])

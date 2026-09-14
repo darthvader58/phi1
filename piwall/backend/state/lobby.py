@@ -80,8 +80,8 @@ return 1
 # ARGV[1] = TTL seconds
 # ARGV[2] = max_players
 # ARGV[3] = player id
-# ARGV[4] = player data, JSON-encoded. If data.car_id is missing/empty and
-#           this is a new player, the script assigns one -- see below.
+# ARGV[4] = player data, JSON-encoded. If data.car_id is missing/empty the
+#           script supplies one -- see below.
 #
 # A read-count-then-decide-then-write across an HTTP handler -- what
 # join_race used to do with .get() plus a Python-side len() check -- lets
@@ -94,19 +94,38 @@ return 1
 # display label (main.py's own docstring on CAR_ID_PATTERN says so, and
 # engine/race.py keys self.strategies and self.belief_models by it), so
 # two concurrent new joins computing a default from a pre-write snapshot
-# could both land on "P01" and hand one player's bot both cars. A default
-# is therefore assigned HERE, inside the same atomic step that already
-# knows the true pre-write count, so two concurrent new joins can never
-# observe the same count and can never be assigned the same default.
+# could both land on "P01" and hand one player's bot both cars. Everything
+# that decides a car_id therefore happens HERE, inside the one atomic step
+# that can see the lobby's true pre-write contents:
+#
+#   * A RE-JOIN keeps the car_id the player already holds. Round 3 derived
+#     the default from the pre-write player count, which for a re-join
+#     already counts the rejoining player -- so re-joining moved that
+#     player to a fresh label and left the one they vacated free for the
+#     next genuinely-new player to be handed as well. Four sequential API
+#     calls (join A, join B, re-join A, join C) were enough to put two
+#     'P03's in one lobby, and the shipped frontend never sends a car_id at
+#     all (frontend/src/lib/api.ts), so that was the DEFAULT path.
+#   * A NEW player with no car_id gets the lowest P%02d that nobody else in
+#     the lobby holds, rather than count + 1 -- a label derived from the
+#     count is only unique while no label has ever been vacated, which is
+#     precisely the assumption the re-join bug broke.
+#   * An EXPLICIT car_id that another player in this lobby already holds is
+#     refused. That is the same collision by a different route, and a
+#     caller cannot check for it beforehand without reopening the very
+#     read-then-write window this script exists to close.
 #
 # A re-join (the player id is already present) never counts against the
 # cap and always succeeds -- it can only ever shrink or hold steady the
 # player count, never grow it past max_players.
 #
-# Returns false if the lobby does not exist, else a JSON object
-# {"full": true} if this is a new player and the lobby is already at
-# max_players, or {"full": false, "is_new": bool, "count": <player count
-# after this write>, "car_id": <the car_id actually stored>} otherwise.
+# Returns false if the lobby does not exist, else a JSON object:
+#   {"full": true}                    new player, lobby already at max
+#   {"full": false, "taken": true, "car_id": <id>}
+#                                     explicit car_id held by someone else
+#   {"full": false, "taken": false, "is_new": bool,
+#    "count": <player count after this write>,
+#    "car_id": <the car_id actually stored>}
 _JOIN_SCRIPT = """
 local raw = redis.call('GET', KEYS[1])
 if raw == false then
@@ -117,7 +136,8 @@ if lobby.players == nil then
     lobby.players = {}
 end
 local player_id = ARGV[3]
-local is_new = lobby.players[player_id] == nil
+local existing = lobby.players[player_id]
+local is_new = existing == nil
 local count = 0
 for _ in pairs(lobby.players) do
     count = count + 1
@@ -126,9 +146,38 @@ if is_new and count >= tonumber(ARGV[2]) then
     return cjson.encode({full = true})
 end
 local player_data = cjson.decode(ARGV[4])
-if player_data.car_id == nil or player_data.car_id == cjson.null or player_data.car_id == '' then
-    player_data.car_id = string.format("P%02d", count + 1)
+
+-- A car_id absent from the JSON arrives as nil; an explicit JSON null
+-- arrives as cjson.null, which is a sentinel userdata and NOT nil.
+local function blank(value)
+    return value == nil or value == cjson.null or value == ''
 end
+
+-- Every car_id held by somebody OTHER than the player being written. The
+-- rejoining player's own current label is deliberately excluded, so
+-- re-sending it (or keeping it, below) is never mistaken for a clash.
+local taken = {}
+for pid, p in pairs(lobby.players) do
+    if pid ~= player_id and type(p) == 'table' and not blank(p.car_id) then
+        taken[p.car_id] = true
+    end
+end
+
+if blank(player_data.car_id) and not is_new then
+    player_data.car_id = existing.car_id
+end
+if blank(player_data.car_id) then
+    local n = 1
+    while taken[string.format('P%02d', n)] do
+        n = n + 1
+    end
+    player_data.car_id = string.format('P%02d', n)
+elseif taken[player_data.car_id] then
+    return cjson.encode({
+        full = false, taken = true, car_id = player_data.car_id
+    })
+end
+
 lobby.players[player_id] = player_data
 redis.call('SET', KEYS[1], cjson.encode(lobby), 'EX', ARGV[1])
 local new_count = count
@@ -136,7 +185,8 @@ if is_new then
     new_count = count + 1
 end
 return cjson.encode({
-    full = false, is_new = is_new, count = new_count, car_id = player_data.car_id
+    full = false, taken = false, is_new = is_new, count = new_count,
+    car_id = player_data.car_id
 })
 """
 
@@ -144,6 +194,16 @@ return cjson.encode({
 class LobbyFullError(Exception):
     """join() raised this: a new player arrived after the lobby already
     reached max_players. Never raised for a re-join."""
+
+
+class CarIdTakenError(Exception):
+    """join() raised this: the caller asked for a car_id that another
+    player in this lobby already holds.
+
+    car_id is an engine identity (engine/race.py keys self.strategies and
+    self.belief_models by it), so honouring the request would hand one
+    player's bot both cars. Never raised for a player re-sending the
+    car_id they already hold."""
 
 
 class LobbyStore:
@@ -229,15 +289,24 @@ class LobbyStore:
         existing player's row (a re-join, which never counts against the
         cap).
 
-        If data["car_id"] is missing or empty and this is a new player,
-        the script assigns one from the same atomic step that determined
-        the pre-write player count -- never from a count read separately
-        beforehand, which two concurrent new joins could both see as the
-        same value and so both compute the same default. car_id is an
-        engine identity (main.py keys belief dicts by it; engine/race.py
-        keys self.strategies and self.belief_models by it), not cosmetic
-        display text, so two players landing on the same one is not a
-        display glitch -- it hands one player's bot both cars.
+        car_id is an engine identity (main.py keys belief dicts by it;
+        engine/race.py keys self.strategies and self.belief_models by
+        it), not cosmetic display text, so two players in one lobby
+        landing on the same one is not a display glitch -- it hands one
+        player's bot both cars, and the manifest and replay hash seal
+        that in. Every decision about it is therefore made inside the
+        script, where the read and the write are a single atomic step:
+
+        - A re-join (this player id is already present) KEEPS the car_id
+          it already holds whenever data["car_id"] is missing or empty.
+          Deriving a fresh default for a re-join is what round 3 did, and
+          it both moved that player and freed their old label for the
+          next new player to be handed too.
+        - A new player with no car_id gets the lowest "P%02d" no other
+          player in the lobby holds -- not one derived from the player
+          count, which stops being unique the moment any label is
+          vacated.
+        - An explicit car_id another player already holds is refused.
 
         Returns (is_new, player_count, car_id) — player_count is the
         lobby's total after this write and car_id is whatever was
@@ -245,7 +314,9 @@ class LobbyStore:
         inside the same atomic step rather than read separately
         afterwards (which would itself race a concurrent join). Raises
         KeyError if the lobby does not exist, LobbyFullError if this is a
-        new player and the lobby is already at max_players.
+        new player and the lobby is already at max_players, and
+        CarIdTakenError if an explicitly requested car_id belongs to
+        somebody else in this lobby.
         """
         raw = self._join_script(
             keys=[self._key(race_id)],
@@ -260,6 +331,11 @@ class LobbyStore:
         result = json.loads(raw)
         if result["full"]:
             raise LobbyFullError(f"lobby {race_id!r} is already full")
+        if result["taken"]:
+            raise CarIdTakenError(
+                f"car_id {result['car_id']!r} is already held by another "
+                f"player in lobby {race_id!r}"
+            )
         return result["is_new"], result["count"], result["car_id"]
 
     def players(self, race_id: str) -> dict:

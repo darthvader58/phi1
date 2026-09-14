@@ -75,3 +75,35 @@ def test_init_db_creates_the_index_on_a_clean_collection(throwaway_db):
 
     names = {ix["name"] for ix in throwaway_db.elo_history.list_indexes()}
     assert "player_id_1_race_id_1" in names
+
+
+def test_init_db_survives_pre_existing_race_results_duplicates(throwaway_db):
+    """The same protection for the newer (race_id, player_id) index on
+    race_results (review round 3, N6). Round 1 of that fix persisted
+    results insert-only, so a live deployment redelivered a match before
+    round 2 landed is holding exactly the duplicate pair this index
+    forbids -- and init_db() runs from both the API's lifespan and the
+    worker's run_forever, so a raise here stops BOTH processes booting
+    over data the boot itself cannot fix.
+
+    The behaviour was verified correct in round 3 but nothing pinned it
+    (re-review of round 3, NEW-3).
+
+    Red line: `except DuplicateKeyError:` in models.py's
+    _create_unique_index_or_log -- the helper both unique indexes now go
+    through. (Deleting the race_results CALL to that helper instead is
+    caught by test_the_unique_index_is_what_prevents_a_double_insert in
+    tests/db/test_race_results_persistence.py; between them, neither
+    half can be removed unnoticed.)
+    """
+    throwaway_db.race_results.insert_many([
+        {"id": "a", "race_id": "r1", "player_id": "p1", "car_id": "P01",
+         "position": 1, "points": 25, "retired": False},
+        {"id": "b", "race_id": "r1", "player_id": "p1", "car_id": "P01",
+         "position": 1, "points": 25, "retired": False},
+    ])
+
+    init_db(throwaway_db)  # must not raise
+
+    names = {ix["name"] for ix in throwaway_db.race_results.list_indexes()}
+    assert "race_id_1_player_id_1" not in names

@@ -46,7 +46,7 @@ from .engine.build import build_track_physics
 from .jobs.events import MatchEvents
 from .jobs.queue import MatchJobQueue
 from .sandbox.runner import NAMESPACE_RESERVED_KEYS, STRATEGY_TEMPLATE
-from .state.lobby import LobbyFullError, LobbyStore
+from .state.lobby import CarIdTakenError, LobbyFullError, LobbyStore
 from backend.sandbox.validation import validate_submission
 from backend.sandbox.isolation import ChildFailed, LimitExceeded
 from backend.sandbox.match_job import run_match_isolated
@@ -209,6 +209,18 @@ async def lifespan(app: FastAPI):
         await event_task
     except asyncio.CancelledError:
         pass
+    except Exception:
+        # N4's residual (round 3), closed. Cancelling the relay runs its
+        # own `finally`, which closes the pub/sub connection -- against a
+        # Redis that has already gone away, that raises, and the raise
+        # comes out of `await event_task` as itself rather than as
+        # CancelledError. Uncaught it propagates out of ASGI shutdown,
+        # turning a clean stop into a failed one over a connection that
+        # was being discarded anyway. There is nothing left to salvage at
+        # this point in shutdown, so it is logged and swallowed; anything
+        # this task needed to do durably was done before it was
+        # cancelled.
+        logger.exception("event relay did not shut down cleanly")
     print("PIT WALL shutting down...")
 
 
@@ -447,15 +459,15 @@ def join_race(race_id: str, req: JoinRaceRequest, x_api_key: str = Header()):
 
     # car_id is an engine identity, not a display label (see
     # CAR_ID_PATTERN's own docstring below, and engine/race.py's
-    # self.strategies / self.belief_models, both keyed by it) -- so the
-    # default label must not be computed from a pre-write snapshot the
-    # way it used to be. Two concurrent brand-new joins reading the same
-    # snapshot could both default to "P01" and hand one player's bot both
-    # cars, sealed into a manifest and a replay. LOBBIES.join() assigns
-    # the default (when req.car_id is not given) from inside the same
-    # atomic step that does the capacity check, so two concurrent new
-    # joins can never observe the same pre-write count and can never be
-    # handed the same default.
+    # self.strategies / self.belief_models, both keyed by it) -- so
+    # nothing about it is decided here. Any check or default computed in
+    # this handler would sit between LOBBIES.get() above and the write
+    # below, which is exactly the window two replicas can both pass. It
+    # is all done inside LOBBIES.join()'s single atomic script instead:
+    # a re-join keeps the car_id it already holds (req.car_id is None on
+    # every join the shipped frontend makes), a new player gets the
+    # lowest label nobody else holds, and an explicit label somebody
+    # else holds is refused.
     try:
         _is_new, position, car_id = LOBBIES.join(race_id, player["id"], {
             "username": player["username"],
@@ -465,6 +477,8 @@ def join_race(race_id: str, req: JoinRaceRequest, x_api_key: str = Header()):
         })
     except LobbyFullError:
         raise HTTPException(400, "Race is full (8 players max)")
+    except CarIdTakenError:
+        raise HTTPException(400, f"car_id {req.car_id} is already taken in this race")
     return {"car_id": car_id, "position": position}
 
 
@@ -1286,20 +1300,80 @@ async def _stream_stored_replay(race_id: str) -> None:
     beyond this phase (see the phase plan's "Deferred beyond this phase"
     section) -- so there is no lap-by-lap body to re-stream here yet. This
     sends one terminal "finished" event rather than the paced per-lap
-    messages the old in-process simulation produced. Standings, lap data
-    and Elo ARE persisted (backend/worker.py's _persist_result writes all
-    three) -- they are simply not re-fetched and re-broadcast here; a
-    spectator who wants them reads GET /api/race/{race_id} after this
-    event arrives.
+    messages the old in-process simulation produced.
+
+    What it does carry is the final standings, because the client on the
+    other end of this socket needs them to render the result at all.
+    Round 1 of the decouple shrank this payload to {race_id,
+    replay_sha256} on the reasoning that "a spectator who wants them
+    reads GET /api/race/{race_id} after this event arrives" -- but no
+    client does that. frontend/src/lib/websocket.ts's "finished" case
+    does `if (msg.result) setResult(msg.result)`, and the shrunken
+    payload is truthy, so the race page then evaluates
+    `[...result.standings]` on a result that has no standings. That
+    throws inside render, and with no error boundary under
+    frontend/src/app/ it takes the whole race page down: every finished
+    race, for every spectator. Round 3's re-review carried it forward as
+    NEW-8, informational.
+
+    The rows come from race_results (the post-race authority: it is
+    written after the engine applies its end-of-race compound-rule time
+    penalties, so positions and total_time here are final) rather than
+    from the last lap_data snapshot (taken before them). gap_to_leader
+    and pit_count are not stored -- they are derived from total_time and
+    pit_laps, which are. A race with no document or no rows yet sends an
+    empty standings list, which renders as an empty result panel rather
+    than crashing the page.
     """
     db = SessionLocal()
     try:
         replay_sha256 = crud.get_replay_hash(db, race_id)
+        race = crud.get_race(db, race_id)
+        results = crud.get_race_results(db, race_id) if race else []
+        lap_data = getattr(race, "lap_data_json", None) or [] if race else []
     finally:
         db.close()
 
+    # get_race_results sorts by position, so the leader is first; a race
+    # whose winner retired (everyone retired) has no meaningful baseline
+    # and every gap is reported as 0.0.
+    leader_time = None
+    for row in results:
+        if not row.retired and row.total_time is not None:
+            leader_time = row.total_time
+            break
+
+    standings = [
+        {
+            "car_id": row.car_id,
+            "position": row.position,
+            "retired": row.retired,
+            "points": row.points,
+            "total_time": row.total_time,
+            "gap_to_leader": (
+                round(row.total_time - leader_time, 3)
+                if not row.retired
+                and row.total_time is not None
+                and leader_time is not None
+                else 0.0
+            ),
+            "pit_laps": row.pit_laps,
+            "pit_count": len(row.pit_laps or []),
+            "compounds_used": row.compounds_used,
+        }
+        for row in results
+    ]
+
     await _broadcast(race_id, {
         "type": "finished",
-        "result": {"race_id": race_id, "replay_sha256": replay_sha256},
+        "result": {
+            "race_id": race_id,
+            "replay_sha256": replay_sha256,
+            "track": getattr(race, "track", None) if race else None,
+            # The number of laps actually run, which is what the tyre
+            # strategy chart scales its stint bars against.
+            "total_laps": lap_data[-1].get("lap", len(lap_data)) if lap_data else 0,
+            "standings": standings,
+        },
     })
 

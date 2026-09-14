@@ -485,6 +485,60 @@ def test_a_missing_race_document_refuses_the_job_rather_than_guessing_k(db):
         db.db.race_results.delete_many({"race_id": match_id})
 
 
+def test_a_refused_job_does_not_leave_the_lobby_reporting_finished(db):
+    """The N7 residual, closed (re-review of round 3, NEW-4).
+
+    A job whose race document is missing raises the F16 RuntimeError and
+    is retried forever. While the race-document lookup sat below the
+    status writes, that job first marked the Redis lobby "finished" --
+    so /api/races reported the race finished while GET /api/race/{id}
+    404'd on the DB read, permanently. Round 3's report called closing
+    this a redesign; it is a hoist, and this is the behaviour it buys.
+
+    Red line: the `race = crud.get_race(db, match_id)` / `if race is
+    None: raise RuntimeError(...)` block's POSITION in
+    backend/worker.py's _persist_result -- above crud.update_race_status
+    rather than below it. Move it back down and the lobby below reads
+    "finished".
+    """
+    match_id = f"m_poison_lobby_{uuid.uuid4().hex[:8]}"
+    manifest = build_manifest(
+        match_id=match_id, seed=1, track="bahrain",
+        participants=[Participant(0, None, None, None, "VEL-01")],
+    )
+    crud.save_manifest(db, manifest)
+    # Deliberately no crud.create_race(db, ...): this is the poison pill.
+
+    lobbies = LobbyStore()
+    lobbies.create(match_id, track="bahrain", race_type="quick")
+    lobbies.set_status(match_id, "running")
+
+    result = {
+        "match_id": match_id,
+        "replay_sha256": "sha256:" + "7" * 64,
+        "standings": [
+            {"player_id": "VEL-01", "car_id": "VEL-01", "position": 1,
+             "retired": False, "total_time": 100.0, "pit_laps": [],
+             "compounds_used": ["MEDIUM"]},
+        ],
+        "lap_data": [{"lap": 1}],
+        "events": [],
+    }
+
+    try:
+        with pytest.raises(RuntimeError, match="no race document"):
+            _persist_result(db, result)
+
+        assert lobbies.get(match_id)["status"] == "running", (
+            "a job that refused itself must not have told every /api/races "
+            "reader the race finished -- GET /api/race/{id} 404s for it"
+        )
+    finally:
+        lobbies.delete(match_id)
+        db.db.manifests.delete_many({"match_id": match_id})
+        db.db.race_results.delete_many({"race_id": match_id})
+
+
 def test_a_crash_between_history_and_rating_still_converges_on_redelivery(db):
     """N1 (fix round 3): making the elo_history row the idempotency token
     moved the vulnerable window rather than closing it.
