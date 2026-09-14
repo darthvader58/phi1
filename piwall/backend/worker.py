@@ -19,6 +19,8 @@ import time
 from dataclasses import asdict
 from typing import Callable, Optional
 
+from pymongo.errors import DuplicateKeyError
+
 from .db import crud
 from .db.models import to_namespace
 from .determinism.canonical import canonical_json
@@ -30,8 +32,15 @@ from .jobs.events import MatchEvents
 from .jobs.queue import MatchJobQueue
 from .observability.logging import configure_logging, get_logger, match_context
 from .season.elo import compute_elo_updates
+from .state.lobby import LobbyStore
 
 log = get_logger("piwall.worker")
+
+# LobbyStore's constructor makes no Redis round trip (register_script only
+# computes a local SHA1; the script itself loads lazily on first EVAL), so
+# building this once at import time carries none of the risk that keeping
+# backend.main's MatchJobQueue eager did (see backend/main.py's _get_jobs).
+LOBBIES = LobbyStore()
 
 WORKER_NAME = f"{socket.gethostname()}-{os.getpid()}"
 
@@ -159,7 +168,8 @@ def _replay_sha256_of(replay: bytes) -> str:
 
 
 def _persist_result(db, result: dict) -> None:
-    """Write everything a finished match must leave behind, exactly once.
+    """Write everything a finished match must leave behind, exactly once
+    per player, no matter how many times this exact result is redelivered.
 
     Spec 4.1 puts result persistence here -- `result -> Mongo (atomic Elo)
     -> pub/sub notify` -- and it belongs in the worker rather than the API
@@ -167,25 +177,38 @@ def _persist_result(db, result: dict) -> None:
     the API enqueues a job and later learns only a race id and a replay
     hash (see backend/main.py's `_stream_stored_replay`).
 
-    The replay hash is written unconditionally: save_replay_hash is a $set
-    against the manifest's own row, so re-writing the same digest on a
-    redelivered job (the queue is at-least-once -- reclaim_stalled
-    redelivers a job whose worker died after running the match but before
-    acking) is harmless, and it must happen before the guard below or a
-    worker that dies between them would leave save_replay_hash's "the
-    result is durable" promise unmet forever.
+    Round 1 of this fix keyed a single "already done?" guard on
+    crud.get_race_results, the FIRST thing the block wrote. A worker that
+    died between that write and the Elo loop left results rows behind, so
+    every later delivery read the guard as "already done" and skipped the
+    Elo update and lap data forever -- lost, not merely delayed. There is
+    no single marker written last that a guard could key on instead
+    without the same problem recurring one line earlier the next time this
+    function grows a new write. So this makes every individual write
+    idempotent on its own terms instead of gating the whole block behind
+    one flag:
 
-    Everything after the guard is NOT naturally idempotent the way the
-    replay hash is: save_race_results and save_elo_history both insert_one
-    per call, and update_player_elo writes an absolute rating computed from
-    the CURRENT one. Determinism guarantees a redelivered job recomputes
-    the identical race, but it says nothing about a read-modify-write
-    against state that has already moved -- applying the same Elo delta
-    twice does not average out, it compounds. The guard (does this race
-    already have result rows?) makes that whole block run at most once per
-    match id in the normal case; the unique index on
-    elo_history(player_id, race_id) (backend/db/models.py) is the second
-    line of defense if that check-then-act is ever raced.
+    - save_replay_hash and update_race_status are already idempotent ($set
+      against a fixed key -- a repeat writes the same value over itself).
+    - save_race_results now replaces this race's rows wholesale (delete
+      then insert) rather than only ever inserting, so re-running it after
+      a partial or full previous run lands on the same final rows instead
+      of a duplicate set.
+    - save_race_data is already idempotent ($set).
+    - Each player's Elo transition is its own unit: the elo_history row is
+      written BEFORE the rating moves, using the unique index on
+      (player_id, race_id) as the idempotency token. A DuplicateKeyError
+      means an earlier delivery already recorded this player's transition
+      for this race, so this delivery skips moving their rating and
+      continues with the rest -- a raise here would strand the whole job
+      unacked forever (the exact bug Task 7's ordering was chasing), and a
+      partial redelivery must not let one already-applied player block
+      every other player's update.
+
+    That per-player ordering also fixes what round 1 got backwards:
+    computing the new rating and writing it BEFORE the history row meant
+    the index could only report a double-apply after the damage was
+    already done, not prevent it.
     """
     match_id = result["match_id"]
 
@@ -203,11 +226,18 @@ def _persist_result(db, result: dict) -> None:
             f"persisted"
         )
 
-    if crud.get_race_results(db, match_id):
-        # A prior delivery of this exact job already applied results and
-        # Elo. Re-running the block would duplicate the results rows and,
-        # worse, re-apply an Elo delta on top of a rating it already moved.
-        return
+    # The lobby's terminal status is durable, cross-replica state, and it
+    # must not depend on whether any API replica happens to have a
+    # spectator socket open for this race -- that was F2: SOCKETS gating a
+    # write nothing else guards. The worker is the one process that always
+    # runs exactly once per finished match, so it is where this belongs.
+    # A KeyError means the lobby already aged past its 6h TTL (or, in a
+    # test, was never created at all) -- the database row above is the
+    # durable record either way, so there is nothing left to update.
+    try:
+        LOBBIES.set_status(match_id, "finished")
+    except KeyError:
+        pass
 
     crud.update_race_status(db, match_id, "finished")
     # crud reads standings and events by attribute; the isolated child
@@ -225,9 +255,17 @@ def _persist_result(db, result: dict) -> None:
     # does not carry race_type either -- adding it there would be a second
     # copy that could drift from the one create_race() already wrote
     # durably before this job ever existed, so the race document is read
-    # instead, as the single authority for it.
+    # instead, as the single authority for it. A missing race document is
+    # refused rather than guessed: silently defaulting to k=32 would apply
+    # the wrong K-factor to what may have been a season race and write
+    # that durably, with nothing to say it was ever in doubt.
     race = crud.get_race(db, match_id)
-    race_type = race.race_type if race is not None else "quick"
+    if race is None:
+        raise RuntimeError(
+            f"no race document for {match_id!r} -- refusing to guess a "
+            f"k_factor rather than silently apply the wrong one"
+        )
+    race_type = getattr(race, "race_type", "quick")
     k_factor = 48.0 if race_type == "season" else 32.0
 
     standings_tuples = [
@@ -236,17 +274,42 @@ def _persist_result(db, result: dict) -> None:
     ]
     current_ratings = {}
     for pid, _, _ in standings_tuples:
-        player = crud.get_player_by_id(db, pid)
-        current_ratings[pid] = player.elo if player else 1200.0
+        # If this player's transition for this exact race was already
+        # recorded (a prior delivery got this far before dying on a later
+        # player), elo_before there is their true pre-race rating.
+        # crud.get_player_by_id's CURRENT rating is not a safe stand-in
+        # once that row exists -- it already reflects this same race's
+        # own effect, and using it as another player's opponent baseline
+        # would compute that player's delta against a result that has
+        # already happened rather than the state before the race.
+        already = crud.get_elo_history_entry(db, pid, match_id)
+        if already is not None:
+            current_ratings[pid] = already.elo_before
+        else:
+            player = crud.get_player_by_id(db, pid)
+            current_ratings[pid] = player.elo if player else 1200.0
 
     new_ratings = compute_elo_updates(standings_tuples, current_ratings, k_factor)
 
     for pid, new_elo in new_ratings.items():
         player = crud.get_player_by_id(db, pid)
-        if player:
-            old_elo = player.elo
-            crud.update_player_elo(db, pid, new_elo)
+        if player is None:
+            continue
+        old_elo = current_ratings[pid]
+        try:
+            # History first: this insert is the idempotency token, not a
+            # record written after the fact. Only once it succeeds -- i.e.
+            # only once we know this player's transition for this race has
+            # never been recorded before -- does the rating actually move.
             crud.save_elo_history(db, pid, match_id, old_elo, new_elo)
+        except DuplicateKeyError:
+            # Another delivery already recorded this player's transition
+            # for this race. Moving their rating again on top of one that
+            # already moved is exactly the drift this index exists to
+            # stop -- skip this player and let the rest of the loop finish
+            # normally rather than raising and stranding the whole job.
+            continue
+        crud.update_player_elo(db, pid, new_elo)
 
 
 def process_one(

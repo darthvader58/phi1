@@ -8,6 +8,19 @@ so a finished match left no results and no rating change. This file proves
 the restored path works, and specifically proves the part that is not a
 copy-paste of the pre-decouple code: a redelivered job must not double-apply
 an Elo update.
+
+Fix round 2 (task-8-review.md F5/F6/F8) found two problems with the first
+version of this fix: the idempotency guard keyed on crud.get_race_results,
+the FIRST thing the block wrote, so a worker that died between that write
+and the Elo loop left the guard reading "already done" and lost the Elo
+update and lap data forever; and nothing in this file distinguished a
+protection that actually works from one that merely looks like it -- the
+unique index could be deleted with the suite staying green, and the
+"redelivery" test only ever re-enqueued a fresh job rather than reproducing
+the actual failure (a crash partway through one persist, then a real
+redelivery of the same entry). test_partial_persist_then_redelivery... and
+test_the_unique_index_is_what_prevents_duplicate_history_rows below close
+both gaps directly.
 """
 
 import uuid
@@ -155,8 +168,18 @@ def test_redelivery_does_not_double_apply_elo(db, wiring):
         history_after_first = crud.get_elo_history(db, player.id)
 
         queue.enqueue(job)
-        process_one(queue, events, persist=lambda r: _persist_result(db, r),
-                   consumer="wtest")
+        second_match_id = process_one(
+            queue, events, persist=lambda r: _persist_result(db, r),
+            consumer="wtest",
+        )
+        # B2: a DuplicateKeyError from the unique index must be caught and
+        # skipped inside _persist_result, not escape persist() -- an
+        # uncaught raise here would mean process_one never acks, and the
+        # entry would be reclaimed and fail identically forever.
+        assert second_match_id == match_id
+        assert queue.pending_count() == 0, (
+            "the second delivery must ack cleanly, not strand the job"
+        )
         elo_after_second = crud.get_player_by_id(db, player.id).elo
         results_after_second = crud.get_race_results(db, match_id)
         history_after_second = crud.get_elo_history(db, player.id)
@@ -246,3 +269,183 @@ def test_k_factor_follows_the_race_documents_race_type(db):
             player_ids=[season_player.id, quick_player.id,
                        opponent_1.id, opponent_2.id],
         )
+
+
+def test_partial_persist_then_redelivery_does_not_lose_elo_or_lap_data(db, wiring):
+    """The actual F5 regression, reproduced as the real failure shape:
+    a worker dies partway through persisting -- after save_race_results
+    but before save_race_data and the Elo loop -- and the SAME queue entry
+    is genuinely redelivered afterwards (reclaim_stalled, not a fresh
+    enqueue). Round 1's guard keyed on "does race_results already exist",
+    which this partial state satisfies, so the redelivered call read the
+    guard as "already done" and never wrote lap data or Elo at all --
+    lost, not merely delayed.
+    """
+    queue, events = wiring
+    player = crud.create_player(db, f"wp_partial_{uuid.uuid4().hex[:8]}", "Test Team")
+    race = crud.create_race(db, "bahrain", "quick", owner_id=player.id)
+    match_id = race.id
+    job, manifest = _job_and_manifest(match_id, player.id)
+    crud.save_manifest(db, manifest)
+
+    elo_before = crud.get_player_by_id(db, player.id).elo
+
+    real_save_race_data = crud.save_race_data
+
+    def exploding_save_race_data(*args, **kwargs):
+        raise RuntimeError("simulated worker death right after save_race_results")
+
+    crud.save_race_data = exploding_save_race_data
+    try:
+        queue.enqueue(job)
+        with pytest.raises(RuntimeError):
+            process_one(queue, events, persist=lambda r: _persist_result(db, r),
+                       consumer="wtest-1")
+    finally:
+        crud.save_race_data = real_save_race_data
+
+    # Confirm the partial state this test is named for actually happened:
+    # results written, nothing else yet, and the job still pending (never
+    # acked, because process_one's persist raised).
+    assert crud.get_race_results(db, match_id), (
+        "results must exist at the simulated crash point"
+    )
+    assert crud.get_player_by_id(db, player.id).elo == elo_before, (
+        "Elo must not have moved yet at the simulated crash point"
+    )
+    assert queue.pending_count() == 1
+
+    try:
+        # Redelivery: process_one's own reclaim_stalled picks the still-
+        # pending entry back up, exactly like
+        # test_a_stalled_job_is_reclaimed_and_completed in test_worker.py --
+        # min_idle_ms=0 so this does not wait out the real 30-second
+        # default idle threshold.
+        redelivered_match_id = process_one(
+            queue, events, persist=lambda r: _persist_result(db, r),
+            consumer="wtest-2", min_idle_ms=0,
+        )
+        assert redelivered_match_id == match_id
+        assert queue.pending_count() == 0
+
+        results = crud.get_race_results(db, match_id)
+        assert {r.car_id for r in results} == {"USR-01", "NXS-07"}, (
+            "results must still be exactly one set after the redelivered persist"
+        )
+        race_doc = crud.get_race(db, match_id)
+        assert race_doc.lap_data_json, (
+            "lap_data_json must not be permanently lost after a partial-crash "
+            "redelivery"
+        )
+        elo_after = crud.get_player_by_id(db, player.id).elo
+        assert elo_after != elo_before, (
+            "Elo must not be permanently lost after a partial-crash redelivery"
+        )
+    finally:
+        _cleanup(db, race_ids=[match_id], player_ids=[player.id])
+
+
+def test_the_unique_index_is_what_prevents_duplicate_history_rows(db):
+    """Braces, verified as actual braces rather than assumed.
+
+    Editing backend/db/models.py to remove the create_index call has no
+    effect on an index that already exists in a persistent database --
+    create_index is never retroactively undone by deleting the code that
+    once called it -- so a test that only edits source and reruns the
+    suite proves nothing here. This drops the index at runtime, confirms a
+    double _persist_result call for the same result actually succeeds in
+    inserting a second, duplicate history row without it (closing review
+    finding F8's "delete the index and the suite stays green" gap
+    directly), then restores the index and confirms the identical
+    double-apply is refused with it back.
+    """
+    player = crud.create_player(db, f"wp_idxcheck_{uuid.uuid4().hex[:8]}", "T")
+    race = crud.create_race(db, "bahrain", "quick", owner_id=player.id)
+    match_id = race.id
+    job, manifest = _job_and_manifest(match_id, player.id)
+    crud.save_manifest(db, manifest)
+
+    result = {
+        "match_id": match_id,
+        "replay_sha256": "sha256:" + "e" * 64,
+        "standings": [
+            {"player_id": player.id, "car_id": "USR-01", "position": 1,
+             "retired": False, "total_time": 100.0, "pit_laps": [],
+             "compounds_used": ["MEDIUM"]},
+            {"player_id": "NXS-07", "car_id": "NXS-07", "position": 2,
+             "retired": False, "total_time": 110.0, "pit_laps": [],
+             "compounds_used": ["MEDIUM"]},
+        ],
+        "lap_data": [{"lap": 1}],
+        "events": [],
+    }
+
+    try:
+        db.db.elo_history.drop_index("player_id_1_race_id_1")
+    except Exception:
+        pass  # already absent; the assertion below still proves the point
+
+    try:
+        try:
+            _persist_result(db, result)
+            _persist_result(db, result)
+            assert len(crud.get_elo_history(db, player.id)) == 2, (
+                "without the index, a second persist of the same result must "
+                "actually succeed in inserting a duplicate row -- this is the "
+                "exact vulnerability the index exists to close, reproduced "
+                "directly rather than assumed"
+            )
+        finally:
+            db.db.elo_history.delete_many({"race_id": match_id})
+            db.db.race_results.delete_many({"race_id": match_id})
+            db.db.elo_history.create_index(
+                [("player_id", 1), ("race_id", 1)], unique=True
+            )
+
+        # With the index restored, the identical double-apply must now be
+        # refused: exactly one history row, not two.
+        _persist_result(db, result)
+        _persist_result(db, result)
+        assert len(crud.get_elo_history(db, player.id)) == 1, (
+            "with the index restored, a second persist of the same result "
+            "must be refused rather than inserted as a duplicate"
+        )
+    finally:
+        _cleanup(db, race_ids=[match_id], player_ids=[player.id])
+
+
+def test_a_missing_race_document_refuses_the_job_rather_than_guessing_k(db):
+    """F16: a missing race document (partial state some other bug left
+    behind, or a manifest saved for a race that was never actually
+    created) must not silently apply k=32 to what may have been a season
+    race and write that durably. Refusing loudly -- the job stays pending
+    and gets retried -- is the same "fail loud, not drift" shape as the
+    Elo unique index.
+    """
+    match_id = f"m_no_race_doc_{uuid.uuid4().hex[:8]}"
+    manifest = build_manifest(
+        match_id=match_id, seed=1, track="bahrain",
+        participants=[Participant(0, None, None, None, "VEL-01")],
+    )
+    crud.save_manifest(db, manifest)
+    # Deliberately no crud.create_race(db, ...) call -- no race document
+    # exists for this match_id.
+
+    result = {
+        "match_id": match_id,
+        "replay_sha256": "sha256:" + "f" * 64,
+        "standings": [
+            {"player_id": "VEL-01", "car_id": "VEL-01", "position": 1,
+             "retired": False, "total_time": 100.0, "pit_laps": [],
+             "compounds_used": ["MEDIUM"]},
+        ],
+        "lap_data": [{"lap": 1}],
+        "events": [],
+    }
+
+    try:
+        with pytest.raises(RuntimeError, match="no race document"):
+            _persist_result(db, result)
+    finally:
+        db.db.manifests.delete_many({"match_id": match_id})
+        db.db.race_results.delete_many({"race_id": match_id})

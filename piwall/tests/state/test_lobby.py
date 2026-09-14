@@ -168,3 +168,128 @@ def test_add_player_survives_interleaved_writes(replica_a, replica_b):
 
     players = replica_a.players(RACE)
     assert set(players) == {"p1", "p2"}
+
+
+def test_join_admits_up_to_max_players(replica_a):
+    """Review round 2, F18: join_race's capacity check used to be a
+    Python-side len() read, separate from the write -- two replicas could
+    both see "seven players, room for one more" and both admit an eighth.
+    """
+    replica_a.create(RACE, track="bahrain")
+    for i in range(3):
+        is_new, count = replica_a.join(
+            RACE, f"p{i}", {"username": f"u{i}"}, max_players=3
+        )
+        assert is_new is True
+        assert count == i + 1
+    assert set(replica_a.players(RACE)) == {"p0", "p1", "p2"}
+
+
+def test_join_refuses_a_new_player_once_full():
+    from backend.state.lobby import LobbyFullError
+
+    store = LobbyStore()
+    store.delete(RACE)
+    store.create(RACE, track="bahrain")
+    try:
+        for i in range(3):
+            store.join(RACE, f"p{i}", {"username": f"u{i}"}, max_players=3)
+        with pytest.raises(LobbyFullError):
+            store.join(RACE, "p_ninth", {"username": "nine"}, max_players=3)
+        assert set(store.players(RACE)) == {"p0", "p1", "p2"}
+    finally:
+        store.delete(RACE)
+
+
+def test_join_never_counts_a_rejoin_against_the_cap(replica_a):
+    """A re-join must succeed and must not change the player count, even
+    when the lobby is already at max_players -- the F18 regression this
+    guards against the other direction of."""
+    replica_a.create(RACE, track="bahrain")
+    for i in range(3):
+        replica_a.join(RACE, f"p{i}", {"username": f"u{i}"}, max_players=3)
+
+    is_new, count = replica_a.join(
+        RACE, "p1", {"username": "u1-rejoined"}, max_players=3
+    )
+    assert is_new is False
+    assert count == 3
+    assert replica_a.players(RACE)["p1"]["username"] == "u1-rejoined"
+
+
+def test_join_on_a_missing_lobby_raises(replica_a):
+    with pytest.raises(KeyError):
+        replica_a.join("r_nope", "p1", {"username": "x"})
+
+
+def test_join_survives_two_replicas_racing_for_the_last_slot(replica_a, replica_b):
+    """The actual atomicity claim: only one of two concurrent joins for the
+    lobby's last slot can succeed, never both.
+
+    Mirrors test_add_player_survives_interleaved_writes's technique --
+    replica_a's own .get() (the read half of the old read-count-then-write
+    pattern) is where a non-atomic implementation would pause -- but here
+    the assertion is about the CAPACITY outcome, not just that both writes
+    landed: a lobby capped at 1 must end with exactly one player, not two.
+    """
+    replica_a.create(RACE, track="bahrain", race_type="quick")
+
+    a_read = threading.Event()
+    b_done = threading.Event()
+    real_get = replica_a._redis.get
+
+    def delayed_get(*args, **kwargs):
+        result = real_get(*args, **kwargs)
+        a_read.set()
+        b_done.wait(timeout=2)
+        return result
+
+    replica_a._redis.get = delayed_get
+    outcomes = {}
+
+    def try_join(store, key, player_id):
+        try:
+            outcomes[key] = store.join(
+                RACE, player_id, {"username": player_id}, max_players=1
+            )
+        except Exception as exc:
+            outcomes[key] = exc
+
+    try:
+        thread = threading.Thread(target=try_join, args=(replica_a, "a", "p_a"))
+        thread.start()
+        a_read.wait(timeout=0.5)
+        try_join(replica_b, "b", "p_b")
+        b_done.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    finally:
+        replica_a._redis.get = real_get
+
+    assert len(replica_a.players(RACE)) == 1, (
+        "a lobby capped at 1 player must never end with 2, no matter how "
+        "the two joins interleaved"
+    )
+
+
+def test_set_player_field_updates_one_field_without_touching_others(replica_a, replica_b):
+    replica_a.create(RACE, track="bahrain")
+    replica_a.add_player(RACE, "p1", {"username": "alex", "car_id": "VEL-01", "code": "old"})
+
+    replica_a.set_player_field(RACE, "p1", "code", "new code")
+
+    player = replica_b.get(RACE)["players"]["p1"]
+    assert player["code"] == "new code"
+    assert player["username"] == "alex"
+    assert player["car_id"] == "VEL-01"
+
+
+def test_set_player_field_on_a_missing_player_raises(replica_a):
+    replica_a.create(RACE, track="bahrain")
+    with pytest.raises(KeyError):
+        replica_a.set_player_field(RACE, "p_missing", "code", "x")
+
+
+def test_set_player_field_on_a_missing_lobby_raises(replica_a):
+    with pytest.raises(KeyError):
+        replica_a.set_player_field("r_nope", "p1", "code", "x")

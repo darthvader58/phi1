@@ -43,11 +43,16 @@ TTL_SECONDS = 6 * 60 * 60
 #
 # KEYS[1] = the lobby key
 # ARGV[1] = TTL seconds, re-applied on every write so a mutation refreshes it
-# ARGV[2] = "field" to set a top-level field, or "player" to set one player
-# ARGV[3] = the field name (mode "field") or player id (mode "player")
+# ARGV[2] = "field" to set a top-level field, "player" to replace one whole
+#           player dict, or "player_field" to set one field within one
+#           player's dict without touching its other fields
+# ARGV[3] = the field name (mode "field") or player id (modes "player" and
+#           "player_field")
 # ARGV[4] = the new value, JSON-encoded
+# ARGV[5] = the field name within the player dict (mode "player_field" only)
 #
-# Returns false (-> None in Python) if the lobby does not exist, else 1.
+# Returns false (-> None in Python) if the lobby does not exist (any mode),
+# or if mode is "player_field" and no player with that id exists yet; else 1.
 _MUTATE_SCRIPT = """
 local raw = redis.call('GET', KEYS[1])
 if raw == false then
@@ -59,12 +64,72 @@ if ARGV[2] == 'player' then
         lobby.players = {}
     end
     lobby.players[ARGV[3]] = cjson.decode(ARGV[4])
+elseif ARGV[2] == 'player_field' then
+    if lobby.players == nil or lobby.players[ARGV[3]] == nil then
+        return false
+    end
+    lobby.players[ARGV[3]][ARGV[5]] = cjson.decode(ARGV[4])
 else
     lobby[ARGV[3]] = cjson.decode(ARGV[4])
 end
 redis.call('SET', KEYS[1], cjson.encode(lobby), 'EX', ARGV[1])
 return 1
 """
+
+# KEYS[1] = the lobby key
+# ARGV[1] = TTL seconds
+# ARGV[2] = max_players
+# ARGV[3] = player id
+# ARGV[4] = player data, JSON-encoded
+#
+# A read-count-then-decide-then-write across an HTTP handler -- what
+# join_race used to do with .get() plus a Python-side len() check -- lets
+# two replicas both see "seven players, room for one more" and both admit
+# an eighth, landing on nine. Folding the capacity check into the same Lua
+# step as the write closes that: only one of two concurrent joins for the
+# last slot can be the one whose EVAL actually sees room.
+#
+# A re-join (the player id is already present) never counts against the
+# cap and always succeeds -- it can only ever shrink or hold steady the
+# player count, never grow it past max_players.
+#
+# Returns false if the lobby does not exist, else a JSON object
+# {"full": true} if this is a new player and the lobby is already at
+# max_players, or {"full": false, "is_new": bool, "count": <player count
+# after this write>} otherwise.
+_JOIN_SCRIPT = """
+local raw = redis.call('GET', KEYS[1])
+if raw == false then
+    return false
+end
+local lobby = cjson.decode(raw)
+if lobby.players == nil then
+    lobby.players = {}
+end
+local player_id = ARGV[3]
+local is_new = lobby.players[player_id] == nil
+if is_new then
+    local count = 0
+    for _ in pairs(lobby.players) do
+        count = count + 1
+    end
+    if count >= tonumber(ARGV[2]) then
+        return cjson.encode({full = true})
+    end
+end
+lobby.players[player_id] = cjson.decode(ARGV[4])
+redis.call('SET', KEYS[1], cjson.encode(lobby), 'EX', ARGV[1])
+local new_count = 0
+for _ in pairs(lobby.players) do
+    new_count = new_count + 1
+end
+return cjson.encode({full = false, is_new = is_new, count = new_count})
+"""
+
+
+class LobbyFullError(Exception):
+    """join() raised this: a new player arrived after the lobby already
+    reached max_players. Never raised for a re-join."""
 
 
 class LobbyStore:
@@ -73,6 +138,7 @@ class LobbyStore:
     def __init__(self, redis_client=None):
         self._redis = redis_client or get_redis()
         self._mutate = self._redis.register_script(_MUTATE_SCRIPT)
+        self._join_script = self._redis.register_script(_JOIN_SCRIPT)
 
     def _key(self, race_id: str) -> str:
         return f"{KEY_PREFIX}{race_id}"
@@ -125,6 +191,51 @@ class LobbyStore:
 
     def add_player(self, race_id: str, player_id: str, data: dict) -> None:
         self._atomic_set(race_id, "player", player_id, data)
+
+    def set_player_field(self, race_id: str, player_id: str, field: str, value) -> None:
+        """Set one field of one player's dict without touching the rest.
+
+        add_player replaces a player's whole dict, which is correct for a
+        join (there is no prior state to preserve) and wrong for a partial
+        update: a caller that read the dict, changed one field in Python
+        and wrote the whole thing back with add_player would silently
+        clobber any other field a concurrent request changed in between.
+        This does the read-modify-write inside the same Lua script as
+        every other mutation here, so there is no such window.
+        """
+        ok = self._mutate(
+            keys=[self._key(race_id)],
+            args=[TTL_SECONDS, "player_field", player_id, json.dumps(value), field],
+        )
+        if not ok:
+            raise KeyError(f"no lobby {race_id!r} or no player {player_id!r} in it")
+
+    def join(self, race_id: str, player_id: str, data: dict, max_players: int = 8):
+        """Atomically add a new player if there is room, or overwrite an
+        existing player's row (a re-join, which never counts against the
+        cap).
+
+        Returns (is_new, player_count) — player_count is the lobby's total
+        after this write, exactly what a caller reporting "you are player
+        N" needs, computed inside the same atomic step rather than read
+        separately afterwards (which would itself race a concurrent join).
+        Raises KeyError if the lobby does not exist, LobbyFullError if this
+        is a new player and the lobby is already at max_players.
+        """
+        raw = self._join_script(
+            keys=[self._key(race_id)],
+            args=[TTL_SECONDS, max_players, player_id, json.dumps(data)],
+        )
+        # A Lua `false` return arrives via RESP as nil, which redis-py
+        # decodes as None, not Python False -- checking `is False` here
+        # would never match and every "no lobby" case would instead crash
+        # inside json.loads(None) one line down.
+        if raw is None:
+            raise KeyError(f"no lobby {race_id!r}")
+        result = json.loads(raw)
+        if result["full"]:
+            raise LobbyFullError(f"lobby {race_id!r} is already full")
+        return result["is_new"], result["count"]
 
     def players(self, race_id: str) -> dict:
         lobby = self.get(race_id)

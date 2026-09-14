@@ -16,6 +16,7 @@ Endpoints:
 """
 
 import asyncio
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -45,7 +46,7 @@ from .engine.build import build_track_physics
 from .jobs.events import MatchEvents
 from .jobs.queue import MatchJobQueue
 from .sandbox.runner import NAMESPACE_RESERVED_KEYS, STRATEGY_TEMPLATE
-from .state.lobby import LobbyStore
+from .state.lobby import LobbyFullError, LobbyStore
 from backend.sandbox.validation import validate_submission
 from backend.sandbox.isolation import ChildFailed, LimitExceeded
 from backend.sandbox.match_job import run_match_isolated
@@ -57,16 +58,77 @@ from backend.sandbox.match_job import run_match_isolated
 # lobby is a plain dict (fields: race_id, track, race_type, status, speed,
 # players) — this replaces active_lobbies, a module-global dict invisible
 # to any replica that did not happen to create or mutate a given lobby.
+#
+# LOBBIES and EVENTS are safe to build here: neither constructor makes a
+# Redis round trip (LobbyStore.register_script only computes a local SHA1;
+# MatchEvents just stores a channel name). JOBS is different --
+# MatchJobQueue.__init__ calls xgroup_create, a real round trip -- so it is
+# built lazily instead, by _get_jobs() below. Building it eagerly here made
+# `import backend.main` require a live Redis, which meant every test file
+# that imports this module (most of them do not even touch JOBS) errored
+# at collection with Redis down instead of the Redis-dependent ones
+# skipping -- the suite ran zero tests instead of skipping only what
+# needed Redis, which is exactly the failure the global constraints name.
 LOBBIES = LobbyStore()
-JOBS = MatchJobQueue()
 EVENTS = MatchEvents()
 
 # This replica's own WebSocket connections, keyed by race id. Deliberately
 # NOT in Redis: a socket is a live object owned by one process. Each replica
 # serves the clients attached to it and learns when to do so from EVENTS.
+# A race id's entry is removed once its last socket disconnects (see
+# websocket_race and _broadcast) rather than left behind as an empty set,
+# so membership here (`race_id in SOCKETS`) means "this replica currently
+# has at least one spectator" and nothing durable is ever decided by it —
+# only whether to bother calling send_json.
 SOCKETS: Dict[str, Set[WebSocket]] = {}
 
+# Fire-and-forget background tasks (currently only _run_race) need a
+# strong reference held somewhere other than the event loop's own internal
+# bookkeeping, or a task with nothing else referencing it can be garbage
+# collected before it finishes -- a well-known asyncio footgun, independent
+# of _run_race's own try/except making sure no exception escapes it
+# uncaught. Tasks remove themselves once done via add_done_callback.
+_background_tasks: Set[asyncio.Task] = set()
+
 logger = logging.getLogger("piwall")
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+_jobs: Optional[MatchJobQueue] = None
+
+
+def _get_jobs() -> MatchJobQueue:
+    """Build the job queue on first real use rather than at import time.
+
+    See the comment above LOBBIES/EVENTS for why: this is the one
+    constructor here that touches Redis.
+    """
+    global _jobs
+    if _jobs is None:
+        _jobs = MatchJobQueue()
+    return _jobs
+
+
+def __getattr__(name: str):
+    """PEP 562: make `main.JOBS` resolve lazily too, for external access.
+
+    `main.JOBS` is part of this module's tested surface
+    (tests/api/test_lobby_integration.py asserts
+    isinstance(main.JOBS, MatchJobQueue)). Internal code calls _get_jobs()
+    directly -- a module's own top-level code does not go through
+    __getattr__ for its own global names -- but this keeps `main.JOBS`
+    itself working for callers outside the module without eagerly
+    constructing it just because someone imported this file.
+    """
+    if name == "JOBS":
+        return _get_jobs()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ─── Database setup ──────────────────────────────────────────────────
@@ -382,18 +444,26 @@ def join_race(race_id: str, req: JoinRaceRequest, x_api_key: str = Header()):
         raise HTTPException(404, "Race not found")
     if lobby["status"] != "lobby":
         raise HTTPException(400, "Race already started")
-    player_count = len(lobby["players"])
-    if player_count >= 8:
-        raise HTTPException(400, "Race is full (8 players max)")
 
-    car_id = req.car_id or f"P{player_count + 1:02d}"
-    LOBBIES.add_player(race_id, player["id"], {
-        "username": player["username"],
-        "car_id": car_id,
-        "code": STRATEGY_TEMPLATE,
-        "starting_compound": req.starting_compound,
-    })
-    return {"car_id": car_id, "position": player_count + 1}
+    # The default car_id label is cosmetic (a display fallback, never an
+    # identity two players are compared or matched on) and is computed from
+    # a snapshot read before the atomic join below, so two concurrent new
+    # joins can in principle land on the same default label. What must NOT
+    # race is whether a 9th player gets admitted at all and what position
+    # is reported back -- LOBBIES.join() does the capacity check and the
+    # write as one Lua script, so only one of two concurrent joins for the
+    # last slot can see room and succeed.
+    car_id = req.car_id or f"P{len(lobby['players']) + 1:02d}"
+    try:
+        _is_new, position = LOBBIES.join(race_id, player["id"], {
+            "username": player["username"],
+            "car_id": car_id,
+            "code": STRATEGY_TEMPLATE,
+            "starting_compound": req.starting_compound,
+        })
+    except LobbyFullError:
+        raise HTTPException(400, "Race is full (8 players max)")
+    return {"car_id": car_id, "position": position}
 
 
 @app.post("/api/race/{race_id}/submit-bot")
@@ -410,9 +480,13 @@ def submit_bot(race_id: str, req: SubmitBotRequest, x_api_key: str = Header()):
     if error:
         raise HTTPException(400, error)
 
-    player_data = dict(lobby["players"][player["id"]])
-    player_data["code"] = req.code
-    LOBBIES.add_player(race_id, player["id"], player_data)
+    # set_player_field, not add_player: add_player replaces the whole
+    # player dict, and this handler only has a snapshot of it (read above,
+    # for the membership check) -- writing that whole snapshot back would
+    # silently clobber any other field (car_id, starting_compound) a
+    # concurrent request changed in between the read and this write.
+    LOBBIES.set_player_field(race_id, player["id"], "code", req.code)
+    car_id = lobby["players"][player["id"]]["car_id"]
 
     # Save to DB
     db = SessionLocal()
@@ -421,7 +495,7 @@ def submit_bot(race_id: str, req: SubmitBotRequest, x_api_key: str = Header()):
     finally:
         db.close()
 
-    return {"status": "submitted", "car_id": player_data["car_id"]}
+    return {"status": "submitted", "car_id": car_id}
 
 
 @app.post("/api/race/{race_id}/start")
@@ -452,15 +526,24 @@ async def start_race(race_id: str, x_api_key: str = Header()):
         db.close()
 
     # Start race in background
-    asyncio.create_task(_run_race(race_id))
+    _spawn_background(_run_race(race_id))
     return {"status": "countdown", "message": "Race starting in 5 seconds..."}
+
+
+# A lobby's status only ever advances to "finished"/"aborted" durably, in
+# the worker (see backend/worker.py's _persist_result) -- never in an API
+# handler -- so once a lobby reports one of these it is terminal and the
+# real data (results, lap data, Elo already applied) lives in Mongo, not
+# in the Redis snapshot. Serving the (permanently None) Redis "result" for
+# a terminal lobby is what F1 was: a finished race stuck reporting
+# "running" with a null result for the rest of its 6h TTL.
+_TERMINAL_LOBBY_STATUSES = ("finished", "aborted")
 
 
 @app.get("/api/race/{race_id}")
 def get_race(race_id: str):
     lobby = LOBBIES.get(race_id)
-    if lobby:
-        result = lobby.get("result")
+    if lobby and lobby["status"] not in _TERMINAL_LOBBY_STATUSES:
         return {
             "race_id": race_id,
             "track": lobby["track"],
@@ -468,10 +551,12 @@ def get_race(race_id: str):
             "players": {pid: {"username": p["username"], "car_id": p["car_id"]}
                         for pid, p in lobby["players"].items()},
             "current_state": lobby.get("current_state"),
-            "result": _serialize_result(result) if result else None,
+            "result": None,
         }
 
-    # Check DB for finished races
+    # A finished/aborted race, or one whose Redis lobby has already aged
+    # past its TTL, is read from Mongo -- the worker's persist step is what
+    # writes results, lap data and events there once the match completes.
     db = SessionLocal()
     try:
         race = crud.get_race(db, race_id)
@@ -861,7 +946,13 @@ def suggest_match(x_api_key: str = Header()):
         db = SessionLocal()
         try:
             elos = []
-            for pid in lobby["players"]:
+            # sorted(), not a bare dict iteration: lobby["players"] came
+            # through Redis as a Lua table re-encoded by cjson, so its key
+            # order is a hash order rather than the stable insertion order
+            # a Python dict would have had, and float addition is not
+            # associative -- summing it in whatever order Redis happened
+            # to produce would make this average order-dependent.
+            for pid in sorted(lobby["players"]):
                 p = crud.get_player_by_id(db, pid)
                 if p:
                     elos.append(p.elo)
@@ -913,21 +1004,42 @@ async def websocket_race(websocket: WebSocket, race_id: str):
             except WebSocketDisconnect:
                 break
     finally:
-        SOCKETS.get(race_id, set()).discard(websocket)
+        _discard_socket(race_id, websocket)
+
+
+def _discard_socket(race_id: str, websocket: WebSocket) -> None:
+    """Drop one socket, and the race's whole entry once it holds none.
+
+    Without the second half, `race_id in SOCKETS` stays true forever after
+    the last spectator for that race disconnects -- an unbounded leak, and
+    (before this fix round) the exact membership test _relay_match_events
+    used to decide whether a match's durable "finished" write happened at
+    all. It no longer gates anything durable (see _persist_result in
+    backend/worker.py), but the leak is worth closing regardless.
+    """
+    sockets = SOCKETS.get(race_id)
+    if sockets is None:
+        return
+    sockets.discard(websocket)
+    if not sockets:
+        SOCKETS.pop(race_id, None)
 
 
 # ─── Race execution ─────────────────────────────────────────────────
 
 async def _broadcast(race_id: str, message: dict) -> None:
     """Send to this replica's sockets for a race, dropping dead ones."""
+    sockets = SOCKETS.get(race_id)
+    if not sockets:
+        return
     dead = set()
-    for ws in SOCKETS.get(race_id, set()):
+    for ws in list(sockets):
         try:
             await ws.send_json(message)
         except Exception:
             dead.add(ws)
     for ws in dead:
-        SOCKETS.get(race_id, set()).discard(ws)
+        _discard_socket(race_id, ws)
 
 
 def _build_job_and_manifest(race_id: str, lobby: dict):
@@ -945,18 +1057,25 @@ def _build_job_and_manifest(race_id: str, lobby: dict):
     slot = 0
     for pid, pdata in sorted(lobby["players"].items()):
         code = pdata.get("code") or ""
+        code_sha256 = "sha256:" + hashlib.sha256(code.encode()).hexdigest()
         participants.append({
             "slot": slot,
             "player_id": pid,
             "car_id": pdata.get("car_id"),
             "code": code,
+            # Carried through so the worker's own manifest
+            # (_manifest_from_job) hashes to the same value as this one --
+            # without it, _manifest_from_job reads code_sha256 as None and
+            # embeds a manifest in the replay that does not match the row
+            # crud.save_manifest wrote for this same match_id below.
+            "code_sha256": code_sha256,
             "starting_compound": pdata.get("starting_compound"),
         })
         manifest_participants.append(Participant(
             slot=slot,
             player_id=pid,
             bot_version_id=None,
-            code_sha256="sha256:" + hashlib.sha256(code.encode()).hexdigest(),
+            code_sha256=code_sha256,
             house_bot=None,
         ))
         slot += 1
@@ -988,119 +1107,145 @@ async def _run_race(race_id: str):
     previous code computed the whole race in one shot and then re-played
     lap_data for display pacing — so this changes which process holds the
     race while it runs, not what a spectator eventually sees finish.
+
+    Everything from the countdown through the enqueue is wrapped in one
+    try/except. Without it, a `save_manifest` ValueError (two replicas both
+    pass start_race's non-atomic "is this lobby still open" check and race
+    to start the same lobby with different random seeds) or a queue error
+    on enqueue left the race at status "running" with no job ever enqueued
+    -- forever, since this coroutine is launched fire-and-forget and
+    nothing else was watching for its exception.
     """
     lobby = LOBBIES.get(race_id)
     if lobby is None:
         return
 
-    for seconds in (5, 4, 3, 2, 1):
-        await _broadcast(race_id, {"type": "countdown", "seconds": seconds})
-        await asyncio.sleep(1.0)
-    await _broadcast(race_id, {"type": "lights_out"})
-
-    LOBBIES.set_status(race_id, "running")
-    db = SessionLocal()
     try:
-        crud.update_race_status(db, race_id, "running")
-    finally:
-        db.close()
+        for seconds in (5, 4, 3, 2, 1):
+            await _broadcast(race_id, {"type": "countdown", "seconds": seconds})
+            await asyncio.sleep(1.0)
+        await _broadcast(race_id, {"type": "lights_out"})
 
-    job, manifest = _build_job_and_manifest(race_id, lobby)
+        LOBBIES.set_status(race_id, "running")
+        db = SessionLocal()
+        try:
+            crud.update_race_status(db, race_id, "running")
+        finally:
+            db.close()
 
-    # save_manifest before enqueue, not after: the worker's persist step
-    # only ever UPDATEs the manifest row for a match id (it never upserts),
-    # and it now raises rather than ack a match with nothing durable
-    # written. Enqueueing first would let the worker claim the job before a
-    # manifest exists for it, so every persist attempt would match zero
-    # documents and the job would fail, get reclaimed, and fail forever.
-    db = SessionLocal()
-    try:
-        crud.save_manifest(db, manifest)
-    finally:
-        db.close()
+        job, manifest = _build_job_and_manifest(race_id, lobby)
 
-    JOBS.enqueue(job)
+        # save_manifest before enqueue, not after: the worker's persist step
+        # only ever UPDATEs the manifest row for a match id (it never
+        # upserts), and it now raises rather than ack a match with nothing
+        # durable written. Enqueueing first would let the worker claim the
+        # job before a manifest exists for it, so every persist attempt
+        # would match zero documents and the job would fail, get reclaimed,
+        # and fail forever.
+        db = SessionLocal()
+        try:
+            crud.save_manifest(db, manifest)
+        finally:
+            db.close()
+
+        _get_jobs().enqueue(job)
+    except Exception:
+        logger.exception("race %s failed to start; marking it aborted", race_id)
+        try:
+            LOBBIES.set_status(race_id, "aborted")
+        except KeyError:
+            pass
+        db = SessionLocal()
+        try:
+            crud.update_race_status(db, race_id, "aborted")
+        finally:
+            db.close()
+        # Generic text, deliberately: spectators on this socket are
+        # unauthenticated, and the real exception (a ValueError from a
+        # manifest conflict, a Redis error from enqueue) is not theirs to
+        # see. logger.exception above is where the real detail goes.
+        await _broadcast(race_id, {"type": "aborted", "reason": "internal error"})
 
 
 async def _relay_match_events() -> None:
     """Stream finished matches to whichever sockets this replica holds.
 
-    Runs on every replica. A replica with no sockets for a match does
-    nothing, which is why publishing to all of them is correct rather than
-    wasteful.
+    Runs on every replica, fed by one shared pub/sub channel; a replica
+    with no sockets for a match correctly does nothing here, which is why
+    fanning the event out to every replica is correct rather than
+    wasteful. The durable half of "this match is finished" -- the race
+    document's status and the Redis lobby's status -- is written by the
+    worker itself before it ever publishes (see backend/worker.py's
+    _persist_result), unconditionally, whether or not any replica has a
+    spectator. SOCKETS decides fan-out here and nothing durable.
+
+    Each iteration is wrapped in its own try/except: one Redis blip on
+    EVENTS.listen, or one Mongo blip while looking up a replay hash, must
+    not permanently kill event relay for the rest of this process's life
+    -- every subsequent match on this replica would then silently never
+    notify a connected spectator, with no log and no restart, until the
+    process itself is recycled.
     """
     pubsub = EVENTS.subscribe()
+    loop = asyncio.get_running_loop()
+    # A dedicated single-thread executor for this coroutine's own blocking
+    # listen() calls, not asyncio's shared default executor: on
+    # cancellation (app shutdown), the `await` here raises immediately, but
+    # a concurrent.futures.Future that has already started running cannot
+    # itself be cancelled or interrupted -- the underlying thread keeps
+    # calling pubsub.get_message() until its own 1.0s timeout elapses. This
+    # executor's own shutdown(wait=True) below blocks until that call has
+    # actually returned, so pubsub.close() can never run concurrently with
+    # it -- redis-py's PubSub is not safe against a concurrent close.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         while True:
-            event = await asyncio.get_running_loop().run_in_executor(
-                None, EVENTS.listen, pubsub, 1.0
-            )
-            if not event or event.get("type") != "match_finished":
-                continue
-            race_id = event["match_id"]
-            if race_id not in SOCKETS:
-                continue
-            await _stream_stored_replay(race_id)
+            try:
+                event = await loop.run_in_executor(executor, EVENTS.listen, pubsub, 1.0)
+                if not event or event.get("type") != "match_finished":
+                    continue
+                race_id = event["match_id"]
+                if race_id not in SOCKETS:
+                    continue
+                await _stream_stored_replay(race_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("event relay: dropping this event and continuing")
     finally:
+        executor.shutdown(wait=True)
         pubsub.close()
 
 
 async def _stream_stored_replay(race_id: str) -> None:
-    """Tell this replica's sockets the match is done.
+    """Tell this replica's sockets the match is done. Fan-out only.
 
-    The worker persists the manifest and the replay's hash (see
-    backend/worker.py) but not yet the replay body itself -- object storage
-    for replay bodies is deferred beyond this phase (see the phase plan's
-    "Deferred beyond this phase" section), so there is no lap-by-lap body to
-    re-stream here yet. This sends one terminal "finished" event rather than
-    the paced per-lap messages the old in-process simulation produced.
-    Standings, points and ELO -- previously computed by this same function
-    right after `run_match_isolated` returned -- are not recomputed here:
-    they depended on the full result, which now lives only inside the
-    worker's process. This is a known gap, not a silently dropped feature.
+    The durable "this match is finished" write -- the race document's
+    status and the Redis lobby's status -- already happened in the worker
+    before it published the event that triggered this call (see
+    backend/worker.py's _persist_result), regardless of whether any
+    replica has a spectator socket for it. This function's only job is
+    telling THIS replica's own sockets, if it has any for this race.
+
+    The worker persists the manifest and the replay's hash but not yet the
+    replay body itself -- object storage for replay bodies is deferred
+    beyond this phase (see the phase plan's "Deferred beyond this phase"
+    section) -- so there is no lap-by-lap body to re-stream here yet. This
+    sends one terminal "finished" event rather than the paced per-lap
+    messages the old in-process simulation produced. Standings, lap data
+    and Elo ARE persisted (backend/worker.py's _persist_result writes all
+    three) -- they are simply not re-fetched and re-broadcast here; a
+    spectator who wants them reads GET /api/race/{race_id} after this
+    event arrives.
     """
     db = SessionLocal()
     try:
-        crud.update_race_status(db, race_id, "finished")
         replay_sha256 = crud.get_replay_hash(db, race_id)
     finally:
         db.close()
-    LOBBIES.set_status(race_id, "finished")
 
     await _broadcast(race_id, {
         "type": "finished",
         "result": {"race_id": race_id, "replay_sha256": replay_sha256},
     })
 
-
-# ─── Serialization helpers ───────────────────────────────────────────
-
-def _serialize_result(result) -> dict:
-    if result is None:
-        return None
-    return {
-        "track": result["track"],
-        "total_laps": result["total_laps"],
-        "standings": [
-            {
-                "car_id": c["car_id"],
-                "player_id": c["player_id"],
-                "position": c["position"],
-                "gap_to_leader": round(c["gap_to_leader"], 3),
-                "compound": c["compound"],
-                "tyre_age": c["tyre_age"],
-                "pit_count": c["pit_count"],
-                "pit_laps": c["pit_laps"],
-                "compounds_used": c["compounds_used"],
-                "total_time": round(c["total_time"], 3),
-                "retired": c["retired"],
-            }
-            for c in result["standings"]
-        ],
-        "events": [
-            {"lap": e["lap"], "type": e["event_type"],
-             "car_id": e["car_id"], "detail": e["detail"]}
-            for e in result["events"]
-        ],
-        "weather_history": result["weather_history"],
-    }

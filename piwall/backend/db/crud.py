@@ -133,6 +133,19 @@ POINTS_TABLE = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1
 
 
 def save_race_results(db, race_id: str, standings: list):
+    """Replace this race's result rows wholesale.
+
+    The worker's job queue is at-least-once, so this can run a second time
+    for a race that already has rows -- either because the whole match was
+    redelivered after fully succeeding once, or because a worker died
+    partway through persisting and a later delivery is retrying the whole
+    block from scratch (see backend/worker.py's _persist_result). Deleting
+    any existing rows before inserting means both cases land on the same
+    final set of rows rather than accumulating duplicates; determinism
+    guarantees the standings passed in are the same every time, so this is
+    a no-op in content even when it is not a no-op in database writes.
+    """
+    db.db.race_results.delete_many({"race_id": race_id})
     rows = []
     for car in standings:
         row = {
@@ -281,6 +294,19 @@ def save_elo_history(db, player_id: str, race_id: str, elo_before: float, elo_af
 def get_elo_history(db, player_id: str, limit: int = 100):
     docs = db.db.elo_history.find({"player_id": player_id}).sort("created_at", 1).limit(limit)
     return [to_namespace(doc) for doc in docs]
+
+
+def get_elo_history_entry(db, player_id: str, race_id: str):
+    """The one elo_history row for exactly this player and this race, if any.
+
+    Used to recover a player's true pre-race rating on a retried persist:
+    once this row exists, get_player_by_id's CURRENT rating already
+    reflects this race's own effect and is no longer a safe "before" value
+    to compute anyone else's delta against.
+    """
+    return to_namespace(
+        db.db.elo_history.find_one({"player_id": player_id, "race_id": race_id})
+    )
 
 
 def save_manifest(db, manifest) -> str:
