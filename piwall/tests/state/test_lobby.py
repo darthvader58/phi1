@@ -176,13 +176,16 @@ def test_join_admits_up_to_max_players(replica_a):
     both see "seven players, room for one more" and both admit an eighth.
     """
     replica_a.create(RACE, track="bahrain")
+    seen_car_ids = set()
     for i in range(3):
-        is_new, count = replica_a.join(
+        is_new, count, car_id = replica_a.join(
             RACE, f"p{i}", {"username": f"u{i}"}, max_players=3
         )
         assert is_new is True
         assert count == i + 1
+        seen_car_ids.add(car_id)
     assert set(replica_a.players(RACE)) == {"p0", "p1", "p2"}
+    assert len(seen_car_ids) == 3, "three new joins must not share a default car_id"
 
 
 def test_join_refuses_a_new_player_once_full():
@@ -209,7 +212,7 @@ def test_join_never_counts_a_rejoin_against_the_cap(replica_a):
     for i in range(3):
         replica_a.join(RACE, f"p{i}", {"username": f"u{i}"}, max_players=3)
 
-    is_new, count = replica_a.join(
+    is_new, count, _car_id = replica_a.join(
         RACE, "p1", {"username": "u1-rejoined"}, max_players=3
     )
     assert is_new is False
@@ -293,3 +296,52 @@ def test_set_player_field_on_a_missing_player_raises(replica_a):
 def test_set_player_field_on_a_missing_lobby_raises(replica_a):
     with pytest.raises(KeyError):
         replica_a.set_player_field("r_nope", "p1", "code", "x")
+
+
+def test_join_never_hands_two_concurrent_new_players_the_same_default_car_id(
+    replica_a, replica_b
+):
+    """N2 (fix round 3): car_id is an engine identity, not a display
+    label -- main.py keys belief dicts by it, and engine/race.py keys
+    self.strategies and self.belief_models by it. Two concurrent
+    brand-new joins with no explicit car_id used to both default to
+    "P01" from a snapshot read before the write, handing one player's
+    bot both cars. The default is now assigned inside the same atomic
+    step that determines the pre-write count, so this must not happen no
+    matter how the two joins interleave.
+    """
+    replica_a.create(RACE, track="bahrain", race_type="quick")
+
+    a_read = threading.Event()
+    b_done = threading.Event()
+    real_get = replica_a._redis.get
+
+    def delayed_get(*args, **kwargs):
+        result = real_get(*args, **kwargs)
+        a_read.set()
+        b_done.wait(timeout=2)
+        return result
+
+    replica_a._redis.get = delayed_get
+    outcomes = {}
+
+    def try_join(store, key, player_id):
+        outcomes[key] = store.join(RACE, player_id, {"username": player_id})
+
+    try:
+        thread = threading.Thread(target=try_join, args=(replica_a, "a", "p_a"))
+        thread.start()
+        a_read.wait(timeout=0.5)
+        try_join(replica_b, "b", "p_b")
+        b_done.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    finally:
+        replica_a._redis.get = real_get
+
+    car_id_a = outcomes["a"][2]
+    car_id_b = outcomes["b"][2]
+    assert car_id_a != car_id_b, (
+        f"two concurrent new joins were both assigned {car_id_a!r} -- "
+        f"one player's bot now drives both cars"
+    )

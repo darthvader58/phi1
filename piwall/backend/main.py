@@ -445,19 +445,21 @@ def join_race(race_id: str, req: JoinRaceRequest, x_api_key: str = Header()):
     if lobby["status"] != "lobby":
         raise HTTPException(400, "Race already started")
 
-    # The default car_id label is cosmetic (a display fallback, never an
-    # identity two players are compared or matched on) and is computed from
-    # a snapshot read before the atomic join below, so two concurrent new
-    # joins can in principle land on the same default label. What must NOT
-    # race is whether a 9th player gets admitted at all and what position
-    # is reported back -- LOBBIES.join() does the capacity check and the
-    # write as one Lua script, so only one of two concurrent joins for the
-    # last slot can see room and succeed.
-    car_id = req.car_id or f"P{len(lobby['players']) + 1:02d}"
+    # car_id is an engine identity, not a display label (see
+    # CAR_ID_PATTERN's own docstring below, and engine/race.py's
+    # self.strategies / self.belief_models, both keyed by it) -- so the
+    # default label must not be computed from a pre-write snapshot the
+    # way it used to be. Two concurrent brand-new joins reading the same
+    # snapshot could both default to "P01" and hand one player's bot both
+    # cars, sealed into a manifest and a replay. LOBBIES.join() assigns
+    # the default (when req.car_id is not given) from inside the same
+    # atomic step that does the capacity check, so two concurrent new
+    # joins can never observe the same pre-write count and can never be
+    # handed the same default.
     try:
-        _is_new, position = LOBBIES.join(race_id, player["id"], {
+        _is_new, position, car_id = LOBBIES.join(race_id, player["id"], {
             "username": player["username"],
-            "car_id": car_id,
+            "car_id": req.car_id,
             "code": STRATEGY_TEMPLATE,
             "starting_compound": req.starting_compound,
         })
@@ -550,7 +552,18 @@ def get_race(race_id: str):
             "status": lobby["status"],
             "players": {pid: {"username": p["username"], "car_id": p["car_id"]}
                         for pid, p in lobby["players"].items()},
-            "current_state": lobby.get("current_state"),
+            # Always None: there is no per-lap live state to report. The
+            # worker runs a match to completion in one shot (N8, fix round
+            # 3) rather than the API replaying lap_data incrementally the
+            # way the pre-decouple in-process simulation did, so nothing
+            # in this architecture ever produces an intermediate snapshot
+            # to serve here. Reading a lobby field that no writer has
+            # populated since round 1 (or serving one that looks live but
+            # never was) would be worse than stating the gap: closing it
+            # for real needs either the worker to publish incremental
+            # progress over pub/sub or the replay-body storage Phase 4
+            # is expected to add, neither of which exists yet.
+            "current_state": None,
             "result": None,
         }
 
@@ -987,10 +1000,11 @@ async def websocket_race(websocket: WebSocket, race_id: str):
 
     SOCKETS.setdefault(race_id, set()).add(websocket)
     try:
-        # Send current state if race is in progress
-        current_state = lobby.get("current_state")
-        if current_state:
-            await websocket.send_json({"type": "state", "data": current_state})
+        # No initial "state" message: there is no per-lap live state to
+        # send. See get_race's identical note (N8, fix round 3) -- the
+        # worker runs a match to completion in one shot, so a socket that
+        # connects mid-race has nothing to catch up on until the
+        # "finished" event arrives; it is not silently dropping one.
 
         # Keep connection alive, listen for speed control messages
         while True:
@@ -1167,6 +1181,10 @@ async def _run_race(race_id: str):
         await _broadcast(race_id, {"type": "aborted", "reason": "internal error"})
 
 
+_RELAY_MIN_BACKOFF_SECONDS = 1.0
+_RELAY_MAX_BACKOFF_SECONDS = 30.0
+
+
 async def _relay_match_events() -> None:
     """Stream finished matches to whichever sockets this replica holds.
 
@@ -1179,42 +1197,78 @@ async def _relay_match_events() -> None:
     _persist_result), unconditionally, whether or not any replica has a
     spectator. SOCKETS decides fan-out here and nothing durable.
 
-    Each iteration is wrapped in its own try/except: one Redis blip on
-    EVENTS.listen, or one Mongo blip while looking up a replay hash, must
-    not permanently kill event relay for the rest of this process's life
-    -- every subsequent match on this replica would then silently never
-    notify a connected spectator, with no log and no restart, until the
-    process itself is recycled.
+    Two failure modes, both handled with capped exponential backoff
+    sharing one counter that resets on any success:
+
+    - EVENTS.subscribe() itself can fail -- Redis down at the moment this
+      task starts, e.g. at app startup. Round 2 left this call outside any
+      try/except, so that failure killed the task for the rest of the
+      process's life, surfacing only when `lifespan` awaited it at
+      shutdown. This retries the subscribe itself instead.
+    - Each iteration inside the subscribed loop (the listen call, and
+      relaying one event) is wrapped in its own try/except: one Redis
+      blip on EVENTS.listen or one Mongo blip while looking up a replay
+      hash must not permanently kill relay either. redis-py's PubSub
+      re-subscribes on its own after a transient connection drop, so the
+      same pubsub object is reused across these -- the backoff here is
+      purely to stop a *sustained* outage from spinning this loop as fast
+      as the failure can be raised and logged.
     """
-    pubsub = EVENTS.subscribe()
-    loop = asyncio.get_running_loop()
-    # A dedicated single-thread executor for this coroutine's own blocking
-    # listen() calls, not asyncio's shared default executor: on
-    # cancellation (app shutdown), the `await` here raises immediately, but
-    # a concurrent.futures.Future that has already started running cannot
-    # itself be cancelled or interrupted -- the underlying thread keeps
-    # calling pubsub.get_message() until its own 1.0s timeout elapses. This
-    # executor's own shutdown(wait=True) below blocks until that call has
-    # actually returned, so pubsub.close() can never run concurrently with
-    # it -- redis-py's PubSub is not safe against a concurrent close.
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        while True:
-            try:
-                event = await loop.run_in_executor(executor, EVENTS.listen, pubsub, 1.0)
-                if not event or event.get("type") != "match_finished":
-                    continue
-                race_id = event["match_id"]
-                if race_id not in SOCKETS:
-                    continue
-                await _stream_stored_replay(race_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("event relay: dropping this event and continuing")
-    finally:
-        executor.shutdown(wait=True)
-        pubsub.close()
+    backoff = _RELAY_MIN_BACKOFF_SECONDS
+    while True:
+        try:
+            pubsub = EVENTS.subscribe()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "event relay: could not subscribe, retrying in %.1fs", backoff
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
+            continue
+
+        loop = asyncio.get_running_loop()
+        # A dedicated single-thread executor for this coroutine's own
+        # blocking listen() calls, not asyncio's shared default executor:
+        # on cancellation (app shutdown), the `await` here raises
+        # immediately, but a concurrent.futures.Future that has already
+        # started running cannot itself be cancelled or interrupted -- the
+        # underlying thread keeps calling pubsub.get_message() until its
+        # own 1.0s timeout elapses. This executor's own shutdown(wait=True)
+        # in the finally below blocks until that call has actually
+        # returned, so pubsub.close() can never run concurrently with it
+        # -- redis-py's PubSub is not safe against a concurrent close.
+        # The shutdown call is itself dispatched to the default executor
+        # (`run_in_executor(None, ...)`), not awaited directly, so that
+        # blocking wait does not stall this event loop for other work
+        # while it happens.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            while True:
+                try:
+                    event = await loop.run_in_executor(
+                        executor, EVENTS.listen, pubsub, 1.0
+                    )
+                    backoff = _RELAY_MIN_BACKOFF_SECONDS
+                    if not event or event.get("type") != "match_finished":
+                        continue
+                    race_id = event["match_id"]
+                    if race_id not in SOCKETS:
+                        continue
+                    await _stream_stored_replay(race_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "event relay: dropping this event, backing off %.1fs",
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
+        finally:
+            await loop.run_in_executor(None, executor.shutdown, True)
+            pubsub.close()
 
 
 async def _stream_stored_replay(race_id: str) -> None:

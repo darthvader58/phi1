@@ -190,25 +190,40 @@ def _persist_result(db, result: dict) -> None:
 
     - save_replay_hash and update_race_status are already idempotent ($set
       against a fixed key -- a repeat writes the same value over itself).
-    - save_race_results now replaces this race's rows wholesale (delete
-      then insert) rather than only ever inserting, so re-running it after
+    - save_race_results upserts one row per car, keyed by (race_id,
+      player_id), rather than only ever inserting, so re-running it after
       a partial or full previous run lands on the same final rows instead
-      of a duplicate set.
+      of a duplicate set. (Round 3, N6: an earlier delete-then-insert
+      version of this made it idempotent too, but briefly left the
+      collection with zero rows for an already-finished race that
+      GET /api/race/{id} and /api/season both read live -- see crud.py's
+      docstring on save_race_results.)
     - save_race_data is already idempotent ($set).
     - Each player's Elo transition is its own unit: the elo_history row is
       written BEFORE the rating moves, using the unique index on
       (player_id, race_id) as the idempotency token. A DuplicateKeyError
       means an earlier delivery already recorded this player's transition
-      for this race, so this delivery skips moving their rating and
-      continues with the rest -- a raise here would strand the whole job
-      unacked forever (the exact bug Task 7's ordering was chasing), and a
-      partial redelivery must not let one already-applied player block
-      every other player's update.
+      for this race -- a raise here would strand the whole job unacked
+      forever (the exact bug Task 7's ordering was chasing), so it is
+      caught rather than left to escape.
 
     That per-player ordering also fixes what round 1 got backwards:
     computing the new rating and writing it BEFORE the history row meant
     the index could only report a double-apply after the damage was
     already done, not prevent it.
+
+    Round 2 caught the DuplicateKeyError and skipped that player entirely.
+    That moved the vulnerable window rather than closing it: a crash
+    between the elo_history insert and the update_player_elo call left
+    the row written and the rating unmoved, and skipping on redelivery
+    left it unmoved forever -- elo_history then permanently disagreeing
+    with players.elo for that player. The row is the record of intent,
+    not of completion, so a DuplicateKeyError now reconciles the rating
+    against the existing row's elo_after instead of skipping (see the Elo
+    loop below). That is idempotent either way: if the prior delivery had
+    in fact finished cleanly, reconciling writes the same value already
+    there; if it crashed mid-write, reconciling is what finally applies
+    the move the row already recorded.
     """
     match_id = result["match_id"]
 
@@ -231,6 +246,21 @@ def _persist_result(db, result: dict) -> None:
     # spectator socket open for this race -- that was F2: SOCKETS gating a
     # write nothing else guards. The worker is the one process that always
     # runs exactly once per finished match, so it is where this belongs.
+    #
+    # The race document is updated FIRST, the Redis lobby SECOND (N7,
+    # fix round 3 -- round 2 had this backwards). A crash between the two
+    # is otherwise self-healing on redelivery either way, but this
+    # ordering means a reader who sees the lobby as "finished" (main.py's
+    # get_race falls through to Mongo for a terminal lobby) is more likely
+    # to find the race document already there too, not the other way
+    # round. It does not fully close the interaction with the F16 path
+    # below: if this match_id turns out to have no race document at all,
+    # update_race_status is a harmless no-op (matched_count 0) and the
+    # lobby still gets marked "finished" a few lines later, before the
+    # RuntimeError -- so that poison-pill job still reports "finished"
+    # while GET /api/race/{id} 404s on the DB read. Both are edge cases
+    # the ordering alone cannot remove; noted rather than silently left.
+    crud.update_race_status(db, match_id, "finished")
     # A KeyError means the lobby already aged past its 6h TTL (or, in a
     # test, was never created at all) -- the database row above is the
     # durable record either way, so there is nothing left to update.
@@ -239,7 +269,6 @@ def _persist_result(db, result: dict) -> None:
     except KeyError:
         pass
 
-    crud.update_race_status(db, match_id, "finished")
     # crud reads standings and events by attribute; the isolated child
     # hands them back as plain dicts, so adapt at this boundary.
     crud.save_race_results(
@@ -303,12 +332,19 @@ def _persist_result(db, result: dict) -> None:
             # never been recorded before -- does the rating actually move.
             crud.save_elo_history(db, pid, match_id, old_elo, new_elo)
         except DuplicateKeyError:
-            # Another delivery already recorded this player's transition
-            # for this race. Moving their rating again on top of one that
-            # already moved is exactly the drift this index exists to
-            # stop -- skip this player and let the rest of the loop finish
-            # normally rather than raising and stranding the whole job.
-            continue
+            # Another delivery already wrote this player's transition for
+            # this race -- and may have crashed between that insert and
+            # the update_player_elo call below, leaving the row written
+            # and the rating unmoved. Skipping here (what round 2 did)
+            # left that player stuck at their pre-race rating forever,
+            # permanently contradicting their own elo_history row. The
+            # row is the record of intent, not of completion: reconcile
+            # the rating against the value it already committed to
+            # instead of skipping. If the prior delivery finished
+            # cleanly this is a same-value $set and a no-op; if it
+            # crashed mid-write this is what finally applies the move it
+            # recorded but never made.
+            new_elo = crud.get_elo_history_entry(db, pid, match_id).elo_after
         crud.update_player_elo(db, pid, new_elo)
 
 

@@ -6,6 +6,8 @@ import secrets
 import uuid
 from typing import List, Optional
 
+from pymongo import ReturnDocument
+
 from .models import to_namespace
 
 
@@ -133,23 +135,37 @@ POINTS_TABLE = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1
 
 
 def save_race_results(db, race_id: str, standings: list):
-    """Replace this race's result rows wholesale.
+    """Upsert this race's result rows, one at a time, keyed by
+    (race_id, player_id) -- never a delete-then-insert.
 
     The worker's job queue is at-least-once, so this can run a second time
     for a race that already has rows -- either because the whole match was
     redelivered after fully succeeding once, or because a worker died
     partway through persisting and a later delivery is retrying the whole
-    block from scratch (see backend/worker.py's _persist_result). Deleting
-    any existing rows before inserting means both cases land on the same
-    final set of rows rather than accumulating duplicates; determinism
-    guarantees the standings passed in are the same every time, so this is
-    a no-op in content even when it is not a no-op in database writes.
+    block from scratch (see backend/worker.py's _persist_result).
+
+    A delete-then-insert (this function's first version) is idempotent in
+    the end state but briefly leaves the collection with ZERO rows for a
+    race that GET /api/race/{id} and /api/season both read live -- a
+    reader landing in that window sees a finished race with no results, or
+    a season table missing a round. Upserting each row individually by its
+    natural key removes the window entirely: at every instant a car's row
+    is either its old content or its new content, never absent. There is
+    no "stale row to delete" case to handle either, because determinism
+    guarantees a redelivered result names exactly the same set of cars
+    every time.
+
+    The (race_id, player_id) unique index (backend/db/models.py) is not
+    just a safety net here the way the elo_history one is -- without it, a
+    concurrent upsert for a document that does not exist yet is a genuine
+    race in MongoDB itself (two upserts can both decide "no match, insert"
+    and create two rows), which is exactly how two workers persisting the
+    same match concurrently (reclaim_stalled firing while the first
+    worker is still running) could double a race's championship points.
     """
-    db.db.race_results.delete_many({"race_id": race_id})
     rows = []
     for car in standings:
         row = {
-            "id": _id(),
             "race_id": race_id,
             "player_id": car.player_id,
             "car_id": car.car_id,
@@ -161,8 +177,13 @@ def save_race_results(db, race_id: str, standings: list):
             "strategy_json": None,
             "retired": car.retired,
         }
-        db.db.race_results.insert_one(row)
-        rows.append(to_namespace(row))
+        updated = db.db.race_results.find_one_and_update(
+            {"race_id": race_id, "player_id": car.player_id},
+            {"$set": row, "$setOnInsert": {"id": _id()}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        rows.append(to_namespace(updated))
     return rows
 
 

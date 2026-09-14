@@ -114,6 +114,18 @@ def init_db(db):
     db.race_results.create_index([("race_id", ASCENDING), ("position", ASCENDING)])
     db.race_results.create_index([("player_id", ASCENDING), ("race_id", ASCENDING)])
 
+    # crud.save_race_results upserts one row per car keyed by
+    # (race_id, player_id) rather than a delete-then-insert specifically so
+    # this index can make a concurrent double-persist (two workers racing
+    # on the same match after a stalled reclaim) impossible rather than
+    # merely unlikely -- without it, two upserts that both find no existing
+    # row for the same key can each decide to insert, doubling a race's
+    # championship points.
+    _create_unique_index_or_log(
+        db.race_results, [("race_id", ASCENDING), ("player_id", ASCENDING)],
+        "race_results",
+    )
+
     db.bot_submissions.create_index([("id", ASCENDING)], unique=True)
     db.bot_submissions.create_index([("player_id", ASCENDING), ("submitted_at", DESCENDING)])
 
@@ -125,30 +137,39 @@ def init_db(db):
     # each player's history row BEFORE moving their rating specifically so
     # this index can refuse a duplicate before the damage is done, rather
     # than merely reporting it afterwards.
-    #
-    # create_index(unique=True) raises DuplicateKeyError if the collection
-    # already holds a duplicate (player_id, race_id) pair -- exactly the
-    # kind of row the bug this index exists to prevent could have already
-    # written on a live deployment, before this index existed. init_db()
-    # runs from both the API's lifespan and the worker's run_forever, so an
-    # uncaught raise here would refuse to let either process start at all
-    # over a data problem a boot cannot fix. Logging and continuing without
-    # the index is safer than bricking the boot; _persist_result's ordering
-    # is still in effect either way, just without this line's extra check.
-    try:
-        db.elo_history.create_index(
-            [("player_id", ASCENDING), ("race_id", ASCENDING)], unique=True
-        )
-    except DuplicateKeyError as exc:
-        logging.getLogger("piwall").error(
-            "elo_history already has a duplicate (player_id, race_id) pair; "
-            "the protective unique index was NOT created. Dedupe the "
-            "collection and restart to re-enable it. %s", exc,
-        )
+    _create_unique_index_or_log(
+        db.elo_history, [("player_id", ASCENDING), ("race_id", ASCENDING)],
+        "elo_history",
+    )
 
     db.manifests.create_index([("match_id", ASCENDING)], unique=True)
 
     return lambda: MongoSession(db)
+
+
+def _create_unique_index_or_log(collection, keys, collection_name: str) -> None:
+    """create_index(unique=True), tolerating pre-existing duplicates.
+
+    create_index(unique=True) raises DuplicateKeyError if the collection
+    already holds a document pair that violates the new index -- exactly
+    the kind of row the index exists to prevent could have already
+    written on a live deployment, before the index existed. init_db()
+    runs from both the API's lifespan and the worker's run_forever, so an
+    uncaught raise here would refuse to let either process start at all
+    over a data problem a boot cannot fix. Logging and continuing without
+    the index is safer than bricking the boot; whatever code-level
+    ordering the index backs up is still in effect either way, just
+    without this extra check until the collection is deduped and the
+    process restarted.
+    """
+    try:
+        collection.create_index(keys, unique=True)
+    except DuplicateKeyError as exc:
+        logging.getLogger("piwall").error(
+            "%s already has a duplicate %s; the protective unique index "
+            "was NOT created. Dedupe the collection and restart to "
+            "re-enable it. %s", collection_name, keys, exc,
+        )
 
 
 def to_namespace(document):
