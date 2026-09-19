@@ -24,17 +24,24 @@ import { useToast } from "@/components/Toast";
  * once the race is over, and inventing a 0 for them would render as a
  * real reading. Getting them back means replay bodies (Phase 4). See
  * backend/main.py's _stream_stored_replay for what the payload carries.
+ *
+ * Nothing below fills a gap with a stand-in value. `total_time` is null
+ * for a retired car and `compound` is null for a car with no recorded
+ * stints, so both are simply left off rather than becoming 0 and "" --
+ * DisplayCar marks them optional so the compiler holds every consumer to
+ * that. An earlier version of this function zero-filled both while this
+ * comment said it did not.
  */
 function finishedRowToDisplayCar(row: FinishedStandingsRow): DisplayCar {
   return {
     car_id: row.car_id,
     position: row.position,
     gap_to_leader: row.gap_to_leader,
-    compound: row.compound ?? "",
+    ...(row.compound !== null ? { compound: row.compound } : {}),
     pit_count: row.pit_count,
     pit_laps: row.pit_laps,
     compounds_used: row.compounds_used,
-    total_time: row.total_time ?? 0,
+    ...(row.total_time !== null ? { total_time: row.total_time } : {}),
     retired: row.retired,
   };
 }
@@ -262,8 +269,15 @@ export default function RacePage() {
   // state -- so they are adapted here, with the unavailable fields left
   // ABSENT rather than zero-filled, and each component decides what to
   // render in their place.
+  // `result?.standings?.map(...)`, not `result?.standings.map(...)`: the
+  // optional chain has to cover `standings` too. FinishedStandingsRow[]
+  // is a compile-time assertion about runtime JSON, and a `finished`
+  // payload with `result` present but no `standings` -- a spectator on
+  // the new frontend against an older backend mid-rollout -- would
+  // otherwise throw in render, which is the crash class this whole
+  // payload contract exists to close.
   const cars: DisplayCar[] =
-    lapData?.cars ?? result?.standings.map(finishedRowToDisplayCar) ?? [];
+    lapData?.cars ?? result?.standings?.map(finishedRowToDisplayCar) ?? [];
   const trackName = raceInfo?.track || "bahrain";
   const weather = lapData?.weather || "dry";
   const safetyCar = lapData?.safety_car || false;

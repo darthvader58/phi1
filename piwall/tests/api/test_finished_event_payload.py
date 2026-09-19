@@ -53,9 +53,17 @@ def db(monkeypatch):
 
     _stream_stored_replay does its own SessionLocal() lookup rather than
     taking a session argument, so main.SessionLocal is pointed here too.
-    Without that the function under test would read the shared database
-    while the fixtures wrote to this one -- the tests would still pass,
-    by reading nothing, which is worse than failing.
+    Without that the function under test reads the shared database while
+    the fixtures write to this one, and five of the six tests below fail
+    loudly -- they assert on standings, gaps, compounds, events and lap
+    counts that are simply not there. Only
+    test_a_race_with_nothing_persisted_yet_... passes, and that one is
+    designed to read nothing, so it is vacuous either way.
+
+    (An earlier version of this docstring claimed the tests "would pass
+    by reading nothing". That is true of one of six and false of the
+    other five. The monkeypatch is load-bearing for isolation, not for
+    stopping a silent pass.)
     """
     import backend.main as main
 

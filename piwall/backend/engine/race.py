@@ -131,7 +131,41 @@ class RaceEngine:
         starting_compound: str = "MEDIUM",
         typical_stints: Optional[Dict[str, int]] = None,
     ):
-        """Add a car to the race."""
+        """Add a car to the race.
+
+        Refuses a car_id another car in this race already holds. This is
+        where the corruption the car_id invariant exists to prevent
+        physically happens: the two assignments at the end of this method
+        key one strategy function and one BeliefModel per car_id, so a
+        repeat silently replaced the first car's with the second's, and
+        _build_race_state then read the survivor back for BOTH cars --
+        one bot driving two. Making that overwrite an error is not a new
+        rule; it is the existing silent failure, made loud at the point
+        it occurs.
+
+        Every grid in the codebase arrives here -- the worker's, the one
+        /api/test-bot assembles, engine/cli_runner's and
+        determinism/replay's -- which is what lets the invariant in
+        backend/state/car_ids.py be stated as enforced rather than
+        audited. main._build_job_and_manifest checks the same property
+        earlier for the lobby path, because failing before the job is
+        enqueued is a cleaner failure than failing inside the sandboxed
+        child; this is the backstop that no grid can route around.
+        """
+        # Imported inside the function deliberately: state/car_ids.py
+        # reads BUILTIN_BOTS out of engine/bots.py, which imports this
+        # module, so a module-level import here is a cycle. Deferring to
+        # call time is the same pattern worker._spec_from_job and
+        # determinism/replay use for their own engine imports.
+        from ..state.car_ids import DuplicateCarIdError
+
+        if car_id in self.strategies:
+            raise DuplicateCarIdError(
+                f"car_id {car_id!r} is already in this race -- adding it "
+                f"again would replace the first car's strategy and belief "
+                f"model, leaving one bot driving both cars"
+            )
+
         car = CarState(
             car_id=car_id,
             player_id=player_id,

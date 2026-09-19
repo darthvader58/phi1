@@ -464,11 +464,17 @@ def join_race(race_id: str, req: JoinRaceRequest, x_api_key: str = Header()):
     # nothing about it is decided here. Any check or default computed in
     # this handler would sit between LOBBIES.get() above and the write
     # below, which is exactly the window two replicas can both pass. It
-    # is all done inside LOBBIES.join()'s single atomic script instead:
-    # a re-join keeps the car_id it already holds (req.car_id is None on
-    # every join the shipped frontend makes), a new player gets the
-    # lowest label nobody else holds, and an explicit label somebody
-    # else holds is refused.
+    # is all done inside LOBBIES.join()'s single atomic script instead.
+    # The rules, in full, are on LobbyStore.join; in short: a re-join
+    # that sends no car_id (which is every join the shipped frontend
+    # makes -- frontend/src/lib/api.ts posts only starting_compound)
+    # keeps the one it holds, unless that id has become impossible to
+    # keep, in which case it is assigned a free one; a re-join that
+    # sends a different unclaimed car_id is honoured; a new player with
+    # no car_id gets the lowest label no other car in the race holds;
+    # and any explicit label another car already holds -- another lobby
+    # player OR one of the house bots reserved in state/car_ids.py -- is
+    # refused.
     try:
         _is_new, position, car_id = LOBBIES.join(race_id, player["id"], {
             "username": player["username"],
@@ -478,8 +484,16 @@ def join_race(race_id: str, req: JoinRaceRequest, x_api_key: str = Header()):
         })
     except LobbyFullError:
         raise HTTPException(400, "Race is full (8 players max)")
-    except CarIdTakenError:
-        raise HTTPException(400, f"car_id {req.car_id} is already taken in this race")
+    except CarIdTakenError as exc:
+        # str(exc), not req.car_id: LobbyStore.join raises naming the id
+        # it actually refused, and reformatting from the request field
+        # reported "car_id None is already taken" for any refusal where
+        # the caller sent none -- naming a value they never supplied.
+        raise HTTPException(
+            400,
+            f"{exc}. Re-join with a different car_id, or omit it to be "
+            f"assigned a free one.",
+        )
     return {"car_id": car_id, "position": position}
 
 
@@ -1118,15 +1132,22 @@ def _build_job_and_manifest(race_id: str, lobby: dict):
         ))
         slot += 1
 
-    # The chokepoint for the car_id uniqueness invariant (state/car_ids.py).
-    # Every source of a car_id converges here -- lobby players above, house
-    # bots just now -- and this is the last point before the manifest, and
-    # therefore the replay hash, seals whatever the grid turned out to be.
-    # Prevention lives with each source (LobbyStore.join() refuses a taken
-    # or reserved id); this is the detection that sees all of them at once,
-    # so a THIRD source cannot be added without passing through it. That is
-    # precisely what was missing when the same corruption arrived by a new
-    # route in three consecutive rounds.
+    # The LOBBY chokepoint for the car_id uniqueness invariant
+    # (state/car_ids.py). Both lobby-path sources converge here -- players
+    # above, house bots just now -- and this is the last point before the
+    # JOB is built, the job being what carries car_id to the worker. The
+    # MANIFEST does not: determinism/manifest.Participant has no car_id
+    # field, so the manifest hash is independent of every choice made here.
+    # The replay hash does depend on it (replay_bytes serialises
+    # final_standings through car_state_to_dict), which is the artefact a
+    # duplicate would actually corrupt.
+    #
+    # This is not the only check. It is the EARLY one: failing here means
+    # failing in this process, before save_manifest and before enqueue, so
+    # a bad grid degrades to _run_race's abort path with no manifest row
+    # and no stranded job. The check that no grid can route around lives in
+    # RaceEngine.add_car, because three other sites in this codebase build
+    # a grid without coming through here -- see state/car_ids.py's map.
     #
     # `car_id or house_bot` is exactly how worker._spec_from_job derives the
     # id it hands engine.add_car, so this checks the values the engine will

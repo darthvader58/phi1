@@ -103,7 +103,8 @@ return 1
 # that can see the lobby's true pre-write contents:
 #
 #   * A RE-JOIN that supplies NO car_id keeps the one the player already
-#     holds. Round 3 derived the default from the pre-write player count,
+#     holds, unless keeping it is impossible -- see the auto-heal note
+#     under join()'s docstring. Round 3 derived the default from the pre-write player count,
 #     which for a re-join already counts the rejoining player -- so
 #     re-joining moved that player to a fresh label and left the one they
 #     vacated free for the next genuinely-new player to be handed as well.
@@ -183,7 +184,8 @@ for pid, p in pairs(lobby.players) do
     end
 end
 
-if blank(player_data.car_id) and not is_new then
+if blank(player_data.car_id) and not is_new
+        and not blank(existing.car_id) and not taken[existing.car_id] then
     player_data.car_id = existing.car_id
 end
 if blank(player_data.car_id) then
@@ -353,13 +355,26 @@ class LobbyStore:
         CarIdTakenError if the car_id being stored belongs to another car
         in this race.
 
-        One consequence of applying that last check to a KEPT id too: a
-        lobby written before house-bot ids were reserved could hold a
-        player on "VEL-01", and their next re-join is refused rather than
-        silently renamed. That is the loud outcome -- the race would not
-        start either way (assert_unique_car_ids refuses the grid) -- and
-        the way out is a re-join carrying a different explicit car_id,
-        which the rename rule above allows.
+        The keep rule has one exception, and it is the difference
+        between a stuck lobby and a working one. A lobby written before
+        house-bot ids were reserved can hold a player on "VEL-01". That
+        id is now impossible to keep -- the race cannot start while it
+        stands, because assert_unique_car_ids refuses the grid -- so a
+        BLANK re-join by that player falls through to a fresh default
+        instead of being refused. It heals the lobby rather than locking
+        the player out of it.
+
+        That is not round 4's rename bug returning. Round 4's bug renamed
+        a player whose id was perfectly VALID, which freed a label and
+        handed the collision to the next joiner. This fires only when the
+        id cannot be kept at all, which `not taken[existing.car_id]`
+        states directly: a valid id is never in `taken` (it excludes the
+        rejoining player's own row), so the keep branch still fires for
+        every ordinary re-join.
+
+        An EXPLICIT request for a taken id is still refused, because
+        there the caller named something and deserves to be told it is
+        unavailable rather than quietly given something else.
         """
         raw = self._join_script(
             keys=[self._key(race_id)],

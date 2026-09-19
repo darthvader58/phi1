@@ -118,8 +118,16 @@ def test_build_job_and_manifest_refuses_two_players_with_no_car_id_at_all():
 
 def test_an_ordinary_grid_still_assembles():
     """The negative control, so the two tests above cannot pass merely
-    because the chokepoint rejects everything. Not red against any
-    production line by design -- that is what makes it a control."""
+    because the chokepoint rejects everything: it is green against every
+    guard in this file's red-check table, which is what makes it a
+    control.
+
+    It is not inert, though -- an earlier docstring here claimed it was
+    "not red against any production line", which is false. Replace
+    `for bot_id in BUILTIN_BOTS:` at main._build_job_and_manifest with an
+    empty iterable and the grid-size assertion below fails. It carries
+    more weight than it used to claim.
+    """
     lobby = _lobby({
         "p1": {"username": "alex", "car_id": "P01", "code": ""},
         "p2": {"username": "bo", "car_id": "P02", "code": ""},
@@ -222,5 +230,126 @@ def test_the_api_refuses_a_join_that_claims_a_house_bot_identity(monkeypatch):
         )
         assert ok.status_code == 200, ok.text
         assert ok.json()["car_id"] == "P01"
+    finally:
+        main.LOBBIES.delete(race_id)
+
+
+def test_the_engine_itself_refuses_a_duplicate_car_id():
+    """The enforcement line. `_build_job_and_manifest` guards the lobby
+    path, but three other production sites assemble a grid without it --
+    /api/test-bot, engine/cli_runner and determinism/replay -- and all of
+    them, plus anything a fourth ever builds, reach `add_car`.
+
+    This is also where the corruption physically occurred: the two
+    assignments at the end of `add_car` key one strategy and one
+    BeliefModel per car_id, so the repeat replaced the first car's and
+    `_build_race_state` read the survivor back for both. The guard makes
+    an existing silent overwrite loud; it does not invent a new rule.
+
+    Red line: `if car_id in self.strategies: raise DuplicateCarIdError(...)`
+    in backend/engine/race.py's `add_car`.
+    """
+    from backend.engine.build import build_engine
+    from backend.engine.bots import BUILTIN_BOTS
+
+    engine = build_engine("bahrain", seed=1)
+    strategy = BUILTIN_BOTS["VEL-01"]["strategy"]
+
+    engine.add_car("VEL-01", "VEL-01", strategy, 1)
+    with pytest.raises(DuplicateCarIdError, match="VEL-01"):
+        engine.add_car("VEL-01", "someone-else", strategy, 2)
+
+    # The first car's strategy and belief model must be the ones that
+    # survived -- the refusal has to happen before either is replaced.
+    assert len(engine.cars) == 1
+    assert engine.strategies["VEL-01"] is strategy
+    assert set(engine.belief_models) == {"VEL-01"}
+
+    # A different id is still perfectly fine.
+    engine.add_car("NXS-07", "NXS-07", strategy, 2)
+    assert len(engine.cars) == 2
+
+
+def test_the_worker_is_safe_against_a_job_it_is_handed():
+    """`_spec_from_job` re-derives every car_id and hands the spec
+    straight to `run_match` without re-checking, so before the engine
+    guard the guarantee was "nothing else enqueues" rather than "the
+    worker is safe against what it is handed". This builds a job the way
+    a second enqueuer would -- bypassing `_build_job_and_manifest`
+    entirely -- and requires the duplicate to be refused rather than
+    simulated.
+
+    Red line: the same `if car_id in self.strategies:` guard in
+    `add_car`. `_spec_from_job` is deliberately left unguarded: one
+    check at the point of use beats a second copy that can drift from it.
+    """
+    from backend.engine.build import build_track_physics
+    from backend.sandbox.match_job import run_match
+
+    job = {
+        "match_id": "m_hand_rolled",
+        "track": "bahrain",
+        "seed": 7,
+        # The same house bot twice. _build_job_and_manifest iterates
+        # BUILTIN_BOTS once and so cannot emit this; a second enqueuer
+        # with its own grid-assembly code could.
+        "participants": [
+            {"slot": 0, "player_id": "VEL-01", "house_bot": "VEL-01"},
+            {"slot": 1, "player_id": "VEL-01", "house_bot": "VEL-01"},
+        ],
+    }
+    spec = _spec_from_job(job)
+    assert [c["car_id"] for c in spec["cars"]] == ["VEL-01", "VEL-01"], (
+        "the job has to actually carry the duplicate through, or this "
+        "test proves nothing about the engine"
+    )
+
+    spec["track_physics"] = build_track_physics("bahrain")
+    with pytest.raises(DuplicateCarIdError, match="VEL-01"):
+        run_match(spec)
+
+
+@pytest.mark.skipif(not redis_is_reachable(), reason="needs a reachable Redis")
+def test_the_join_400_names_the_id_actually_refused(monkeypatch):
+    """N-2 (final cleanup): the handler used to reformat the refusal from
+    `req.car_id`, so any refusal where the caller sent no car_id read
+    "car_id None is already taken in this race" -- naming a value the
+    caller never supplied, on the one path they could not diagnose.
+
+    The assertion is on the RACE ID appearing in the detail, deliberately:
+    that is something only LobbyStore.join's own exception knows, so no
+    amount of reformatting from the request body could produce it. The
+    remedy has to be in there too, since a 400 that does not say what to
+    do next is how the lockout went unnoticed.
+
+    Red line: `raise HTTPException(400, f"{exc}. Re-join with ...")` in
+    `join_race` -- specifically using the exception rather than
+    `req.car_id`.
+    """
+    import backend.main as main
+
+    race_id = f"r_api_detail_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setattr(
+        main, "authenticate",
+        lambda api_key: {"id": "p_api", "username": "eve", "elo": 1200.0,
+                         "role": "player"},
+    )
+    main.LOBBIES.create(race_id, track="bahrain", race_type="quick")
+    try:
+        response = TestClient(main.app).post(
+            f"/api/race/{race_id}/join",
+            json={"car_id": "NXS-07", "starting_compound": "MEDIUM"},
+            headers={"x-api-key": "irrelevant"},
+        )
+
+        assert response.status_code == 400, response.text
+        detail = response.json()["detail"]
+        assert "NXS-07" in detail
+        assert race_id in detail, (
+            f"the detail must come from the exception, which names the "
+            f"race; got {detail!r}"
+        )
+        assert "None" not in detail
+        assert "omit it" in detail, "a refusal has to name a way forward"
     finally:
         main.LOBBIES.delete(race_id)

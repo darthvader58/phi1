@@ -31,16 +31,22 @@ export interface CarState {
  * a 0 that reads as real (round 5, NEW-11). CarState is assignable to
  * this, so a live snapshot still flows through unchanged.
  */
-export type DisplayCar = Omit<
-  CarState,
-  "player_id" | "tyre_age" | "fuel_kg" | "last_lap_time" | "drs_available" | "beliefs"
-> &
-  Partial<
-    Pick<
-      CarState,
-      "player_id" | "tyre_age" | "fuel_kg" | "last_lap_time" | "drs_available" | "beliefs"
-    >
-  >;
+type LiveOnlyCarFields =
+  | "player_id"
+  | "tyre_age"
+  | "fuel_kg"
+  | "last_lap_time"
+  | "drs_available"
+  | "beliefs"
+  // Present on every live snapshot. After the race, race_results stores
+  // it as null for a retired car, and nothing reads it off a car anyway.
+  | "total_time"
+  // The tyre the car finished on, derived from the last stint. Absent
+  // only for a car with no recorded stints at all.
+  | "compound";
+
+export type DisplayCar = Omit<CarState, LiveOnlyCarFields> &
+  Partial<Pick<CarState, LiveOnlyCarFields>>;
 
 /** The fields TyreStrategyChart needs, which both a live snapshot and a
  *  finished result row carry. */
@@ -234,6 +240,15 @@ export function getCarColor(index: number): string {
   return CAR_COLORS[index % CAR_COLORS.length];
 }
 
-export function getCompoundColor(compound: string): string {
-  return COMPOUND_COLORS[compound] || "#888888";
+/**
+ * Colour for a tyre compound, including when there is not one.
+ *
+ * Accepts undefined/null because a finished race's result row has no
+ * compound for a car with no recorded stints (see DisplayCar), and the
+ * grey fallback this already returned for any unrecognised value is
+ * exactly the right answer for "unknown" -- better than each caller
+ * inventing its own placeholder string to pass in.
+ */
+export function getCompoundColor(compound: string | null | undefined): string {
+  return (compound && COMPOUND_COLORS[compound]) || "#888888";
 }

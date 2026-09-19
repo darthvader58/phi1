@@ -562,3 +562,64 @@ def test_a_rejoin_may_change_to_a_different_unclaimed_car_id(replica_a, replica_
 
     car_ids = [p["car_id"] for p in replica_a.players(RACE).values()]
     assert sorted(car_ids) == sorted({*car_ids}) == ["P01", CUSTOM_CAR_ID]
+
+
+def test_a_blank_rejoin_heals_an_id_that_has_become_impossible_to_keep(replica_a):
+    """N-2 (final cleanup): a lobby written before house-bot ids were
+    reserved can hold a player on a reserved id. That id can no longer be
+    kept -- the race will not start while it stands, because
+    assert_unique_car_ids refuses the grid -- so refusing the re-join too
+    left that player locked out of their own lobby until the 6h TTL, with
+    no way for the shipped UI to send the remedy id.
+
+    A BLANK re-join now falls through to a fresh default instead, which
+    heals the lobby rather than stranding it.
+
+    This is not round 4's rename bug returning: that renamed a player
+    whose id was perfectly VALID, freeing a label and handing the
+    collision to the next joiner. The guard here is
+    `not taken[existing.car_id]`, and a valid id is never in `taken` --
+    it excludes the rejoining player's own row -- so every ordinary
+    re-join still keeps its id (pinned by the test above).
+
+    Red line: `and not taken[existing.car_id]` in _JOIN_SCRIPT's keep
+    condition. Without it the re-join is refused and the lobby stays
+    unstartable.
+    """
+    from backend.state.car_ids import RESERVED_CAR_IDS
+
+    reserved = sorted(RESERVED_CAR_IDS)[0]
+    replica_a.create(RACE, track="bahrain")
+    # Straight into Redis: this is the pre-fix shape join() can no longer
+    # produce, which is exactly why it has to be written directly.
+    replica_a.add_player(RACE, "p_old", {"username": "alex", "car_id": reserved})
+
+    is_new, count, healed = replica_a.join(RACE, "p_old", {"username": "alex"})
+
+    assert is_new is False
+    assert count == 1
+    assert healed == "P01", f"expected a fresh default, got {healed!r}"
+    assert replica_a.players(RACE)["p_old"]["car_id"] == "P01"
+
+
+def test_an_explicit_request_for_a_taken_id_is_still_refused_not_healed(replica_a):
+    """The auto-heal above must not swallow an explicit request. A caller
+    who names an id deserves to be told it is unavailable rather than
+    quietly handed something else -- silently substituting is how a
+    player's bot ends up racing under an identity they did not choose.
+
+    Red line: the `elseif taken[player_data.car_id] then` refusal branch
+    in _JOIN_SCRIPT.
+    """
+    from backend.state.car_ids import RESERVED_CAR_IDS
+
+    reserved = sorted(RESERVED_CAR_IDS)[0]
+    replica_a.create(RACE, track="bahrain")
+    replica_a.add_player(RACE, "p_old", {"username": "alex", "car_id": reserved})
+
+    with pytest.raises(CarIdTakenError):
+        replica_a.join(RACE, "p_old", {"username": "alex", "car_id": reserved})
+
+    assert replica_a.players(RACE)["p_old"]["car_id"] == reserved, (
+        "a refused join must leave the row exactly as it was"
+    )
