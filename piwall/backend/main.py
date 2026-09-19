@@ -222,6 +222,8 @@ async def lifespan(app: FastAPI):
         # this task needed to do durably was done before it was
         # cancelled.
         logger.exception("event relay did not shut down cleanly")
+    drained = await drain_sockets()
+    logger.info("closed %d websocket(s) on shutdown", drained)
     print("PIT WALL shutting down...")
 
 
@@ -1048,6 +1050,27 @@ async def websocket_race(websocket: WebSocket, race_id: str):
                 break
     finally:
         _discard_socket(race_id, websocket)
+
+
+async def drain_sockets() -> int:
+    """Close every socket this replica holds. Returns how many were closed.
+
+    Called on shutdown so clients get a clean close frame and reconnect to a
+    live replica, instead of waiting on a TCP timeout against a process that
+    is already gone. Pure fan-out, on purpose: it must never write anything
+    durable, and one socket's close() raising must never strand the rest --
+    SOCKETS is per-process spectator bookkeeping (see its own comment above),
+    and nothing here decides whether a match finished.
+    """
+    closed = 0
+    for race_id in list(SOCKETS.keys()):
+        for ws in list(SOCKETS.pop(race_id, set())):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            closed += 1
+    return closed
 
 
 def _discard_socket(race_id: str, websocket: WebSocket) -> None:
