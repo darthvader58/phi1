@@ -222,8 +222,16 @@ async def lifespan(app: FastAPI):
         # this task needed to do durably was done before it was
         # cancelled.
         logger.exception("event relay did not shut down cleanly")
-    drained = await drain_sockets()
-    logger.info("closed %d websocket(s) on shutdown", drained)
+    try:
+        drained = await drain_sockets()
+        logger.info("closed %d websocket(s) on shutdown", drained)
+    except Exception:
+        # A failure here must not be the reason ASGI shutdown itself fails
+        # or hangs -- draining is a best-effort courtesy to spectators, not
+        # a step anything durable depends on (see drain_sockets's own
+        # docstring). Whatever this was, there is nothing left to salvage
+        # for it at this point in shutdown.
+        logger.exception("socket drain did not complete cleanly")
     print("PIT WALL shutting down...")
 
 
@@ -1052,25 +1060,46 @@ async def websocket_race(websocket: WebSocket, race_id: str):
         _discard_socket(race_id, websocket)
 
 
+# Per-socket ceiling on how long drain_sockets waits for one close() to
+# finish. WebSocket.close() awaits a send; a client with a wedged or full
+# transport buffer would otherwise stall this coroutine indefinitely, and
+# with it -- since lifespan awaits this before ASGI shutdown completes --
+# the whole shutdown. Well under a client's own idle-ping timeout (30s in
+# websocket_race above), so this is what actually bounds shutdown, not
+# whatever the far end feels like doing.
+_DRAIN_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
 async def drain_sockets() -> int:
-    """Close every socket this replica holds. Returns how many were closed.
+    """Close every socket this replica holds. Returns how many closed cleanly.
 
     Called on shutdown so clients get a clean close frame and reconnect to a
     live replica, instead of waiting on a TCP timeout against a process that
     is already gone. Pure fan-out, on purpose: it must never write anything
-    durable, and one socket's close() raising must never strand the rest --
-    SOCKETS is per-process spectator bookkeeping (see its own comment above),
-    and nothing here decides whether a match finished.
+    durable, and one socket's close() raising or hanging must never strand
+    the rest -- SOCKETS is per-process spectator bookkeeping (see its own
+    comment above), and nothing here decides whether a match finished.
+
+    Sockets are closed concurrently, each bounded by _DRAIN_CLOSE_TIMEOUT_SECONDS,
+    rather than one at a time with no limit: a sequential, unbounded loop
+    means the single slowest (or wedged) client sets how long every other
+    client -- and ASGI shutdown itself -- waits.
     """
-    closed = 0
-    for race_id in list(SOCKETS.keys()):
-        for ws in list(SOCKETS.pop(race_id, set())):
-            try:
-                await ws.close()
-            except Exception:
-                pass
-            closed += 1
-    return closed
+    every_socket = [
+        ws
+        for race_id in list(SOCKETS.keys())
+        for ws in list(SOCKETS.pop(race_id, set()))
+    ]
+
+    async def _close_one(ws) -> bool:
+        try:
+            await asyncio.wait_for(ws.close(), timeout=_DRAIN_CLOSE_TIMEOUT_SECONDS)
+            return True
+        except Exception:
+            return False
+
+    results = await asyncio.gather(*(_close_one(ws) for ws in every_socket))
+    return sum(results)
 
 
 def _discard_socket(race_id: str, websocket: WebSocket) -> None:
