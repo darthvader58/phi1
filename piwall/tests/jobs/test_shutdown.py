@@ -55,6 +55,7 @@ from backend.determinism.manifest import Participant, build_manifest
 from backend.jobs.queue import STREAM, MatchJobQueue
 from backend.observability.health import _mongo_is_reachable
 from backend.state.redis_client import get_redis, redis_is_reachable
+from tests.subprocess_env import child_env
 
 PIWALL_DIR = Path(__file__).resolve().parents[2]
 
@@ -229,22 +230,7 @@ def test_a_real_sigterm_mid_job_still_finishes_and_acks_the_claimed_match(
     queue.enqueue(job)
 
     consumer = f"sigterm-test-{uuid.uuid4().hex[:8]}"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(PIWALL_DIR)
-    env["MONGODB_URI"] = mongo_url
-    # MONGODB_DB OVERRIDES the database named in MONGODB_URI's path --
-    # backend/db/models.py's _resolve_database_name reads the variable first
-    # and only falls back to the path -- and both CI and docker compose set
-    # it. Inheriting it unchanged sends the child to whatever database that
-    # names while this test's assertions read the throwaway one: the child
-    # then finds no manifest for its match, _persist_result refuses to treat
-    # the result as persisted, and the job is never acked. Worse, a developer
-    # with MONGODB_DB=phi1 exported would have the child writing into the
-    # shared database this suite must never touch. Pinning it to the
-    # throwaway database's own name means the two cannot disagree.
-    database_name = urlparse(mongo_url).path.lstrip("/")
-    assert database_name, f"no database name in {mongo_url!r}"
-    env["MONGODB_DB"] = database_name
+    env = child_env(mongo_url)
 
     child_source = _CHILD_SOURCE.replace("__CONSUMER__", consumer)
 

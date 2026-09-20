@@ -17,20 +17,19 @@ import uuid
 
 import pytest
 from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError, ServerSelectionTimeoutError
+from pymongo.errors import DuplicateKeyError
 
 from backend.db import crud
 from backend.db.models import create_db_engine, init_db, mongo_url
-
-
-def _mongo_is_reachable() -> bool:
-    try:
-        MongoClient(
-            "mongodb://127.0.0.1:27017/", serverSelectionTimeoutMS=500
-        ).admin.command("ping")
-        return True
-    except ServerSelectionTimeoutError:
-        return False
+# The one definition of "a reachable database" this suite uses
+# (backend/observability/health.py), which probes whatever mongo_url()
+# resolves to. A private probe hardcoded to 127.0.0.1 -- which this file used
+# to carry -- disagrees with it the moment Mongo is anywhere else, and the two
+# disagree in opposite, equally wrong directions: this file then SKIPS against
+# a perfectly reachable database, while the files that gate on the shared
+# probe and then connect to a hardcoded host ERROR. A suite whose skip count
+# depends on where Mongo happens to live undermines CI's zero-skip floor.
+from backend.observability.health import _mongo_is_reachable
 
 
 pytestmark = pytest.mark.skipif(
@@ -80,7 +79,7 @@ def throwaway_db():
     database built and torn down for exactly this test.
     """
     name = f"piwall_test_race_results_{uuid.uuid4().hex[:8]}"
-    client = MongoClient("mongodb://127.0.0.1:27017/")
+    client = MongoClient(mongo_url())
     database = client[name]
     yield database
     client.drop_database(name)

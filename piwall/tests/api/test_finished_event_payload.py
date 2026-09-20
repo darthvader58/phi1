@@ -35,6 +35,7 @@ from pymongo import MongoClient
 
 from backend.db import crud
 from backend.db.models import init_db
+from backend.db.models import mongo_url
 from backend.observability.health import _mongo_is_reachable
 
 pytestmark = pytest.mark.skipif(
@@ -68,7 +69,12 @@ def db(monkeypatch):
     import backend.main as main
 
     name = f"piwall_test_finished_event_{uuid.uuid4().hex[:8]}"
-    client = MongoClient("mongodb://127.0.0.1:27017/")
+    # mongo_url(), not a hardcoded 127.0.0.1: the skip gate above
+    # probes mongo_url(), so a hardcoded host here means the gate
+    # says "run" against a database this client cannot reach --
+    # an error rather than a skip, which is what happens inside a
+    # container. The two must resolve the same server.
+    client = MongoClient(mongo_url())
     session = init_db(client[name])()
     monkeypatch.setattr(main, "SessionLocal", lambda: session)
     yield session

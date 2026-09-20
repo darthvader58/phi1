@@ -108,10 +108,14 @@ def throwaway_db():
     """
     from pymongo import MongoClient
 
-    from backend.db.models import MongoSession
+    from backend.db.models import MongoSession, mongo_url
 
     name = f"piwall_test_worker_persistence_{uuid.uuid4().hex[:8]}"
-    client = MongoClient("mongodb://127.0.0.1:27017/")
+    # mongo_url(), not a hardcoded 127.0.0.1: the skip gate on this module
+    # probes mongo_url(), so hardcoding a host here means the gate says
+    # "run" against a server this client cannot reach -- an error rather
+    # than a skip, which is exactly what happens inside a container.
+    client = MongoClient(mongo_url())
     database = client[name]
     init_db(database)
     session = MongoSession(database)
