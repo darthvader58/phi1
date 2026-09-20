@@ -29,25 +29,32 @@ class MongoSession:
         return None
 
 
-def create_db_engine(url: str | None = None):
-    mongo_url = url or os.environ.get("MONGODB_URI") or "mongodb://127.0.0.1:27017/phi1"
-    client = MongoClient(mongo_url)
-    db = client[_resolve_database_name(mongo_url)]
-    return db
-
-
 def mongo_url() -> str:
-    """The Mongo connection string, for callers that must not import main.
+    """The Mongo connection string. The ONE definition of it.
 
-    main imports the health router, and the worker imports neither -- so both
-    need this without reaching back into the API module. Same precedence main
-    itself uses, kept here because this module already owns database config.
+    main imports the health router and the worker imports neither, so both
+    need this without reaching back into the API module -- and it lives here
+    because this module already owns database configuration.
+
+    Everything that resolves a connection string goes through this,
+    including create_db_engine's own no-arg fallback below. That fallback
+    used to read MONGODB_URI but not DATABASE_URL, which made it a third
+    precedence rule alongside this one and main's copy: a deployment setting
+    only DATABASE_URL got the localhost default from some call sites and the
+    real server from others, with nothing to say so.
     """
     return (
         os.environ.get("MONGODB_URI")
         or os.environ.get("DATABASE_URL")
         or "mongodb://127.0.0.1:27017/phi1"
     )
+
+
+def create_db_engine(url: str | None = None):
+    resolved = url or mongo_url()
+    client = MongoClient(resolved)
+    db = client[_resolve_database_name(resolved)]
+    return db
 
 
 # MongoDB reports "an index with this name exists but with different options"

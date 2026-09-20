@@ -138,7 +138,12 @@ def _spec_from_job(job: dict) -> dict:
             "car_id": participant.get("car_id") or house_bot,
             "player_id": participant.get("player_id") or house_bot,
             "start_position": position,
-            "starting_compound": participant.get("starting_compound", default_compound),
+            # `or`, not a dict default: a participant row can carry the
+            # key with value None, in which case a default argument never
+            # fires and None reaches engine.add_car as the compound.
+            "starting_compound": (
+                participant.get("starting_compound") or default_compound
+            ),
         }
         if participant.get("code"):
             car["code"] = participant["code"]

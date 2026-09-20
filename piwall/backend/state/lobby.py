@@ -44,16 +44,30 @@ TTL_SECONDS = 6 * 60 * 60
 #
 # KEYS[1] = the lobby key
 # ARGV[1] = TTL seconds, re-applied on every write so a mutation refreshes it
-# ARGV[2] = "field" to set a top-level field, "player" to replace one whole
-#           player dict, or "player_field" to set one field within one
-#           player's dict without touching its other fields
-# ARGV[3] = the field name (mode "field") or player id (modes "player" and
-#           "player_field")
+# ARGV[2] = "field" to set a top-level field, "field_if" to set one only
+#           when its current value is in an allowed set, "player" to replace
+#           one whole player dict, or "player_field" to set one field within
+#           one player's dict without touching its other fields
+# ARGV[3] = the field name (modes "field" and "field_if") or player id
+#           (modes "player" and "player_field")
 # ARGV[4] = the new value, JSON-encoded
-# ARGV[5] = the field name within the player dict (mode "player_field" only)
+# ARGV[5] = the field name within the player dict (mode "player_field"), or
+#           a JSON array of acceptable current values (mode "field_if")
 #
 # Returns false (-> None in Python) if the lobby does not exist (any mode),
-# or if mode is "player_field" and no player with that id exists yet; else 1.
+# if mode is "player_field" and no player with that id exists yet, or if
+# mode is "field_if" and the field's current value is not in the allowed
+# set; else 1.
+#
+# "field_if" is a compare-and-set, and it exists because a check in an HTTP
+# handler is not one. start_race read the lobby, checked status == "lobby",
+# and then wrote "countdown"; two concurrent /start calls both passed the
+# check and both spawned a _run_race, which built two jobs with two
+# different random seeds for one race. The loser's save_manifest raised and
+# its except block marked the WINNER'S live race aborted -- permanently, if
+# it landed after the worker's finish. Folding the check into the same
+# atomic step as the write is the only place it cannot be raced, exactly as
+# _JOIN_SCRIPT already does for capacity and car_id.
 _MUTATE_SCRIPT = """
 local raw = redis.call('GET', KEYS[1])
 if raw == false then
@@ -70,6 +84,17 @@ elseif ARGV[2] == 'player_field' then
         return false
     end
     lobby.players[ARGV[3]][ARGV[5]] = cjson.decode(ARGV[4])
+elseif ARGV[2] == 'field_if' then
+    local allowed = false
+    for _, value in ipairs(cjson.decode(ARGV[5])) do
+        if lobby[ARGV[3]] == value then
+            allowed = true
+        end
+    end
+    if not allowed then
+        return false
+    end
+    lobby[ARGV[3]] = cjson.decode(ARGV[4])
 else
     lobby[ARGV[3]] = cjson.decode(ARGV[4])
 end
@@ -281,6 +306,25 @@ class LobbyStore:
 
     def set_status(self, race_id: str, status: str) -> None:
         self._atomic_set(race_id, "field", "status", status)
+
+    def set_status_if(self, race_id: str, status: str, expected) -> bool:
+        """Move the status only if it currently holds one of `expected`.
+
+        Returns True if this call made the transition, False if the lobby is
+        gone or its status was something else. The caller that gets True is
+        the only one that made it, which is what makes it safe to act on --
+        two replicas racing the same transition cannot both be told yes.
+
+        Never raises KeyError the way _atomic_set does: "the lobby moved on"
+        and "there is no lobby" are the same answer to the only question
+        this asks, which is "am I the one who may proceed".
+        """
+        ok = self._mutate(
+            keys=[self._key(race_id)],
+            args=[TTL_SECONDS, "field_if", "status", json.dumps(status),
+                  json.dumps(list(expected))],
+        )
+        return bool(ok)
 
     def set_speed(self, race_id: str, speed: float) -> None:
         self._atomic_set(race_id, "field", "speed", float(speed))

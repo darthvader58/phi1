@@ -36,7 +36,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from .db.models import MongoSession, create_db_engine, init_db
+from .db.models import MongoSession, create_db_engine, init_db, mongo_url
 from .db import crud
 from .data.tracks import TRACKS
 from .determinism.manifest import Participant, build_manifest
@@ -47,7 +47,12 @@ from .jobs.events import MatchEvents
 from .jobs.queue import MatchJobQueue
 from .sandbox.runner import NAMESPACE_RESERVED_KEYS, STRATEGY_TEMPLATE
 from .state.car_ids import assert_unique_car_ids
-from .state.lobby import CarIdTakenError, LobbyFullError, LobbyStore
+from .state.lobby import (
+    OPEN_STATUSES as OPEN_LOBBY_STATUSES,
+    CarIdTakenError,
+    LobbyFullError,
+    LobbyStore,
+)
 from backend.sandbox.validation import validate_submission
 from backend.sandbox.isolation import ChildFailed, LimitExceeded
 from backend.sandbox.match_job import run_match_isolated
@@ -101,6 +106,45 @@ def _spawn_background(coro) -> asyncio.Task:
     return task
 
 
+# How long shutdown waits for work already in hand. It must comfortably
+# exceed the countdown _run_race sits through (5s) plus the save_manifest
+# and enqueue that follow it, because finishing that sequence is the whole
+# point -- cutting it short loses the match exactly as abandoning it did.
+# It also bounds shutdown, so it cannot be "however long the slowest thing
+# feels like taking": a task still running at the deadline is cancelled and
+# logged, which at least leaves a record of the match that was lost.
+_BACKGROUND_DRAIN_TIMEOUT_SECONDS = 15.0
+
+
+async def _finish_background_tasks(
+    timeout: float = _BACKGROUND_DRAIN_TIMEOUT_SECONDS,
+) -> int:
+    """Let in-flight background work finish. Returns how many did.
+
+    Best effort in the same sense drain_sockets is -- a task raising must
+    not be the reason ASGI shutdown fails -- but unlike drain_sockets this
+    one guards something durable, so it waits rather than merely closing.
+    """
+    tasks = [t for t in _background_tasks if not t.done()]
+    if not tasks:
+        return 0
+    logger.info("waiting for %d background task(s) before shutdown", len(tasks))
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in pending:
+        # Named individually: a cancelled _run_race is a match that was
+        # promised to a player and never enqueued, and the race id is the
+        # only thing that makes it recoverable by hand.
+        logger.error("background task did not finish before shutdown: %r", task)
+        task.cancel()
+    for task in done:
+        if task.cancelled():
+            continue
+        exc = task.exception()
+        if exc is not None:
+            logger.error("background task failed during shutdown: %r", exc)
+    return len(done)
+
+
 _jobs: Optional[MatchJobQueue] = None
 
 
@@ -134,7 +178,12 @@ def __getattr__(name: str):
 
 # ─── Database setup ──────────────────────────────────────────────────
 
-DB_URL = os.environ.get("MONGODB_URI") or os.environ.get("DATABASE_URL") or "mongodb://127.0.0.1:27017/phi1"
+# db.models.mongo_url(), not a second copy of its body. 23b4b5b added that
+# function and routed the worker and the health probe through it, but left
+# a byte-for-byte duplicate of its precedence rule here. Two definitions
+# that agree today are two definitions that can stop agreeing, and the
+# symptom -- one process writing to a database another reads -- is silent.
+DB_URL = mongo_url()
 
 
 def _parse_cors_origins() -> List[str]:
@@ -205,6 +254,16 @@ async def lifespan(app: FastAPI):
     # app it belongs to.
     event_task = asyncio.create_task(_relay_match_events())
     yield
+    # BEFORE anything else is torn down. For the five seconds between
+    # /start and enqueue, a match exists only as an in-memory asyncio task
+    # on this one replica -- no job in the queue, nothing durable but a
+    # lobby at "countdown" that nothing reaps. A replica that stopped
+    # during a countdown took the match with it, which is precisely what a
+    # rolling restart causes, and rolling restarts are the reason two
+    # replicas exist at all. The worker side of this property ("a restart
+    # mid-match loses no match") was built and tested; this is its mirror
+    # image.
+    await _finish_background_tasks()
     event_task.cancel()
     try:
         await event_task
@@ -238,7 +297,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="PIT WALL", version="0.1.0", lifespan=lifespan)
 
 from .observability.health import health_router
-from .observability.logging import configure_logging
+from .observability.logging import configure_logging, match_context
 
 configure_logging("api")
 app.include_router(health_router)
@@ -558,7 +617,16 @@ async def start_race(race_id: str, x_api_key: str = Header()):
     if getattr(race, "owner_id", None) not in (None, player["id"]):
         raise HTTPException(403, "Only the race owner can start this race")
 
-    LOBBIES.set_status(race_id, "countdown")
+    # Compare-and-set, not the read-check-write this used to be. The
+    # `lobby["status"] != "lobby"` check above is a cheap early reject that
+    # two concurrent calls can both pass -- they read the same snapshot --
+    # and both then spawned a _run_race. Two _run_races build two jobs for
+    # one race with two different random seeds; the loser's save_manifest
+    # raises, and its except block marked the winner's LIVE race aborted,
+    # permanently if it landed after the worker's finish. Only the caller
+    # this returns True to may start the race.
+    if not LOBBIES.set_status_if(race_id, "countdown", ("lobby",)):
+        raise HTTPException(400, "Race already started")
 
     db = SessionLocal()
     try:
@@ -1172,7 +1240,15 @@ def _build_job_and_manifest(race_id: str, lobby: dict):
             # embeds a manifest in the replay that does not match the row
             # crud.save_manifest wrote for this same match_id below.
             "code_sha256": code_sha256,
-            "starting_compound": pdata.get("starting_compound"),
+            # `or "MEDIUM"`, not `.get(key, "MEDIUM")`. The key is
+            # PRESENT with value None for any player row that lacks one, so
+            # a dict default never fires and None reaches engine.add_car as
+            # the compound -- which is what the worker's own
+            # `.get("starting_compound", default_compound)` could not
+            # recover either. Unreachable today only because
+            # JoinRaceRequest.starting_compound is a non-optional pydantic
+            # field; one field ever becoming optional makes it live.
+            "starting_compound": pdata.get("starting_compound") or "MEDIUM",
         })
         manifest_participants.append(Participant(
             slot=slot,
@@ -1248,6 +1324,18 @@ async def _run_race(race_id: str):
     if lobby is None:
         return
 
+    # The API's half of the correlation id. observability/logging.py exists
+    # so one match id follows one match ACROSS processes; the worker bound
+    # one and main bound none, so no API log line ever carried a match_id
+    # and the cross-process join the module was built for could not be
+    # performed at all. match_context rather than bind/clear because this
+    # coroutine can leave by an exception, which a bare clear_match() would
+    # skip -- leaving the id bound to whatever runs next in this context.
+    with match_context(race_id):
+        await _run_race_inner(race_id, lobby)
+
+
+async def _run_race_inner(race_id: str, lobby: dict):
     try:
         for seconds in (5, 4, 3, 2, 1):
             await _broadcast(race_id, {"type": "countdown", "seconds": seconds})
@@ -1279,13 +1367,16 @@ async def _run_race(race_id: str):
         _get_jobs().enqueue(job)
     except Exception:
         logger.exception("race %s failed to start; marking it aborted", race_id)
-        try:
-            LOBBIES.set_status(race_id, "aborted")
-        except KeyError:
-            pass
+        # Both writes refuse to touch a race that is already terminal. The
+        # compare-and-set in start_race means two _run_races for one race
+        # can no longer exist, but this path can still run against a race
+        # the worker has meanwhile finished -- and an unconditional abort
+        # then marks a completed race aborted with its results still in
+        # race_results, which no later write heals.
+        LOBBIES.set_status_if(race_id, "aborted", OPEN_LOBBY_STATUSES)
         db = SessionLocal()
         try:
-            crud.update_race_status(db, race_id, "aborted")
+            crud.abort_race(db, race_id, "internal error")
         finally:
             db.close()
         # Generic text, deliberately: spectators on this socket are
@@ -1452,6 +1543,11 @@ async def _stream_stored_replay(race_id: str) -> None:
     DisplayCar marks exactly those fields optional so a component has to
     say what it shows in their place rather than rendering a zero.
     """
+    with match_context(race_id):
+        await _stream_stored_replay_inner(race_id)
+
+
+async def _stream_stored_replay_inner(race_id: str) -> None:
     db = SessionLocal()
     try:
         replay_sha256 = crud.get_replay_hash(db, race_id)
