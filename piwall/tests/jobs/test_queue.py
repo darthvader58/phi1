@@ -150,3 +150,141 @@ def test_ensure_group_does_not_swallow_a_non_busygroup_error():
             MatchJobQueue()
     finally:
         client.delete(STREAM)
+
+
+# ─── Surviving the loss of the stream key or the group ───────────────
+#
+# `_ensure_group` used to run in `__init__` and nowhere else, and
+# `run_forever` builds one queue at startup and keeps it for the life of the
+# process. So a stream key that disappeared afterwards -- a Redis restart with
+# no persistence, an eviction under maxmemory, an operator DEL, or this very
+# suite's own `client.delete(STREAM)` teardown running against a Redis a
+# worker is draining -- wedged that worker permanently. Every iteration raised
+# NOGROUP, `run_forever` logged it as a job failure and backed off to its 30s
+# ceiling, and the process never exited, so `restart: unless-stopped` never
+# fired and no probe noticed: `/ready` checks only that Redis and Mongo are
+# reachable, and both genuinely are.
+#
+# Meanwhile XADD does not fail. `enqueue` recreates the key without a group
+# and keeps returning entry ids, so the API accepts races and stacks up jobs
+# nothing can read. These tests pin both halves.
+
+
+def test_claim_recovers_when_the_stream_key_has_been_deleted(queue):
+    """The wedge, at its source.
+
+    Delete `_with_group`'s `self._ensure_group()` call (or narrow its
+    NOGROUP match) and this goes red with the raw
+    `ResponseError: NOGROUP No such key 'piwall:jobs:match' or consumer
+    group 'match-workers'` -- which is exactly what a real worker used to
+    take, once per iteration, forever.
+    """
+    get_redis().delete(STREAM)
+
+    # Jobs enqueued after the loss are the ones that must not be stranded:
+    # XADD rebuilds the key with no group, so this succeeds either way.
+    queue.enqueue(JOB)
+
+    entry_id, job = queue.claim("worker-1", block_ms=500)
+    assert job["match_id"] == "m_test_1", (
+        "a job enqueued after the stream key was lost must still be claimable"
+    )
+    queue.ack(entry_id)
+    assert queue.pending_count() == 0
+
+
+def test_claim_recovers_when_only_the_group_has_been_destroyed(queue):
+    """The other NOGROUP case: the stream survives, the group does not.
+
+    Re-creating at id="0" re-delivers what is still in the stream, which is
+    safe by determinism and by _persist_result's idempotency, and is the
+    correct trade against creating at "$" and silently discarding every job
+    enqueued during the outage.
+    """
+    queue.enqueue(JOB)
+    get_redis().xgroup_destroy(STREAM, GROUP)
+
+    entry_id, job = queue.claim("worker-1", block_ms=500)
+    assert job["match_id"] == "m_test_1", (
+        "an undelivered job must survive the group being destroyed under it"
+    )
+    queue.ack(entry_id)
+
+
+def test_reclaim_and_pending_count_recover_too(queue):
+    """All three group-scoped commands, not just the one that was noticed.
+
+    `process_one` calls reclaim_stalled BEFORE claim, so a fix that only
+    covered claim would leave the worker wedged on the very first line it
+    reaches. pending_count is what every assertion in this suite reads the
+    queue's state through.
+    """
+    get_redis().delete(STREAM)
+    assert queue.reclaim_stalled("worker-1", min_idle_ms=0) == []
+    assert queue.pending_count() == 0
+
+    queue.enqueue(JOB)
+    entry_id, _job = queue.claim("worker-1", block_ms=500)
+    assert queue.pending_count() == 1
+    assert queue.reclaim_stalled("worker-2", min_idle_ms=0)[0][0] == entry_id
+
+
+def test_a_non_nogroup_response_error_is_not_swallowed(queue):
+    """The NOGROUP-only match is load-bearing, exactly as BUSYGROUP's is.
+
+    Widen `_with_group` to a bare `except ResponseError` and a genuinely
+    broken stream stops raising: the queue would quietly re-create a group,
+    retry, and surface a different error or none at all, instead of failing
+    on the real problem.
+    """
+    client = get_redis()
+    client.delete(STREAM)
+    client.set(STREAM, "not a stream")
+    try:
+        with pytest.raises(ResponseError, match="WRONGTYPE"):
+            # Built against the bad key directly: __init__ raises here, which
+            # is the loud startup failure test_ensure_group_does_not_swallow_
+            # a_non_busygroup_error already pins. This asserts the same
+            # property for the retry path by driving it on an existing queue.
+            queue._with_group(lambda: client.xlen(STREAM) and client.xreadgroup(
+                GROUP, "worker-1", {STREAM: ">"}, count=1, block=100
+            ))
+    finally:
+        client.delete(STREAM)
+
+
+def test_enqueue_caps_the_stream_so_it_cannot_grow_without_bound(queue,
+                                                                 monkeypatch):
+    """XACK does not delete, so nothing else ever shrinks this stream.
+
+    Delete the `maxlen=`/`approximate=` arguments from enqueue and this goes
+    red at 500 entries instead of ~100: the stream keeps every job ever
+    enqueued, which is unbounded Redis memory and one of the routes by which
+    the key gets evicted and the NOGROUP wedge above fires in the first
+    place.
+
+    The cap is monkeypatched down rather than enqueuing ten thousand jobs.
+    `approximate=True` means Redis trims whole radix nodes and so keeps MORE
+    than the cap, never fewer -- measured here, a cap of 10 settles at
+    `stream-node-max-entries` (100 by default) rather than at 10, and stays
+    there no matter how many more arrive. That one-sidedness is the point:
+    over-keeping is harmless, while trimming an entry that is still pending
+    would lose that match. So this asserts trimming HAPPENS and never
+    undershoots, and deliberately does not pin an exact length Redis is
+    entitled to choose.
+    """
+    import backend.jobs.queue as queue_module
+
+    monkeypatch.setattr(queue_module, "STREAM_MAXLEN", 10)
+    for n in range(500):
+        queue.enqueue({**JOB, "match_id": f"m_cap_{n}"})
+
+    depth = queue.depth()
+    assert depth < 250, (
+        f"500 jobs enqueued under a cap of 10 left {depth} in the stream; "
+        f"the stream is not being trimmed at all"
+    )
+    assert depth >= 10, (
+        f"the trim undershot the cap ({depth} < 10) -- an entry still "
+        f"pending would be a lost match"
+    )

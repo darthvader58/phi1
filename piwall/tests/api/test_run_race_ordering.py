@@ -42,9 +42,16 @@ class _RecordingJobs:
         return "fake-entry-id"
 
 
-def test_run_race_saves_the_manifest_before_enqueuing_the_job(monkeypatch):
+def test_run_race_saves_the_manifest_before_enqueuing_the_job(
+    monkeypatch, throwaway_session
+):
     import backend.main as main
     from backend.db import crud
+
+    # Every database write _run_race makes goes to a database this test
+    # owns. Without it these writes land in whatever mongo_url() names,
+    # which on a developer machine is the shared phi1.
+    monkeypatch.setattr(main, "SessionLocal", lambda: throwaway_session)
 
     # The countdown's five real 1-second sleeps would make this test slow
     # for no reason -- what is under test is call order, not timing.
@@ -86,7 +93,9 @@ def test_run_race_saves_the_manifest_before_enqueuing_the_job(monkeypatch):
     )
 
 
-def test_run_race_marks_the_race_aborted_on_a_manifest_conflict(monkeypatch):
+def test_run_race_marks_the_race_aborted_on_a_manifest_conflict(
+    monkeypatch, throwaway_session
+):
     """F13: _run_race had no error handling and its task handle was
     dropped. If crud.save_manifest raised (e.g. a ValueError from a
     manifest conflict -- two replicas both passing start_race's
@@ -98,6 +107,7 @@ def test_run_race_marks_the_race_aborted_on_a_manifest_conflict(monkeypatch):
     from backend.db import crud
 
     monkeypatch.setattr(main.asyncio, "sleep", _fast_sleep)
+    monkeypatch.setattr(main, "SessionLocal", lambda: throwaway_session)
 
     race_id = f"m_run_race_abort_{int(time.time() * 1000)}"
     main.LOBBIES.delete(race_id)

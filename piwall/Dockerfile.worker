@@ -1,0 +1,36 @@
+# The worker runs untrusted player code, so it is the same image as the API:
+# same base, same pinned dependencies, same frozen calibration, same
+# PYTHONHASHSEED. A separate dependency set here would mean the sandbox and
+# the determinism guarantees were verified against something the worker does
+# not actually run.
+#
+# Kept deliberately in lockstep with Dockerfile.backend, which differs only in
+# its CMD and in carrying the test suite. CI builds BOTH and asserts the same
+# "no numpy/scipy/fastf1 in the runtime" property against each, so the two
+# drifting apart is a red check rather than a discovery made during an
+# incident.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ backend/
+
+# Frozen calibration artifacts: committed and content-addressed, read at
+# race-build time by backend/data/calibration_store.py. The worker is now the
+# process that builds track physics (backend/worker.py's _spec_from_job builds
+# it here rather than shipping it in the job payload), so without this the
+# image imports fine and every single match fails with FileNotFoundError.
+COPY calibration/ calibration/
+
+RUN mkdir -p fastf1_cache processed_cache
+
+ENV PYTHONPATH=/app
+# Pinned for determinism, exactly as in Dockerfile.backend. The API and the
+# worker compare replay hashes with each other across process boundaries;
+# they must agree on the interpreter's hash seed.
+ENV PYTHONHASHSEED=0
+
+CMD ["python", "-m", "backend.worker"]

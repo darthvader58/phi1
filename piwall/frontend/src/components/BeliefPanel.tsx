@@ -1,6 +1,6 @@
 "use client";
 
-import { CarState, getCompoundColor, getCarColor } from "@/lib/types";
+import { DisplayCar, getCompoundColor, getCarColor } from "@/lib/types";
 
 interface RivalBelief {
   age: number;
@@ -12,7 +12,7 @@ interface RivalBelief {
 }
 
 interface Props {
-  cars: CarState[];
+  cars: DisplayCar[];
   selectedCarId?: string;
 }
 

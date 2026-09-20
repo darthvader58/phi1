@@ -1,9 +1,9 @@
 "use client";
 
-import { CarState, getCompoundColor, getCarColor } from "@/lib/types";
+import { DisplayCar, getCompoundColor, getCarColor } from "@/lib/types";
 
 interface Props {
-  cars: CarState[];
+  cars: DisplayCar[];
   highlightCarId?: string;
   previousPositions?: Record<string, number>;
 }
@@ -102,12 +102,15 @@ export default function Leaderboard({ cars, highlightCarId, previousPositions }:
                 />
               </div>
 
-              {/* Tyre age */}
+              {/* Tyre age. Undefined on a finished race: the result row
+                  carries no per-lap state, so this shows an explicit dash
+                  rather than a 0 that would read as a fresh set. */}
               <span className={`w-8 text-right tabular-nums font-mono text-[11px] ${
+                car.tyre_age === undefined ? "text-pit-muted" :
                 car.tyre_age > 20 ? "text-red-400" :
                 car.tyre_age > 12 ? "text-yellow-400" : "text-pit-muted"
               }`}>
-                {car.tyre_age}
+                {car.tyre_age ?? "—"}
               </span>
 
               {/* Pit count */}

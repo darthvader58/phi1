@@ -6,6 +6,7 @@ import { useState, useEffect, useRef } from "react";
 import { useRaceWebSocket } from "@/lib/websocket";
 import { api } from "@/lib/api";
 import { COMPOUND_COLORS } from "@/lib/types";
+import type { DisplayCar, FinishedStandingsRow } from "@/lib/types";
 import Leaderboard from "@/components/Leaderboard";
 import GapChart from "@/components/GapChart";
 import LapTimeChart from "@/components/LapTimeChart";
@@ -14,6 +15,36 @@ import EventLog from "@/components/EventLog";
 import TyreStrategyChart from "@/components/TyreStrategyChart";
 import BeliefPanel from "@/components/BeliefPanel";
 import { useToast } from "@/components/Toast";
+
+/**
+ * A finished race's result row, as much of a car as it can honestly be.
+ *
+ * tyre_age, fuel_kg, last_lap_time, drs_available and beliefs are
+ * deliberately not set: they are live-timing state that no longer exists
+ * once the race is over, and inventing a 0 for them would render as a
+ * real reading. Getting them back means replay bodies (Phase 4). See
+ * backend/main.py's _stream_stored_replay for what the payload carries.
+ *
+ * Nothing below fills a gap with a stand-in value. `total_time` is null
+ * for a retired car and `compound` is null for a car with no recorded
+ * stints, so both are simply left off rather than becoming 0 and "" --
+ * DisplayCar marks them optional so the compiler holds every consumer to
+ * that. An earlier version of this function zero-filled both while this
+ * comment said it did not.
+ */
+function finishedRowToDisplayCar(row: FinishedStandingsRow): DisplayCar {
+  return {
+    car_id: row.car_id,
+    position: row.position,
+    gap_to_leader: row.gap_to_leader,
+    ...(row.compound !== null ? { compound: row.compound } : {}),
+    pit_count: row.pit_count,
+    pit_laps: row.pit_laps,
+    compounds_used: row.compounds_used,
+    ...(row.total_time !== null ? { total_time: row.total_time } : {}),
+    retired: row.retired,
+  };
+}
 
 export default function RacePage() {
   const params = useParams();
@@ -39,7 +70,6 @@ export default function RacePage() {
     countdown,
     lightsOut,
     abortReason,
-    setSpeed
   } = useRaceWebSocket(raceInfo?.status === "lobby" ? null : raceId);
 
   useEffect(() => {
@@ -231,7 +261,22 @@ export default function RacePage() {
     );
   }
 
-  const cars = lapData?.cars || result?.standings || [];
+  // Which cars the live-timing panels show, stated explicitly rather than
+  // left to a `||` chain (round 5, NEW-11). While a race runs these are
+  // the per-lap snapshot's cars; once it has finished the only cars that
+  // still exist are the persisted result rows, which carry no per-lap
+  // state -- so they are adapted here, with the unavailable fields left
+  // ABSENT rather than zero-filled, and each component decides what to
+  // render in their place.
+  // `result?.standings?.map(...)`, not `result?.standings.map(...)`: the
+  // optional chain has to cover `standings` too. FinishedStandingsRow[]
+  // is a compile-time assertion about runtime JSON, and a `finished`
+  // payload with `result` present but no `standings` -- a spectator on
+  // the new frontend against an older backend mid-rollout -- would
+  // otherwise throw in render, which is the crash class this whole
+  // payload contract exists to close.
+  const cars: DisplayCar[] =
+    lapData?.cars ?? result?.standings?.map(finishedRowToDisplayCar) ?? [];
   const trackName = raceInfo?.track || "bahrain";
   const weather = lapData?.weather || "dry";
   const safetyCar = lapData?.safety_car || false;
@@ -279,18 +324,6 @@ export default function RacePage() {
         )}
 
         <div className="ml-auto flex items-center gap-2">
-          <span className="text-[10px] text-pit-muted uppercase tracking-wider hidden sm:inline">Speed</span>
-          {[1, 5, 20].map((s) => (
-            <button
-              key={s}
-              onClick={() => setSpeed(s)}
-              className="px-2.5 py-1 rounded-md bg-pit-surface text-pit-text text-[11px] font-bold
-                         hover:bg-pit-border hover:text-white transition-colors duration-150"
-              type="button"
-            >
-              {s}x
-            </button>
-          ))}
           <div
             className={`w-2 h-2 rounded-full ml-1 ${
               connected ? "bg-green-500" : status === "disconnected" ? "bg-yellow-500 animate-pulse-slow" : "bg-red-500"

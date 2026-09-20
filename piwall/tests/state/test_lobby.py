@@ -13,7 +13,7 @@ import threading
 import pytest
 import redis as redis_lib
 
-from backend.state.lobby import LobbyStore
+from backend.state.lobby import CarIdTakenError, LobbyStore
 from backend.state.redis_client import REDIS_URL, redis_is_reachable
 
 pytestmark = pytest.mark.skipif(
@@ -21,6 +21,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 RACE = "r_test_lobby"
+
+# A car_id a player picks for themselves. Deliberately NOT one of
+# BUILTIN_BOTS' ids: those are reserved (backend/state/car_ids.py) and
+# join() now refuses them, so using one here would test the reserved-id
+# guard rather than the rule each of these tests is actually about.
+CUSTOM_CAR_ID = "USR-01"
 
 
 @pytest.fixture
@@ -88,12 +94,19 @@ def test_players_is_empty_for_a_new_lobby(replica_a):
     assert replica_a.players(RACE) == {}
 
 
-def test_speed_round_trips_as_a_float(replica_a, replica_b):
-    """Redis stores strings; a speed read back as '5.0' breaks arithmetic."""
+def test_a_new_lobby_carries_no_playback_speed(replica_a):
+    """Replaces test_speed_round_trips_as_a_float, which tested a field
+    that no longer exists.
+
+    `speed` was written by create_race, by a WebSocket message and by
+    LobbyStore.create, and read by nothing: the
+    `asyncio.sleep(11.0 / lobby.speed)` display loop that consumed it is
+    what this phase deleted. A lobby field with three writers and no
+    readers is not dormant, it is misleading -- and it still had a UI
+    control in front of it that changed nothing a user could observe.
+    """
     replica_a.create(RACE, track="bahrain")
-    replica_a.set_speed(RACE, 5.0)
-    assert replica_b.get(RACE)["speed"] == 5.0
-    assert isinstance(replica_b.get(RACE)["speed"], float)
+    assert "speed" not in replica_a.get(RACE)
 
 
 def test_list_open_includes_a_waiting_lobby(replica_a):
@@ -176,13 +189,16 @@ def test_join_admits_up_to_max_players(replica_a):
     both see "seven players, room for one more" and both admit an eighth.
     """
     replica_a.create(RACE, track="bahrain")
+    seen_car_ids = set()
     for i in range(3):
-        is_new, count = replica_a.join(
+        is_new, count, car_id = replica_a.join(
             RACE, f"p{i}", {"username": f"u{i}"}, max_players=3
         )
         assert is_new is True
         assert count == i + 1
+        seen_car_ids.add(car_id)
     assert set(replica_a.players(RACE)) == {"p0", "p1", "p2"}
+    assert len(seen_car_ids) == 3, "three new joins must not share a default car_id"
 
 
 def test_join_refuses_a_new_player_once_full():
@@ -209,7 +225,7 @@ def test_join_never_counts_a_rejoin_against_the_cap(replica_a):
     for i in range(3):
         replica_a.join(RACE, f"p{i}", {"username": f"u{i}"}, max_players=3)
 
-    is_new, count = replica_a.join(
+    is_new, count, _car_id = replica_a.join(
         RACE, "p1", {"username": "u1-rejoined"}, max_players=3
     )
     assert is_new is False
@@ -293,3 +309,324 @@ def test_set_player_field_on_a_missing_player_raises(replica_a):
 def test_set_player_field_on_a_missing_lobby_raises(replica_a):
     with pytest.raises(KeyError):
         replica_a.set_player_field("r_nope", "p1", "code", "x")
+
+
+def test_join_never_hands_two_concurrent_new_players_the_same_default_car_id(
+    replica_a,
+):
+    """N2 (fix round 3): car_id is an engine identity, not a display
+    label -- main.py keys belief dicts by it, and engine/race.py keys
+    self.strategies and self.belief_models by it. Two concurrent
+    brand-new joins with no explicit car_id used to both default to
+    "P01" from a snapshot read before the write, handing one player's
+    bot both cars.
+
+    Round 3's version of this test hooked replica_a._redis.get to stall
+    one join mid-read, which is how the SEQUENTIAL lobby mutators are
+    tested elsewhere in this file -- but join() goes through an EVALSHA
+    and never calls _redis.get at all, so the hook fired zero times and
+    the two joins ran strictly in sequence (re-review of round 3,
+    NEW-5). This interleaves for real instead: eight threads, each with
+    its own LobbyStore on its own connection, all released from one
+    threading.Barrier into the same empty lobby.
+
+    Red line: the default assignment inside _JOIN_SCRIPT --
+    `player_data.car_id = string.format('P%02d', n)`. Replace it with a
+    constant, or move the choice back out of the script into Python
+    where each thread picks from its own pre-read snapshot, and the
+    eight ids stop being eight.
+    """
+    replica_a.create(RACE, track="bahrain", race_type="quick")
+
+    thread_count = 8
+    barrier = threading.Barrier(thread_count)
+    car_ids = {}
+    clients = []
+
+    def joiner(index):
+        client = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
+        clients.append(client)
+        store = LobbyStore(redis_client=client)
+        # register_script does not touch the network, so every thread is
+        # already loaded and waiting when the barrier releases.
+        barrier.wait(timeout=5)
+        car_ids[index] = store.join(
+            RACE, f"p_{index}", {"username": f"u{index}"}, max_players=thread_count
+        )[2]
+
+    threads = [
+        threading.Thread(target=joiner, args=(i,)) for i in range(thread_count)
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+    finally:
+        for client in clients:
+            client.close()
+
+    assert len(car_ids) == thread_count, "every concurrent join must have returned"
+    assert len(set(car_ids.values())) == thread_count, (
+        f"eight concurrent new joins shared a default car_id: "
+        f"{sorted(car_ids.values())} -- one player's bot now drives two cars"
+    )
+    stored = {p["car_id"] for p in replica_a.players(RACE).values()}
+    assert stored == set(car_ids.values()), (
+        "the car_ids join() reported must be the ones actually stored"
+    )
+
+
+def test_a_rejoin_without_a_car_id_keeps_the_one_the_player_already_has(
+    replica_a, replica_b
+):
+    """A re-join must not silently rename the player. Round 3 recomputed
+    the default on every join, so pressing the frontend's Join button a
+    second time (the natural way to change starting compound -- and it
+    never sends a car_id, frontend/src/lib/api.ts) moved that player to
+    a different engine identity.
+
+    The player here holds a car_id of their own choosing, which is what
+    makes this test about the re-join rule specifically: "lowest label
+    nobody else holds" would answer "P01" and rename them, so only the
+    re-join branch can keep USR-01.
+
+    Red line: `player_data.car_id = existing.car_id` in _JOIN_SCRIPT.
+    """
+    replica_a.create(RACE, track="bahrain")
+    _, _, first = replica_a.join(RACE, "p_a", {"username": "alex", "car_id": CUSTOM_CAR_ID})
+
+    # Same player, no car_id -- exactly what the frontend sends.
+    is_new, _count, rejoined = replica_b.join(
+        RACE, "p_a", {"username": "alex", "starting_compound": "SOFT"}
+    )
+
+    assert is_new is False
+    assert rejoined == first == CUSTOM_CAR_ID, (
+        f"a re-join reassigned {first!r} -> {rejoined!r}; car_id is an "
+        f"engine identity, not a label the server may re-pick at will"
+    )
+    assert replica_b.players(RACE)["p_a"]["car_id"] == CUSTOM_CAR_ID
+
+
+def test_a_new_player_after_a_rejoin_does_not_collide_with_it(replica_a):
+    """The harm NEW-1 actually reproduced, end to end and with no
+    concurrency at all: A joins, B joins, A re-joins, C joins -- and C
+    was handed the same label the re-join had just moved A onto. Both
+    reached _build_job_and_manifest, and engine/race.py keys
+    self.strategies and self.belief_models by car_id, so one player's
+    bot drove both cars, sealed into a manifest and a replay hash.
+
+    Red line: round 3's `player_data.car_id = string.format("P%02d",
+    count + 1)` -- the unconditional default this round replaced. Round
+    4 replaced that one line with two independent guards (keep a
+    re-join's existing id; derive a new player's from the lowest unheld
+    label), and for THIS four-call sequence either guard alone is enough
+    to prevent the collision, so each has its own single-line test above
+    and below. This one pins the reported behaviour end to end.
+    """
+    replica_a.create(RACE, track="bahrain")
+    replica_a.join(RACE, "p_a", {"username": "alex"})
+    replica_a.join(RACE, "p_b", {"username": "bo"})
+    replica_a.join(RACE, "p_a", {"username": "alex"})  # re-join, no car_id
+    replica_a.join(RACE, "p_c", {"username": "cass"})
+
+    car_ids = [p["car_id"] for p in replica_a.players(RACE).values()]
+    assert sorted(car_ids) == ["P01", "P02", "P03"], (
+        f"lobby ended with {sorted(car_ids)} -- two players sharing a car_id "
+        f"means engine/race.py keys one strategy and one BeliefModel for both"
+    )
+
+
+def test_a_default_car_id_fills_the_lowest_label_nobody_holds(replica_a):
+    """A default derived from the player count stops being unique the
+    moment any label is out of sequence -- an explicit "P01" from one
+    player is enough. The lowest unheld label is chosen instead.
+
+    Red line: the `while taken[string.format('P%02d', n)] do` loop in
+    _JOIN_SCRIPT. Replace it with `count + 1` and the second join here
+    collides with the first.
+    """
+    replica_a.create(RACE, track="bahrain")
+    replica_a.join(RACE, "p_a", {"username": "alex", "car_id": "P02"})
+
+    _, _, car_id = replica_a.join(RACE, "p_b", {"username": "bo"})
+
+    assert car_id == "P01", f"expected the lowest free label, got {car_id!r}"
+    _, _, third = replica_a.join(RACE, "p_c", {"username": "cass"})
+    assert third == "P03"
+
+
+def test_join_refuses_a_car_id_another_player_in_the_lobby_holds(
+    replica_a, replica_b
+):
+    """The same collision by its other route: an explicitly-requested
+    car_id somebody else already holds. Checking for it in the handler
+    would reopen the read-then-write window the script exists to close,
+    so the refusal lives in the script.
+
+    Red line: the `elseif taken[player_data.car_id] then` branch in
+    _JOIN_SCRIPT.
+    """
+    from backend.state.lobby import CarIdTakenError
+
+    replica_a.create(RACE, track="bahrain")
+    replica_a.join(RACE, "p_a", {"username": "alex", "car_id": CUSTOM_CAR_ID})
+
+    with pytest.raises(CarIdTakenError):
+        replica_b.join(RACE, "p_b", {"username": "bo", "car_id": CUSTOM_CAR_ID})
+
+    assert set(replica_a.players(RACE)) == {"p_a"}, (
+        "the refused join must not have been written at all"
+    )
+
+
+def test_a_player_may_resend_the_car_id_it_already_holds(replica_a):
+    """The refusal above must not lock a player out of their own
+    re-join: a client that echoes back the car_id it was given (or asks
+    for the one it already has) is not a collision."""
+    replica_a.create(RACE, track="bahrain")
+    replica_a.join(RACE, "p_a", {"username": "alex", "car_id": CUSTOM_CAR_ID})
+
+    is_new, count, car_id = replica_a.join(
+        RACE, "p_a", {"username": "alex", "car_id": CUSTOM_CAR_ID}
+    )
+
+    assert (is_new, count, car_id) == (False, 1, CUSTOM_CAR_ID)
+
+
+def test_join_refuses_a_house_bot_car_id(replica_a, replica_b):
+    """NEW-9 (round 5) -- the third route to the same corruption.
+
+    The "already taken" set was built only from other lobby PLAYERS. But
+    every race also gets house bots appended until the grid is full, each
+    carrying car_id == bot_id (worker._spec_from_job derives it as
+    `participant.get("car_id") or house_bot`). So a player claiming
+    "VEL-01" was accepted, and the spec reached engine.add_car with two
+    cars called VEL-01 -- one strategy function and one shared
+    BeliefModel driving both, sealed into the manifest and replay hash,
+    exactly as for two colliding players.
+
+    Every reserved id is checked, not just the first, so adding a bot to
+    BUILTIN_BOTS without reserving it cannot pass unnoticed.
+
+    Red line: `for _, reserved in ipairs(cjson.decode(ARGV[5])) do` in
+    _JOIN_SCRIPT -- the loop that seeds `taken` from RESERVED_CAR_IDS.
+    """
+    from backend.state.car_ids import RESERVED_CAR_IDS
+
+    replica_a.create(RACE, track="bahrain")
+    assert RESERVED_CAR_IDS, "there must be house bots for this to be about"
+
+    for bot_id in sorted(RESERVED_CAR_IDS):
+        with pytest.raises(CarIdTakenError):
+            replica_b.join(RACE, "p_thief", {"username": "eve", "car_id": bot_id})
+
+    assert replica_a.players(RACE) == {}, (
+        "a refused join must not have been written to the lobby at all"
+    )
+
+
+def test_a_rejoin_may_change_to_a_different_unclaimed_car_id(replica_a, replica_b):
+    """NEW-10 (round 5), decided deliberately: an explicit rename on
+    re-join is HONOURED, and the label it vacates becomes available.
+
+    The alternative was to refuse it. Honouring it wins because car_id is
+    a documented field of the join request, so refusing would make the
+    identical request succeed or fail depending only on whether the
+    caller had joined before, and would leave a player no way to correct
+    an id they regret. Nothing durable is keyed on it yet: join_race
+    refuses any status but "lobby", and the identity is sealed only when
+    _build_job_and_manifest builds the manifest. Uniqueness -- the thing
+    that actually matters -- holds throughout, because the rename goes
+    through the same collision check as any other explicit id, which the
+    last assertion here pins.
+
+    Red line: the `blank(player_data.car_id) and` half of the keep
+    condition in _JOIN_SCRIPT. Drop it so a re-join keeps its id
+    unconditionally -- the obvious way someone would "fix" this by
+    forbidding renames -- and the rename is silently ignored instead.
+    """
+    replica_a.create(RACE, track="bahrain")
+    _, _, first = replica_a.join(RACE, "p_a", {"username": "alex"})
+    assert first == "P01"
+
+    _, _, renamed = replica_b.join(
+        RACE, "p_a", {"username": "alex", "car_id": CUSTOM_CAR_ID}
+    )
+    assert renamed == CUSTOM_CAR_ID
+    assert replica_a.players(RACE)["p_a"]["car_id"] == CUSTOM_CAR_ID
+
+    # The vacated label is free again, and handing it out keeps the
+    # lobby unique rather than duplicating anything.
+    _, _, next_new = replica_a.join(RACE, "p_b", {"username": "bo"})
+    assert next_new == "P01"
+
+    # ...and the renamed player's new id is itself protected.
+    with pytest.raises(CarIdTakenError):
+        replica_a.join(RACE, "p_c", {"username": "cass", "car_id": CUSTOM_CAR_ID})
+
+    car_ids = [p["car_id"] for p in replica_a.players(RACE).values()]
+    assert sorted(car_ids) == sorted({*car_ids}) == ["P01", CUSTOM_CAR_ID]
+
+
+def test_a_blank_rejoin_heals_an_id_that_has_become_impossible_to_keep(replica_a):
+    """N-2 (final cleanup): a lobby written before house-bot ids were
+    reserved can hold a player on a reserved id. That id can no longer be
+    kept -- the race will not start while it stands, because
+    assert_unique_car_ids refuses the grid -- so refusing the re-join too
+    left that player locked out of their own lobby until the 6h TTL, with
+    no way for the shipped UI to send the remedy id.
+
+    A BLANK re-join now falls through to a fresh default instead, which
+    heals the lobby rather than stranding it.
+
+    This is not round 4's rename bug returning: that renamed a player
+    whose id was perfectly VALID, freeing a label and handing the
+    collision to the next joiner. The guard here is
+    `not taken[existing.car_id]`, and a valid id is never in `taken` --
+    it excludes the rejoining player's own row -- so every ordinary
+    re-join still keeps its id (pinned by the test above).
+
+    Red line: `and not taken[existing.car_id]` in _JOIN_SCRIPT's keep
+    condition. Without it the re-join is refused and the lobby stays
+    unstartable.
+    """
+    from backend.state.car_ids import RESERVED_CAR_IDS
+
+    reserved = sorted(RESERVED_CAR_IDS)[0]
+    replica_a.create(RACE, track="bahrain")
+    # Straight into Redis: this is the pre-fix shape join() can no longer
+    # produce, which is exactly why it has to be written directly.
+    replica_a.add_player(RACE, "p_old", {"username": "alex", "car_id": reserved})
+
+    is_new, count, healed = replica_a.join(RACE, "p_old", {"username": "alex"})
+
+    assert is_new is False
+    assert count == 1
+    assert healed == "P01", f"expected a fresh default, got {healed!r}"
+    assert replica_a.players(RACE)["p_old"]["car_id"] == "P01"
+
+
+def test_an_explicit_request_for_a_taken_id_is_still_refused_not_healed(replica_a):
+    """The auto-heal above must not swallow an explicit request. A caller
+    who names an id deserves to be told it is unavailable rather than
+    quietly handed something else -- silently substituting is how a
+    player's bot ends up racing under an identity they did not choose.
+
+    Red line: the `elseif taken[player_data.car_id] then` refusal branch
+    in _JOIN_SCRIPT.
+    """
+    from backend.state.car_ids import RESERVED_CAR_IDS
+
+    reserved = sorted(RESERVED_CAR_IDS)[0]
+    replica_a.create(RACE, track="bahrain")
+    replica_a.add_player(RACE, "p_old", {"username": "alex", "car_id": reserved})
+
+    with pytest.raises(CarIdTakenError):
+        replica_a.join(RACE, "p_old", {"username": "alex", "car_id": reserved})
+
+    assert replica_a.players(RACE)["p_old"]["car_id"] == reserved, (
+        "a refused join must leave the row exactly as it was"
+    )

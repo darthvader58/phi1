@@ -10,6 +10,7 @@ balancer whether to send this process traffic.
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from ..jobs import heartbeat
 from ..state.redis_client import redis_is_reachable
 
 health_router = APIRouter(tags=["health"])
@@ -52,6 +53,20 @@ def _mongo_is_reachable(timeout: float = 0.5) -> bool:
             client.close()
 
 
+def _live_worker_count() -> int:
+    """How many workers have a live heartbeat. Never raises.
+
+    Redis being unreachable is already reported by its own check, and a
+    second exception from the same cause must not turn /ready into a 500 --
+    a readiness probe that crashes tells an orchestrator nothing about
+    readiness.
+    """
+    try:
+        return len(heartbeat.live_workers())
+    except Exception:
+        return 0
+
+
 def check_dependencies() -> dict:
     return {"redis": redis_is_reachable(), "mongo": _mongo_is_reachable()}
 
@@ -64,8 +79,27 @@ def health() -> dict:
 
 @health_router.get("/ready")
 def ready() -> JSONResponse:
-    """Readiness. 503 names the dependency that failed."""
+    """Readiness. 503 names the dependency that failed.
+
+    `workers` is reported but deliberately does NOT affect the status code.
+    Twice now, matches have quietly stopped finishing while this endpoint
+    stayed green -- a vanished consumer group, and a poison job at the head
+    of the queue -- and in both cases the missing fact was that no worker
+    was making progress. That fact now has a number here (see
+    jobs/heartbeat.py), so it can be alerted on.
+
+    Failing readiness on it would be worse than not reporting it: an API
+    replica with no worker behind it still serves every read endpoint
+    correctly, and 503-ing every replica because the worker fleet is down
+    turns a worker outage into a total outage. This endpoint answers "should
+    this process receive traffic", and the answer does not change.
+    """
     checks = check_dependencies()
+    workers = _live_worker_count()
     if all(checks.values()):
-        return JSONResponse({"status": "ready", **checks}, status_code=200)
-    return JSONResponse({"status": "not ready", **checks}, status_code=503)
+        return JSONResponse(
+            {"status": "ready", **checks, "workers": workers}, status_code=200
+        )
+    return JSONResponse(
+        {"status": "not ready", **checks, "workers": workers}, status_code=503
+    )

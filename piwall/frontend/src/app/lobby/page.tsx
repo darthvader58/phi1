@@ -13,7 +13,6 @@ export default function LobbyPage() {
   const [leaderboard, setLeaderboard] = useState<any[]>([]);
   const [suggestions, setSuggestions] = useState<any[]>([]);
   const [track, setTrack] = useState("bahrain");
-  const [speed, setSpeed] = useState(5);
   const [raceType, setRaceType] = useState("quick");
   const [username, setUsername] = useState("");
   const [registered, setRegistered] = useState(false);
@@ -88,7 +87,7 @@ export default function LobbyPage() {
   async function handleCreateRace() {
     setError("");
     try {
-      const res = await api.createRace(track, speed, raceType);
+      const res = await api.createRace(track, raceType);
       window.location.href = `/race/${res.race_id}`;
     } catch (err: any) {
       setError(err.message);
@@ -173,14 +172,6 @@ export default function LobbyPage() {
                         {t.charAt(0).toUpperCase() + t.slice(1)}
                       </option>
                     ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-[10px] text-pit-muted uppercase tracking-wider block mb-1.5">Speed</label>
-                  <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} className="input">
-                    <option value={1}>1x (Real-time)</option>
-                    <option value={5}>5x</option>
-                    <option value={20}>20x (Fast)</option>
                   </select>
                 </div>
                 <div>

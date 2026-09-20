@@ -27,6 +27,18 @@ class CalibrationMismatch(ValueError):
     """
 
 
+class ReplayHashConflict(ValueError):
+    """Two executions of one manifest produced different replay bytes.
+
+    The contract this project rests on is that they cannot. Raised by
+    crud.save_replay_hash when a second execution of a match disagrees with
+    the hash already recorded for it, instead of the disagreement being
+    written over the original -- which is what used to happen, and which
+    erased the only evidence the system is able to produce that determinism
+    broke.
+    """
+
+
 def replay_bytes(result: RaceResult, manifest: MatchManifest) -> bytes:
     payload = {
         "format_version": REPLAY_FORMAT_VERSION,
@@ -86,8 +98,20 @@ def replay_from_manifest(manifest: MatchManifest) -> bytes:
     for participant in sorted(manifest.participants, key=lambda p: p.slot):
         if participant.house_bot is None:
             raise NotImplementedError(
-                "Replaying a player bot needs its source, which Phase 2 stores "
-                "against code_sha256. Golden manifests use house bots only."
+                f"Cannot replay participant slot {participant.slot} from this "
+                f"manifest alone. Its source IS recoverable -- stored "
+                f"content-addressed under code_sha256 "
+                f"{participant.code_sha256!r} (crud.get_bot_source) -- but "
+                f"its STARTING COMPOUND is not in the manifest: Participant "
+                f"has no field for it, and it changes the race. So a "
+                f"manifest naming a player bot does not by itself determine "
+                f"the race it describes. The compound a given match "
+                f"actually used is kept alongside the manifest "
+                f"(crud.get_replay_inputs) so nothing is lost, but putting "
+                f"it IN the manifest changes the manifest's canonical bytes "
+                f"and therefore every committed golden replay hash -- a "
+                f"schema version bump, not a bug fix. Golden manifests use "
+                f"house bots only, whose compound comes from BUILTIN_BOTS."
             )
         bot = BUILTIN_BOTS[participant.house_bot]
         engine.add_car(

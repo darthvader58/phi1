@@ -17,7 +17,6 @@ Endpoints:
 
 import asyncio
 import concurrent.futures
-import hashlib
 import hmac
 import json
 import logging
@@ -36,7 +35,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from .db.models import MongoSession, create_db_engine, init_db
+from .db.models import MongoSession, create_db_engine, init_db, mongo_url
 from .db import crud
 from .data.tracks import TRACKS
 from .determinism.manifest import Participant, build_manifest
@@ -46,7 +45,13 @@ from .engine.build import build_track_physics
 from .jobs.events import MatchEvents
 from .jobs.queue import MatchJobQueue
 from .sandbox.runner import NAMESPACE_RESERVED_KEYS, STRATEGY_TEMPLATE
-from .state.lobby import LobbyFullError, LobbyStore
+from .state.car_ids import assert_unique_car_ids
+from .state.lobby import (
+    OPEN_STATUSES as OPEN_LOBBY_STATUSES,
+    CarIdTakenError,
+    LobbyFullError,
+    LobbyStore,
+)
 from backend.sandbox.validation import validate_submission
 from backend.sandbox.isolation import ChildFailed, LimitExceeded
 from backend.sandbox.match_job import run_match_isolated
@@ -55,7 +60,7 @@ from backend.sandbox.match_job import run_match_isolated
 # ─── State management ──────────────────────────────────────────────────
 
 # Lobby state lives in Redis so both API replicas see the same lobby. A
-# lobby is a plain dict (fields: race_id, track, race_type, status, speed,
+# lobby is a plain dict (fields: race_id, track, race_type, status,
 # players) — this replaces active_lobbies, a module-global dict invisible
 # to any replica that did not happen to create or mutate a given lobby.
 #
@@ -100,6 +105,45 @@ def _spawn_background(coro) -> asyncio.Task:
     return task
 
 
+# How long shutdown waits for work already in hand. It must comfortably
+# exceed the countdown _run_race sits through (5s) plus the save_manifest
+# and enqueue that follow it, because finishing that sequence is the whole
+# point -- cutting it short loses the match exactly as abandoning it did.
+# It also bounds shutdown, so it cannot be "however long the slowest thing
+# feels like taking": a task still running at the deadline is cancelled and
+# logged, which at least leaves a record of the match that was lost.
+_BACKGROUND_DRAIN_TIMEOUT_SECONDS = 15.0
+
+
+async def _finish_background_tasks(
+    timeout: float = _BACKGROUND_DRAIN_TIMEOUT_SECONDS,
+) -> int:
+    """Let in-flight background work finish. Returns how many did.
+
+    Best effort in the same sense drain_sockets is -- a task raising must
+    not be the reason ASGI shutdown fails -- but unlike drain_sockets this
+    one guards something durable, so it waits rather than merely closing.
+    """
+    tasks = [t for t in _background_tasks if not t.done()]
+    if not tasks:
+        return 0
+    logger.info("waiting for %d background task(s) before shutdown", len(tasks))
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in pending:
+        # Named individually: a cancelled _run_race is a match that was
+        # promised to a player and never enqueued, and the race id is the
+        # only thing that makes it recoverable by hand.
+        logger.error("background task did not finish before shutdown: %r", task)
+        task.cancel()
+    for task in done:
+        if task.cancelled():
+            continue
+        exc = task.exception()
+        if exc is not None:
+            logger.error("background task failed during shutdown: %r", exc)
+    return len(done)
+
+
 _jobs: Optional[MatchJobQueue] = None
 
 
@@ -133,7 +177,12 @@ def __getattr__(name: str):
 
 # ─── Database setup ──────────────────────────────────────────────────
 
-DB_URL = os.environ.get("MONGODB_URI") or os.environ.get("DATABASE_URL") or "mongodb://127.0.0.1:27017/phi1"
+# db.models.mongo_url(), not a second copy of its body. 23b4b5b added that
+# function and routed the worker and the health probe through it, but left
+# a byte-for-byte duplicate of its precedence rule here. Two definitions
+# that agree today are two definitions that can stop agreeing, and the
+# symptom -- one process writing to a database another reads -- is silent.
+DB_URL = mongo_url()
 
 
 def _parse_cors_origins() -> List[str]:
@@ -204,18 +253,50 @@ async def lifespan(app: FastAPI):
     # app it belongs to.
     event_task = asyncio.create_task(_relay_match_events())
     yield
+    # BEFORE anything else is torn down. For the five seconds between
+    # /start and enqueue, a match exists only as an in-memory asyncio task
+    # on this one replica -- no job in the queue, nothing durable but a
+    # lobby at "countdown" that nothing reaps. A replica that stopped
+    # during a countdown took the match with it, which is precisely what a
+    # rolling restart causes, and rolling restarts are the reason two
+    # replicas exist at all. The worker side of this property ("a restart
+    # mid-match loses no match") was built and tested; this is its mirror
+    # image.
+    await _finish_background_tasks()
     event_task.cancel()
     try:
         await event_task
     except asyncio.CancelledError:
         pass
+    except Exception:
+        # N4's residual (round 3), closed. Cancelling the relay runs its
+        # own `finally`, which closes the pub/sub connection -- against a
+        # Redis that has already gone away, that raises, and the raise
+        # comes out of `await event_task` as itself rather than as
+        # CancelledError. Uncaught it propagates out of ASGI shutdown,
+        # turning a clean stop into a failed one over a connection that
+        # was being discarded anyway. There is nothing left to salvage at
+        # this point in shutdown, so it is logged and swallowed; anything
+        # this task needed to do durably was done before it was
+        # cancelled.
+        logger.exception("event relay did not shut down cleanly")
+    try:
+        drained = await drain_sockets()
+        logger.info("closed %d websocket(s) on shutdown", drained)
+    except Exception:
+        # A failure here must not be the reason ASGI shutdown itself fails
+        # or hangs -- draining is a best-effort courtesy to spectators, not
+        # a step anything durable depends on (see drain_sockets's own
+        # docstring). Whatever this was, there is nothing left to salvage
+        # for it at this point in shutdown.
+        logger.exception("socket drain did not complete cleanly")
     print("PIT WALL shutting down...")
 
 
 app = FastAPI(title="PIT WALL", version="0.1.0", lifespan=lifespan)
 
 from .observability.health import health_router
-from .observability.logging import configure_logging
+from .observability.logging import configure_logging, match_context
 
 configure_logging("api")
 app.include_router(health_router)
@@ -331,7 +412,15 @@ class RegisterRequest(BaseModel):
 class CreateRaceRequest(BaseModel):
     track: str
     race_type: str = "quick"
-    speed: float = 5.0
+    # No `speed`. Playback pacing was a property of the in-process
+    # simulation this phase deleted -- the API replayed lap_data on an
+    # asyncio.sleep(11.0 / lobby.speed) loop. The worker now runs a match to
+    # completion in one shot and publishes one terminal event, so there is
+    # nothing left for a speed to pace. Pydantic ignores unknown keys by
+    # default, so a client still sending one is accepted and ignored rather
+    # than rejected. If replay playback returns with Phase 4's replay
+    # bodies, the control belongs in the browser, over the stored replay --
+    # not as server state two API replicas have to agree on.
 
 # A car_id is not just a label: belief dicts are keyed by it, and those keys
 # become attributes of the Namespace object every bot in the race receives
@@ -429,7 +518,6 @@ def create_race(request: Request, req: CreateRaceRequest, x_api_key: str = Heade
         race = crud.create_race(db, req.track, req.race_type, season_id=season_id,
                                 owner_id=player["id"])
         LOBBIES.create(race.id, track=req.track, race_type=req.race_type)
-        LOBBIES.set_speed(race.id, req.speed)
         return {"race_id": race.id, "track": req.track, "status": "lobby",
                 "race_type": req.race_type, "season_id": season_id}
     finally:
@@ -445,24 +533,42 @@ def join_race(race_id: str, req: JoinRaceRequest, x_api_key: str = Header()):
     if lobby["status"] != "lobby":
         raise HTTPException(400, "Race already started")
 
-    # The default car_id label is cosmetic (a display fallback, never an
-    # identity two players are compared or matched on) and is computed from
-    # a snapshot read before the atomic join below, so two concurrent new
-    # joins can in principle land on the same default label. What must NOT
-    # race is whether a 9th player gets admitted at all and what position
-    # is reported back -- LOBBIES.join() does the capacity check and the
-    # write as one Lua script, so only one of two concurrent joins for the
-    # last slot can see room and succeed.
-    car_id = req.car_id or f"P{len(lobby['players']) + 1:02d}"
+    # car_id is an engine identity, not a display label (see
+    # CAR_ID_PATTERN's own docstring below, and engine/race.py's
+    # self.strategies / self.belief_models, both keyed by it) -- so
+    # nothing about it is decided here. Any check or default computed in
+    # this handler would sit between LOBBIES.get() above and the write
+    # below, which is exactly the window two replicas can both pass. It
+    # is all done inside LOBBIES.join()'s single atomic script instead.
+    # The rules, in full, are on LobbyStore.join; in short: a re-join
+    # that sends no car_id (which is every join the shipped frontend
+    # makes -- frontend/src/lib/api.ts posts only starting_compound)
+    # keeps the one it holds, unless that id has become impossible to
+    # keep, in which case it is assigned a free one; a re-join that
+    # sends a different unclaimed car_id is honoured; a new player with
+    # no car_id gets the lowest label no other car in the race holds;
+    # and any explicit label another car already holds -- another lobby
+    # player OR one of the house bots reserved in state/car_ids.py -- is
+    # refused.
     try:
-        _is_new, position = LOBBIES.join(race_id, player["id"], {
+        _is_new, position, car_id = LOBBIES.join(race_id, player["id"], {
             "username": player["username"],
-            "car_id": car_id,
+            "car_id": req.car_id,
             "code": STRATEGY_TEMPLATE,
             "starting_compound": req.starting_compound,
         })
     except LobbyFullError:
         raise HTTPException(400, "Race is full (8 players max)")
+    except CarIdTakenError as exc:
+        # str(exc), not req.car_id: LobbyStore.join raises naming the id
+        # it actually refused, and reformatting from the request field
+        # reported "car_id None is already taken" for any refusal where
+        # the caller sent none -- naming a value they never supplied.
+        raise HTTPException(
+            400,
+            f"{exc}. Re-join with a different car_id, or omit it to be "
+            f"assigned a free one.",
+        )
     return {"car_id": car_id, "position": position}
 
 
@@ -517,7 +623,16 @@ async def start_race(race_id: str, x_api_key: str = Header()):
     if getattr(race, "owner_id", None) not in (None, player["id"]):
         raise HTTPException(403, "Only the race owner can start this race")
 
-    LOBBIES.set_status(race_id, "countdown")
+    # Compare-and-set, not the read-check-write this used to be. The
+    # `lobby["status"] != "lobby"` check above is a cheap early reject that
+    # two concurrent calls can both pass -- they read the same snapshot --
+    # and both then spawned a _run_race. Two _run_races build two jobs for
+    # one race with two different random seeds; the loser's save_manifest
+    # raises, and its except block marked the winner's LIVE race aborted,
+    # permanently if it landed after the worker's finish. Only the caller
+    # this returns True to may start the race.
+    if not LOBBIES.set_status_if(race_id, "countdown", ("lobby",)):
+        raise HTTPException(400, "Race already started")
 
     db = SessionLocal()
     try:
@@ -550,7 +665,18 @@ def get_race(race_id: str):
             "status": lobby["status"],
             "players": {pid: {"username": p["username"], "car_id": p["car_id"]}
                         for pid, p in lobby["players"].items()},
-            "current_state": lobby.get("current_state"),
+            # Always None: there is no per-lap live state to report. The
+            # worker runs a match to completion in one shot (N8, fix round
+            # 3) rather than the API replaying lap_data incrementally the
+            # way the pre-decouple in-process simulation did, so nothing
+            # in this architecture ever produces an intermediate snapshot
+            # to serve here. Reading a lobby field that no writer has
+            # populated since round 1 (or serving one that looks live but
+            # never was) would be worse than stating the gap: closing it
+            # for real needs either the worker to publish incremental
+            # progress over pub/sub or the replay-body storage Phase 4
+            # is expected to add, neither of which exists yet.
+            "current_state": None,
             "result": None,
         }
 
@@ -581,6 +707,14 @@ def get_race(race_id: str):
             ],
             "lap_data": race.lap_data_json,
             "events": race.events_json,
+            # Why a match never ran, for the player whose bot was in it.
+            # None for every race that completed. Without it the only
+            # difference between "aborted" and "finished with nobody
+            # scoring" is an empty results list, which tells a player
+            # nothing about their own bot -- and the commonest reason to
+            # land here is that their bot exceeded its resource budget,
+            # which is something they can fix.
+            "abort_reason": getattr(race, "abort_reason", None),
         }
     finally:
         db.close()
@@ -987,17 +1121,20 @@ async def websocket_race(websocket: WebSocket, race_id: str):
 
     SOCKETS.setdefault(race_id, set()).add(websocket)
     try:
-        # Send current state if race is in progress
-        current_state = lobby.get("current_state")
-        if current_state:
-            await websocket.send_json({"type": "state", "data": current_state})
+        # No initial "state" message: there is no per-lap live state to
+        # send. See get_race's identical note (N8, fix round 3) -- the
+        # worker runs a match to completion in one shot, so a socket that
+        # connects mid-race has nothing to catch up on until the
+        # "finished" event arrives; it is not silently dropping one.
 
-        # Keep connection alive, listen for speed control messages
+        # Keep the connection alive. Nothing a client sends is acted on:
+        # the only inbound message this ever handled was {"type":"speed"},
+        # which wrote a lobby field no reader has read since the in-process
+        # display loop was deleted. Received and discarded rather than
+        # refused, so an older client page cannot break its own socket.
         while True:
             try:
-                msg = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
-                if msg.get("type") == "speed":
-                    LOBBIES.set_speed(race_id, float(msg.get("speed", 1.0)))
+                await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
             except asyncio.TimeoutError:
                 # Send ping to keep alive
                 await websocket.send_json({"type": "ping"})
@@ -1005,6 +1142,48 @@ async def websocket_race(websocket: WebSocket, race_id: str):
                 break
     finally:
         _discard_socket(race_id, websocket)
+
+
+# Per-socket ceiling on how long drain_sockets waits for one close() to
+# finish. WebSocket.close() awaits a send; a client with a wedged or full
+# transport buffer would otherwise stall this coroutine indefinitely, and
+# with it -- since lifespan awaits this before ASGI shutdown completes --
+# the whole shutdown. Well under a client's own idle-ping timeout (30s in
+# websocket_race above), so this is what actually bounds shutdown, not
+# whatever the far end feels like doing.
+_DRAIN_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
+async def drain_sockets() -> int:
+    """Close every socket this replica holds. Returns how many closed cleanly.
+
+    Called on shutdown so clients get a clean close frame and reconnect to a
+    live replica, instead of waiting on a TCP timeout against a process that
+    is already gone. Pure fan-out, on purpose: it must never write anything
+    durable, and one socket's close() raising or hanging must never strand
+    the rest -- SOCKETS is per-process spectator bookkeeping (see its own
+    comment above), and nothing here decides whether a match finished.
+
+    Sockets are closed concurrently, each bounded by _DRAIN_CLOSE_TIMEOUT_SECONDS,
+    rather than one at a time with no limit: a sequential, unbounded loop
+    means the single slowest (or wedged) client sets how long every other
+    client -- and ASGI shutdown itself -- waits.
+    """
+    every_socket = [
+        ws
+        for race_id in list(SOCKETS.keys())
+        for ws in list(SOCKETS.pop(race_id, set()))
+    ]
+
+    async def _close_one(ws) -> bool:
+        try:
+            await asyncio.wait_for(ws.close(), timeout=_DRAIN_CLOSE_TIMEOUT_SECONDS)
+            return True
+        except Exception:
+            return False
+
+    results = await asyncio.gather(*(_close_one(ws) for ws in every_socket))
+    return sum(results)
 
 
 def _discard_socket(race_id: str, websocket: WebSocket) -> None:
@@ -1057,7 +1236,12 @@ def _build_job_and_manifest(race_id: str, lobby: dict):
     slot = 0
     for pid, pdata in sorted(lobby["players"].items()):
         code = pdata.get("code") or ""
-        code_sha256 = "sha256:" + hashlib.sha256(code.encode()).hexdigest()
+        # crud.code_sha256, not a local re-spelling of it. The manifest
+        # names source by this exact string and crud.save_bot_source stores
+        # it under the same one; two independent spellings of "the hash of
+        # this code" is how the stored digest and the referenced digest
+        # came apart in the first place.
+        code_sha256 = crud.code_sha256(code)
         participants.append({
             "slot": slot,
             "player_id": pid,
@@ -1069,7 +1253,15 @@ def _build_job_and_manifest(race_id: str, lobby: dict):
             # embeds a manifest in the replay that does not match the row
             # crud.save_manifest wrote for this same match_id below.
             "code_sha256": code_sha256,
-            "starting_compound": pdata.get("starting_compound"),
+            # `or "MEDIUM"`, not `.get(key, "MEDIUM")`. The key is
+            # PRESENT with value None for any player row that lacks one, so
+            # a dict default never fires and None reaches engine.add_car as
+            # the compound -- which is what the worker's own
+            # `.get("starting_compound", default_compound)` could not
+            # recover either. Unreachable today only because
+            # JoinRaceRequest.starting_compound is a non-optional pydantic
+            # field; one field ever becoming optional makes it live.
+            "starting_compound": pdata.get("starting_compound") or "MEDIUM",
         })
         manifest_participants.append(Participant(
             slot=slot,
@@ -1088,6 +1280,31 @@ def _build_job_and_manifest(race_id: str, lobby: dict):
             code_sha256=None, house_bot=bot_id,
         ))
         slot += 1
+
+    # The LOBBY chokepoint for the car_id uniqueness invariant
+    # (state/car_ids.py). Both lobby-path sources converge here -- players
+    # above, house bots just now -- and this is the last point before the
+    # JOB is built, the job being what carries car_id to the worker. The
+    # MANIFEST does not: determinism/manifest.Participant has no car_id
+    # field, so the manifest hash is independent of every choice made here.
+    # The replay hash does depend on it (replay_bytes serialises
+    # final_standings through car_state_to_dict), which is the artefact a
+    # duplicate would actually corrupt.
+    #
+    # This is not the only check. It is the EARLY one: failing here means
+    # failing in this process, before save_manifest and before enqueue, so
+    # a bad grid degrades to _run_race's abort path with no manifest row
+    # and no stranded job. The check that no grid can route around lives in
+    # RaceEngine.add_car, because three other sites in this codebase build
+    # a grid without coming through here -- see state/car_ids.py's map.
+    #
+    # `car_id or house_bot` is exactly how worker._spec_from_job derives the
+    # id it hands engine.add_car, so this checks the values the engine will
+    # actually see -- including a player row with no car_id at all, which
+    # would reach the engine as None.
+    assert_unique_car_ids(
+        p.get("car_id") or p.get("house_bot") for p in participants
+    )
 
     seed = int(lobby.get("seed") or random.randint(0, 99999))
     manifest = build_manifest(race_id, seed, lobby["track"], manifest_participants)
@@ -1120,6 +1337,18 @@ async def _run_race(race_id: str):
     if lobby is None:
         return
 
+    # The API's half of the correlation id. observability/logging.py exists
+    # so one match id follows one match ACROSS processes; the worker bound
+    # one and main bound none, so no API log line ever carried a match_id
+    # and the cross-process join the module was built for could not be
+    # performed at all. match_context rather than bind/clear because this
+    # coroutine can leave by an exception, which a bare clear_match() would
+    # skip -- leaving the id bound to whatever runs next in this context.
+    with match_context(race_id):
+        await _run_race_inner(race_id, lobby)
+
+
+async def _run_race_inner(race_id: str, lobby: dict):
     try:
         for seconds in (5, 4, 3, 2, 1):
             await _broadcast(race_id, {"type": "countdown", "seconds": seconds})
@@ -1144,6 +1373,16 @@ async def _run_race(race_id: str):
         # and fail forever.
         db = SessionLocal()
         try:
+            # Source first, then the inputs the manifest cannot name, then
+            # the manifest. In that order because the manifest is what
+            # REFERENCES the other two: a manifest row whose code_sha256
+            # resolves to nothing is exactly the state this phase was
+            # writing for every real match, and the replay hash the worker
+            # later seals against it is then unverifiable by construction.
+            for participant in job["participants"]:
+                if participant.get("code_sha256"):
+                    crud.save_bot_source(db, participant["code"])
+            crud.save_replay_inputs(db, race_id, job["participants"])
             crud.save_manifest(db, manifest)
         finally:
             db.close()
@@ -1151,13 +1390,16 @@ async def _run_race(race_id: str):
         _get_jobs().enqueue(job)
     except Exception:
         logger.exception("race %s failed to start; marking it aborted", race_id)
-        try:
-            LOBBIES.set_status(race_id, "aborted")
-        except KeyError:
-            pass
+        # Both writes refuse to touch a race that is already terminal. The
+        # compare-and-set in start_race means two _run_races for one race
+        # can no longer exist, but this path can still run against a race
+        # the worker has meanwhile finished -- and an unconditional abort
+        # then marks a completed race aborted with its results still in
+        # race_results, which no later write heals.
+        LOBBIES.set_status_if(race_id, "aborted", OPEN_LOBBY_STATUSES)
         db = SessionLocal()
         try:
-            crud.update_race_status(db, race_id, "aborted")
+            crud.abort_race(db, race_id, "internal error")
         finally:
             db.close()
         # Generic text, deliberately: spectators on this socket are
@@ -1165,6 +1407,10 @@ async def _run_race(race_id: str):
         # manifest conflict, a Redis error from enqueue) is not theirs to
         # see. logger.exception above is where the real detail goes.
         await _broadcast(race_id, {"type": "aborted", "reason": "internal error"})
+
+
+_RELAY_MIN_BACKOFF_SECONDS = 1.0
+_RELAY_MAX_BACKOFF_SECONDS = 30.0
 
 
 async def _relay_match_events() -> None:
@@ -1179,42 +1425,95 @@ async def _relay_match_events() -> None:
     _persist_result), unconditionally, whether or not any replica has a
     spectator. SOCKETS decides fan-out here and nothing durable.
 
-    Each iteration is wrapped in its own try/except: one Redis blip on
-    EVENTS.listen, or one Mongo blip while looking up a replay hash, must
-    not permanently kill event relay for the rest of this process's life
-    -- every subsequent match on this replica would then silently never
-    notify a connected spectator, with no log and no restart, until the
-    process itself is recycled.
+    Two failure modes, both handled with capped exponential backoff
+    sharing one counter that resets on any success:
+
+    - EVENTS.subscribe() itself can fail -- Redis down at the moment this
+      task starts, e.g. at app startup. Round 2 left this call outside any
+      try/except, so that failure killed the task for the rest of the
+      process's life, surfacing only when `lifespan` awaited it at
+      shutdown. This retries the subscribe itself instead.
+    - Each iteration inside the subscribed loop (the listen call, and
+      relaying one event) is wrapped in its own try/except: one Redis
+      blip on EVENTS.listen or one Mongo blip while looking up a replay
+      hash must not permanently kill relay either. redis-py's PubSub
+      re-subscribes on its own after a transient connection drop, so the
+      same pubsub object is reused across these -- the backoff here is
+      purely to stop a *sustained* outage from spinning this loop as fast
+      as the failure can be raised and logged.
     """
-    pubsub = EVENTS.subscribe()
-    loop = asyncio.get_running_loop()
-    # A dedicated single-thread executor for this coroutine's own blocking
-    # listen() calls, not asyncio's shared default executor: on
-    # cancellation (app shutdown), the `await` here raises immediately, but
-    # a concurrent.futures.Future that has already started running cannot
-    # itself be cancelled or interrupted -- the underlying thread keeps
-    # calling pubsub.get_message() until its own 1.0s timeout elapses. This
-    # executor's own shutdown(wait=True) below blocks until that call has
-    # actually returned, so pubsub.close() can never run concurrently with
-    # it -- redis-py's PubSub is not safe against a concurrent close.
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        while True:
-            try:
-                event = await loop.run_in_executor(executor, EVENTS.listen, pubsub, 1.0)
-                if not event or event.get("type") != "match_finished":
-                    continue
-                race_id = event["match_id"]
-                if race_id not in SOCKETS:
-                    continue
-                await _stream_stored_replay(race_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("event relay: dropping this event and continuing")
-    finally:
-        executor.shutdown(wait=True)
-        pubsub.close()
+    backoff = _RELAY_MIN_BACKOFF_SECONDS
+    while True:
+        try:
+            pubsub = EVENTS.subscribe()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "event relay: could not subscribe, retrying in %.1fs", backoff
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
+            continue
+
+        loop = asyncio.get_running_loop()
+        # A dedicated single-thread executor for this coroutine's own
+        # blocking listen() calls, not asyncio's shared default executor:
+        # on cancellation (app shutdown), the `await` here raises
+        # immediately, but a concurrent.futures.Future that has already
+        # started running cannot itself be cancelled or interrupted -- the
+        # underlying thread keeps calling pubsub.get_message() until its
+        # own 1.0s timeout elapses. This executor's own shutdown(wait=True)
+        # in the finally below blocks until that call has actually
+        # returned, so pubsub.close() can never run concurrently with it
+        # -- redis-py's PubSub is not safe against a concurrent close.
+        # The shutdown call is itself dispatched to the default executor
+        # (`run_in_executor(None, ...)`), not awaited directly, so that
+        # blocking wait does not stall this event loop for other work
+        # while it happens.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            while True:
+                try:
+                    event = await loop.run_in_executor(
+                        executor, EVENTS.listen, pubsub, 1.0
+                    )
+                    backoff = _RELAY_MIN_BACKOFF_SECONDS
+                    if not event:
+                        continue
+                    kind = event.get("type")
+                    if kind not in ("match_finished", "match_aborted"):
+                        continue
+                    race_id = event["match_id"]
+                    if race_id not in SOCKETS:
+                        continue
+                    if kind == "match_aborted":
+                        # A match the worker could not run. The durable
+                        # record (race status "aborted" and its reason) is
+                        # already written, same as for a finished match;
+                        # this is fan-out only. The reason is composed by
+                        # the worker from its own constants and is safe to
+                        # show an unauthenticated spectator -- see
+                        # worker.UNRUNNABLE_REASON and
+                        # sandbox/isolation.py's LimitExceeded.
+                        await _broadcast(race_id, {
+                            "type": "aborted",
+                            "reason": event.get("reason") or "internal error",
+                        })
+                        continue
+                    await _stream_stored_replay(race_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "event relay: dropping this event, backing off %.1fs",
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
+        finally:
+            await loop.run_in_executor(None, executor.shutdown, True)
+            pubsub.close()
 
 
 async def _stream_stored_replay(race_id: str) -> None:
@@ -1232,20 +1531,122 @@ async def _stream_stored_replay(race_id: str) -> None:
     beyond this phase (see the phase plan's "Deferred beyond this phase"
     section) -- so there is no lap-by-lap body to re-stream here yet. This
     sends one terminal "finished" event rather than the paced per-lap
-    messages the old in-process simulation produced. Standings, lap data
-    and Elo ARE persisted (backend/worker.py's _persist_result writes all
-    three) -- they are simply not re-fetched and re-broadcast here; a
-    spectator who wants them reads GET /api/race/{race_id} after this
-    event arrives.
+    messages the old in-process simulation produced.
+
+    What it does carry is the final standings, because the client on the
+    other end of this socket needs them to render the result at all.
+    Round 1 of the decouple shrank this payload to {race_id,
+    replay_sha256} on the reasoning that "a spectator who wants them
+    reads GET /api/race/{race_id} after this event arrives" -- but no
+    client does that. frontend/src/lib/websocket.ts's "finished" case
+    does `if (msg.result) setResult(msg.result)`, and the shrunken
+    payload is truthy, so the race page then evaluates
+    `[...result.standings]` on a result that has no standings. That
+    throws inside render, and with no error boundary under
+    frontend/src/app/ it takes the whole race page down: every finished
+    race, for every spectator. Round 3's re-review carried it forward as
+    NEW-8, informational.
+
+    The rows come from race_results (the post-race authority: it is
+    written after the engine applies its end-of-race compound-rule time
+    penalties, so positions and total_time here are final) rather than
+    from the last lap_data snapshot (taken before them). gap_to_leader,
+    pit_count and the finishing compound are not stored -- they are
+    derived from total_time, pit_laps and compounds_used, which are. A
+    race with no document or no rows yet sends an empty standings list,
+    which renders as an empty result panel rather than crashing the page.
+
+    Round 5 added the race's events for the same reason the standings
+    were added in round 4: crud.save_race_data persists them durably, the
+    worker sends no per-lap messages that could carry them, and nothing
+    re-fetches -- so EventLog sat permanently empty on a finished race
+    (NEW-12). What is still NOT here is per-lap state: tyre age, fuel,
+    DRS and beliefs exist only while a race runs, and bringing them back
+    means replay bodies, which are Phase 4. frontend types.ts's
+    DisplayCar marks exactly those fields optional so a component has to
+    say what it shows in their place rather than rendering a zero.
     """
+    with match_context(race_id):
+        await _stream_stored_replay_inner(race_id)
+
+
+async def _stream_stored_replay_inner(race_id: str) -> None:
     db = SessionLocal()
     try:
         replay_sha256 = crud.get_replay_hash(db, race_id)
+        race = crud.get_race(db, race_id)
+        results = crud.get_race_results(db, race_id) if race else []
+        lap_data = getattr(race, "lap_data_json", None) or [] if race else []
+        events = getattr(race, "events_json", None) or [] if race else []
+        track = getattr(race, "track", None) if race else None
     finally:
         db.close()
 
+    # get_race_results sorts by position, so the leader is first; a race
+    # whose winner retired (everyone retired) has no meaningful baseline
+    # and every gap is reported as 0.0.
+    leader_time = None
+    for row in results:
+        if not row.retired and row.total_time is not None:
+            leader_time = row.total_time
+            break
+
+    standings = [
+        {
+            "car_id": row.car_id,
+            "position": row.position,
+            "retired": row.retired,
+            "points": row.points,
+            "total_time": row.total_time,
+            "gap_to_leader": (
+                round(row.total_time - leader_time, 3)
+                if not row.retired
+                and row.total_time is not None
+                and leader_time is not None
+                else 0.0
+            ),
+            "pit_laps": row.pit_laps,
+            "pit_count": len(row.pit_laps or []),
+            "compounds_used": row.compounds_used,
+            # The tyre the car finished on. Not stored as its own column,
+            # but compounds_used is an ordered stint history, so the last
+            # entry is exactly it -- the one live-timing field the result
+            # row can honestly supply (round 5, NEW-11). tyre_age,
+            # drs_available and beliefs genuinely cannot be: they are
+            # per-lap state that only a replay body brings back, which is
+            # Phase 4 work.
+            "compound": (row.compounds_used or [None])[-1],
+        }
+        for row in results
+    ]
+
     await _broadcast(race_id, {
         "type": "finished",
-        "result": {"race_id": race_id, "replay_sha256": replay_sha256},
+        "result": {
+            "race_id": race_id,
+            "replay_sha256": replay_sha256,
+            "track": track,
+            # The number of laps actually run. TyreStrategyChart scales
+            # every stint bar by this, as ((endLap - startLap) / totalLaps),
+            # so a 0 alongside non-empty standings renders width:Infinity%
+            # (round 5, NEW-13). Falling back to the track's scheduled
+            # distance keeps it a real number whenever lap_data is missing
+            # but result rows are not; only a race with no document at all
+            # reaches 0, and that case sends no standings to divide.
+            "total_laps": (
+                lap_data[-1].get("lap", len(lap_data)) if lap_data
+                else getattr(TRACKS.get(track), "total_laps", 0)
+            ),
+            "standings": standings,
+            # Persisted by crud.save_race_data and then dropped from this
+            # payload until round 5 (NEW-12), which left EventLog
+            # permanently empty on a finished decoupled race -- including
+            # the +30s compound-rule penalty event that explains the
+            # standings sitting next to it. The rows are already read
+            # above; nothing new is fetched to send them. Shape is
+            # {lap, type, car_id, detail}, which is frontend
+            # types.ts's RaceEvent exactly.
+            "events": events,
+        },
     })
 

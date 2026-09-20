@@ -38,6 +38,20 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # Redis is the whole subject of the decoupling phase: lobby state, the
+      # match job queue and match events all live in it. Without this service
+      # 94 tests skipped themselves here, so the suite reported green while
+      # the entire thing it was meant to be testing never ran.
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       PYTHONPATH: .
       # PYTHONHASHSEED is pinned in the runtime image for determinism; pin it
@@ -46,6 +60,7 @@ jobs:
       PYTHONHASHSEED: "0"
       MONGODB_URI: mongodb://localhost:27017/ci_test
       MONGODB_DB: ci_test
+      REDIS_URL: redis://localhost:6379/0
 
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +94,40 @@ jobs:
           fi
 
       - name: Full suite
-        run: python -m pytest -q
+        # Output is kept so the next step can read the skip count off this
+        # run rather than paying for a second one.
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee "$RUNNER_TEMP/pytest-full.txt"
+
+      - name: Nothing may skip; a skip here means a service did not start
+        # The floor is zero, and that is a deliberate choice rather than a
+        # tight guess. Every service-gated test in this suite skips itself
+        # when its dependency is unreachable -- which is the right behaviour
+        # locally and a silent disaster here, because a CI whose Redis
+        # container failed to start would drop 94 tests and still report
+        # green. That is not hypothetical: it is the state this workflow was
+        # in until Redis was added above.
+        #
+        # A future test that must legitimately skip on CI should raise this
+        # floor in the same commit that introduces it, so the decision is
+        # visible in review instead of being absorbed silently.
+        run: |
+          summary=$(grep -E '[0-9]+ (passed|failed|error)' "$RUNNER_TEMP/pytest-full.txt" | tail -1)
+          echo "summary: $summary"
+          # An unparseable summary must fail rather than read as "0 skipped"
+          # -- otherwise this check quietly passes whenever it stops working.
+          if [ -z "$summary" ]; then
+            echo "::error::could not find a pytest summary line to check"
+            exit 1
+          fi
+          skipped=$(printf '%s' "$summary" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' || true)
+          skipped=${skipped:-0}
+          echo "skipped: $skipped"
+          if [ "$skipped" -gt 0 ]; then
+            echo "::error::$skipped test(s) skipped; a dependency (Redis or MongoDB) is not reachable from this job"
+            exit 1
+          fi
 
       - name: The persistence tests must have run, not skipped
         # Gating on "is MONGODB_URI set" rather than "is a database reachable"
@@ -159,6 +207,13 @@ jobs:
       - name: Build the backend image
         run: docker build -f piwall/Dockerfile.backend -t piwall-backend piwall
 
+      - name: Build the worker image
+        # The worker is now the process that actually executes untrusted
+        # player code, so every guarantee asserted about the API image has to
+        # hold for this one too. Building both here is also what keeps the two
+        # Dockerfiles from drifting apart unnoticed.
+        run: docker build -f piwall/Dockerfile.worker -t piwall-worker piwall
+
       - name: numpy and scipy must not be in the runtime
         # Calibration is a frozen, committed artifact precisely so the runner
         # never fits curves at race time: scipy's results shift with the
@@ -170,6 +225,29 @@ jobs:
           leaked = [m for m in ('numpy', 'scipy', 'fastf1') if u.find_spec(m)];
           sys.exit('these must not be in the runtime image: ' + repr(leaked)) if leaked
           else print('runtime image is lean')"
+
+      - name: numpy and scipy must not be in the worker either
+        # Same guarantee, same reason: the worker builds track physics itself
+        # (backend/worker.py's _spec_from_job), so a scipy that fitted curves
+        # at race time would move every lap time in the game -- and would do
+        # it in the one process that runs the race.
+        run: >-
+          docker run --rm piwall-worker python -c
+          "import importlib.util as u, sys;
+          leaked = [m for m in ('numpy', 'scipy', 'fastf1') if u.find_spec(m)];
+          sys.exit('these must not be in the worker image: ' + repr(leaked)) if leaked
+          else print('worker image is lean')"
+
+      - name: The worker image can actually run a match
+        # A worker image that imports cleanly but cannot build track physics
+        # is the exact failure a missing `COPY calibration/` produces, and it
+        # would otherwise surface as every match failing in production rather
+        # than as a red check here.
+        run: >-
+          docker run --rm piwall-worker python -c
+          "from backend.engine.build import build_track_physics;
+          build_track_physics('bahrain');
+          print('worker image can build a race')"
 
       - name: Determinism gate inside the production image
         # The image is where untrusted code actually runs. A gate that only

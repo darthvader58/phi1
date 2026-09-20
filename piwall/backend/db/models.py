@@ -29,25 +29,32 @@ class MongoSession:
         return None
 
 
-def create_db_engine(url: str | None = None):
-    mongo_url = url or os.environ.get("MONGODB_URI") or "mongodb://127.0.0.1:27017/phi1"
-    client = MongoClient(mongo_url)
-    db = client[_resolve_database_name(mongo_url)]
-    return db
-
-
 def mongo_url() -> str:
-    """The Mongo connection string, for callers that must not import main.
+    """The Mongo connection string. The ONE definition of it.
 
-    main imports the health router, and the worker imports neither -- so both
-    need this without reaching back into the API module. Same precedence main
-    itself uses, kept here because this module already owns database config.
+    main imports the health router and the worker imports neither, so both
+    need this without reaching back into the API module -- and it lives here
+    because this module already owns database configuration.
+
+    Everything that resolves a connection string goes through this,
+    including create_db_engine's own no-arg fallback below. That fallback
+    used to read MONGODB_URI but not DATABASE_URL, which made it a third
+    precedence rule alongside this one and main's copy: a deployment setting
+    only DATABASE_URL got the localhost default from some call sites and the
+    real server from others, with nothing to say so.
     """
     return (
         os.environ.get("MONGODB_URI")
         or os.environ.get("DATABASE_URL")
         or "mongodb://127.0.0.1:27017/phi1"
     )
+
+
+def create_db_engine(url: str | None = None):
+    resolved = url or mongo_url()
+    client = MongoClient(resolved)
+    db = client[_resolve_database_name(resolved)]
+    return db
 
 
 # MongoDB reports "an index with this name exists but with different options"
@@ -114,6 +121,18 @@ def init_db(db):
     db.race_results.create_index([("race_id", ASCENDING), ("position", ASCENDING)])
     db.race_results.create_index([("player_id", ASCENDING), ("race_id", ASCENDING)])
 
+    # crud.save_race_results upserts one row per car keyed by
+    # (race_id, player_id) rather than a delete-then-insert specifically so
+    # this index can make a concurrent double-persist (two workers racing
+    # on the same match after a stalled reclaim) impossible rather than
+    # merely unlikely -- without it, two upserts that both find no existing
+    # row for the same key can each decide to insert, doubling a race's
+    # championship points.
+    _create_unique_index_or_log(
+        db.race_results, [("race_id", ASCENDING), ("player_id", ASCENDING)],
+        "race_results",
+    )
+
     db.bot_submissions.create_index([("id", ASCENDING)], unique=True)
     db.bot_submissions.create_index([("player_id", ASCENDING), ("submitted_at", DESCENDING)])
 
@@ -125,30 +144,51 @@ def init_db(db):
     # each player's history row BEFORE moving their rating specifically so
     # this index can refuse a duplicate before the damage is done, rather
     # than merely reporting it afterwards.
-    #
-    # create_index(unique=True) raises DuplicateKeyError if the collection
-    # already holds a duplicate (player_id, race_id) pair -- exactly the
-    # kind of row the bug this index exists to prevent could have already
-    # written on a live deployment, before this index existed. init_db()
-    # runs from both the API's lifespan and the worker's run_forever, so an
-    # uncaught raise here would refuse to let either process start at all
-    # over a data problem a boot cannot fix. Logging and continuing without
-    # the index is safer than bricking the boot; _persist_result's ordering
-    # is still in effect either way, just without this line's extra check.
-    try:
-        db.elo_history.create_index(
-            [("player_id", ASCENDING), ("race_id", ASCENDING)], unique=True
-        )
-    except DuplicateKeyError as exc:
-        logging.getLogger("piwall").error(
-            "elo_history already has a duplicate (player_id, race_id) pair; "
-            "the protective unique index was NOT created. Dedupe the "
-            "collection and restart to re-enable it. %s", exc,
-        )
+    _create_unique_index_or_log(
+        db.elo_history, [("player_id", ASCENDING), ("race_id", ASCENDING)],
+        "elo_history",
+    )
 
     db.manifests.create_index([("match_id", ASCENDING)], unique=True)
 
+    # Player source, content-addressed. A manifest names a participant's
+    # code only by its code_sha256, so this is the store that makes that
+    # name resolvable -- without it the manifest references source that
+    # exists nowhere and the replay hash it seals cannot be re-derived even
+    # in principle. Unique because the key IS the content: two rows for one
+    # digest would mean one of them is not what it claims to be.
+    db.bot_sources.create_index([("code_sha256", ASCENDING)], unique=True)
+
+    # The per-participant inputs a match had that the manifest schema does
+    # not yet carry -- today, starting_compound. See crud.save_replay_inputs.
+    db.replay_inputs.create_index([("match_id", ASCENDING)], unique=True)
+
     return lambda: MongoSession(db)
+
+
+def _create_unique_index_or_log(collection, keys, collection_name: str) -> None:
+    """create_index(unique=True), tolerating pre-existing duplicates.
+
+    create_index(unique=True) raises DuplicateKeyError if the collection
+    already holds a document pair that violates the new index -- exactly
+    the kind of row the index exists to prevent could have already
+    written on a live deployment, before the index existed. init_db()
+    runs from both the API's lifespan and the worker's run_forever, so an
+    uncaught raise here would refuse to let either process start at all
+    over a data problem a boot cannot fix. Logging and continuing without
+    the index is safer than bricking the boot; whatever code-level
+    ordering the index backs up is still in effect either way, just
+    without this extra check until the collection is deduped and the
+    process restarted.
+    """
+    try:
+        collection.create_index(keys, unique=True)
+    except DuplicateKeyError as exc:
+        logging.getLogger("piwall").error(
+            "%s already has a duplicate %s; the protective unique index "
+            "was NOT created. Dedupe the collection and restart to "
+            "re-enable it. %s", collection_name, keys, exc,
+        )
 
 
 def to_namespace(document):
