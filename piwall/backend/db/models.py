@@ -151,6 +151,18 @@ def init_db(db):
 
     db.manifests.create_index([("match_id", ASCENDING)], unique=True)
 
+    # Player source, content-addressed. A manifest names a participant's
+    # code only by its code_sha256, so this is the store that makes that
+    # name resolvable -- without it the manifest references source that
+    # exists nowhere and the replay hash it seals cannot be re-derived even
+    # in principle. Unique because the key IS the content: two rows for one
+    # digest would mean one of them is not what it claims to be.
+    db.bot_sources.create_index([("code_sha256", ASCENDING)], unique=True)
+
+    # The per-participant inputs a match had that the manifest schema does
+    # not yet carry -- today, starting_compound. See crud.save_replay_inputs.
+    db.replay_inputs.create_index([("match_id", ASCENDING)], unique=True)
+
     return lambda: MongoSession(db)
 
 

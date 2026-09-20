@@ -17,7 +17,6 @@ Endpoints:
 
 import asyncio
 import concurrent.futures
-import hashlib
 import hmac
 import json
 import logging
@@ -1228,7 +1227,12 @@ def _build_job_and_manifest(race_id: str, lobby: dict):
     slot = 0
     for pid, pdata in sorted(lobby["players"].items()):
         code = pdata.get("code") or ""
-        code_sha256 = "sha256:" + hashlib.sha256(code.encode()).hexdigest()
+        # crud.code_sha256, not a local re-spelling of it. The manifest
+        # names source by this exact string and crud.save_bot_source stores
+        # it under the same one; two independent spellings of "the hash of
+        # this code" is how the stored digest and the referenced digest
+        # came apart in the first place.
+        code_sha256 = crud.code_sha256(code)
         participants.append({
             "slot": slot,
             "player_id": pid,
@@ -1360,6 +1364,16 @@ async def _run_race_inner(race_id: str, lobby: dict):
         # and fail forever.
         db = SessionLocal()
         try:
+            # Source first, then the inputs the manifest cannot name, then
+            # the manifest. In that order because the manifest is what
+            # REFERENCES the other two: a manifest row whose code_sha256
+            # resolves to nothing is exactly the state this phase was
+            # writing for every real match, and the replay hash the worker
+            # later seals against it is then unverifiable by construction.
+            for participant in job["participants"]:
+                if participant.get("code_sha256"):
+                    crud.save_bot_source(db, participant["code"])
+            crud.save_replay_inputs(db, race_id, job["participants"])
             crud.save_manifest(db, manifest)
         finally:
             db.close()

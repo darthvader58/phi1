@@ -295,13 +295,120 @@ def _upsert_race_result(db, race_id: str, player_id: str, row: dict):
     )
 
 
+def code_sha256(code: str) -> str:
+    """The one spelling of a bot's content address.
+
+    Prefixed and full-length, matching determinism/manifest.Participant's
+    code_sha256 exactly. The manifest names source by this string, so every
+    producer of it has to agree character for character or the name does not
+    resolve -- which is how "Phase 2 stores it against code_sha256" came to
+    be untrue while a 16-character unprefixed digest was being written.
+    """
+    return "sha256:" + hashlib.sha256(code.encode()).hexdigest()
+
+
+def save_bot_source(db, code: str) -> str:
+    """Store a bot's source under its content address. Returns the address.
+
+    This is what makes a manifest's code_sha256 resolvable. Before it, the
+    only copy of a player's source was a bot_submissions row keyed by a
+    TRUNCATED, unprefixed digest -- and only for players who called
+    /submit-bot at all, so anyone who joined and raced with the default
+    STRATEGY_TEMPLATE had no row anywhere. Every real match therefore
+    recorded a replay hash whose inputs could not be recovered.
+
+    Content-addressed and immutable: the same source written twice is one
+    row, and $setOnInsert means a second write cannot alter the first. An
+    upsert rather than an insert-and-catch because two players submitting
+    identical code -- which the default template makes the common case, not
+    an edge one -- is normal, not a conflict.
+    """
+    digest = code_sha256(code)
+    db.db.bot_sources.update_one(
+        {"code_sha256": digest},
+        {"$setOnInsert": {"code_sha256": digest, "code": code,
+                          "first_seen_at": _now()}},
+        upsert=True,
+    )
+    return digest
+
+
+def get_bot_source(db, digest: str) -> Optional[str]:
+    """The source behind a manifest's code_sha256, or None."""
+    row = db.db.bot_sources.find_one({"code_sha256": digest})
+    return row["code"] if row else None
+
+
+def save_replay_inputs(db, match_id: str, participants: list):
+    """Record the inputs a match had that the MANIFEST does not name.
+
+    Today that is exactly one field: starting_compound. It is chosen by the
+    player, it materially changes the race, it travels in the job -- and
+    determinism/manifest.Participant has no field for it. So a manifest for
+    a real match does not, on its own, determine the race it describes, and
+    the replay hash stored against it cannot be re-derived from it.
+
+    The honest fix is a manifest field, which changes the manifest's
+    canonical bytes and therefore every committed golden replay hash -- a
+    schema version bump, deliberately not folded into a fix round. Until
+    then this keeps the data rather than losing it: without it the compound
+    is gone the moment the Redis lobby expires, and no later schema change
+    can recover a match that has already run.
+
+    Immutable, like save_manifest and for the same reason: these are the
+    definition of what a match was. Raises ValueError on any attempt to
+    change one.
+
+    `participants` is a list of {"slot", "code_sha256", "starting_compound"}.
+    """
+    rows = sorted(
+        [
+            {"slot": int(p["slot"]),
+             "code_sha256": p.get("code_sha256"),
+             "starting_compound": p.get("starting_compound"),
+             "house_bot": p.get("house_bot")}
+            for p in participants
+        ],
+        key=lambda row: row["slot"],
+    )
+    existing = db.db.replay_inputs.find_one({"match_id": match_id})
+    if existing:
+        if existing.get("participants") != rows:
+            raise ValueError(
+                f"replay inputs for {match_id} already exist with different "
+                f"content"
+            )
+        return rows
+    db.db.replay_inputs.insert_one(
+        {"match_id": match_id, "participants": rows}
+    )
+    return rows
+
+
+def get_replay_inputs(db, match_id: str):
+    """The recorded per-slot inputs for a match, or None."""
+    row = db.db.replay_inputs.find_one({"match_id": match_id})
+    return row["participants"] if row else None
+
+
 def save_bot_submission(db, player_id: str, code: str, race_id: Optional[str] = None):
+    # The submission row is a player-facing history entry; the SOURCE is
+    # stored separately, content-addressed, because that is what a manifest
+    # references and a submission row is not guaranteed to exist for every
+    # participant (a player who never calls /submit-bot races with the
+    # default template).
+    save_bot_source(db, code)
     sub = {
         "id": _id(),
         "player_id": player_id,
         "race_id": race_id,
         "code": code,
+        # Kept: the frontend renders it (types.ts's bot_history) and it is
+        # the id a player has seen for their own submissions.
         "code_hash": hashlib.sha256(code.encode()).hexdigest()[:16],
+        # The address a manifest actually uses, so a submission row can be
+        # joined to the manifest that raced it.
+        "code_sha256": code_sha256(code),
         "submitted_at": _now(),
     }
     db.db.bot_submissions.insert_one(sub)
