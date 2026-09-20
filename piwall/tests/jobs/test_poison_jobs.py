@@ -414,3 +414,103 @@ def test_a_determinism_break_retires_the_job_without_aborting_the_race(
         "a determinism break must not also mark the race aborted -- the "
         "earlier delivery's result is the durable one"
     )
+
+
+# ─── Failures OUTSIDE the match, which escaped the same way ──────────────
+#
+# The classification above covers everything run_match_isolated can raise.
+# It did not cover the statements sitting outside process_one's `try`: the
+# match_id lookup, the manifest build, and the publish/ack pair. A job that
+# failed in any of those escaped uncapped and re-wedged the queue exactly as
+# an unhandled match failure used to -- same starvation, reached by a route
+# the classification never saw.
+
+
+def test_a_job_that_cannot_become_a_manifest_does_not_wedge_the_queue(wiring):
+    """Red against moving `_manifest_from_job` inside the try.
+
+    Duplicate slots are rejected by the manifest builder, deterministically.
+    Built above the try, that raise left the entry pending forever and the
+    healthy job behind it never ran.
+    """
+    queue, events = wiring
+    malformed = dict(
+        HOUSE_JOB,
+        match_id="m_bad_manifest",
+        participants=[{"slot": 0, "house_bot": "VEL-01"},
+                      {"slot": 0, "house_bot": "NXS-07"}],
+    )
+    queue.enqueue(malformed)
+    queue.enqueue(HOUSE_JOB)
+
+    persisted = []
+    for _ in range(MAX_DELIVERIES + 2):
+        try:
+            process_one(queue, events, persisted.append,
+                        consumer="c_manifest", min_idle_ms=0)
+        except Exception:
+            # Escaping at all is the bug; keep draining so the assertions
+            # below describe the queue rather than the first raise.
+            pass
+
+    assert queue.pending_count() == 0, (
+        "the malformed job never left the queue, so it will be re-served "
+        "ahead of every new match forever"
+    )
+    assert any(r["match_id"] == "m_poison_good" for r in persisted), (
+        "the healthy job behind the malformed one never ran"
+    )
+
+
+def test_a_job_with_no_match_id_is_retired_on_the_first_delivery(wiring):
+    """Red against the `job.get` guard.
+
+    `job["match_id"]` sat above the try, so a job missing the key raised
+    KeyError straight out of process_one -- uncapped, and before any handler
+    could retire it.
+    """
+    queue, events = wiring
+    queue.enqueue({"track": "bahrain", "seed": 1000,
+                   "participants": [{"slot": 0, "house_bot": "VEL-01"}]})
+
+    assert process_one(queue, events, lambda r: None,
+                       consumer="c_no_id", min_idle_ms=0) is None
+    assert queue.pending_count() == 0
+    assert get_redis().xlen(DEAD_LETTER_STREAM) == 1, (
+        "a job with no match id must be dead-lettered, not left pending"
+    )
+
+
+def test_a_publish_failure_does_not_escape_uncapped(wiring):
+    """Red against moving publish/ack inside the try.
+
+    A Redis blip in publish used to escape process_one after persist had
+    already succeeded, leaving the entry pending with no cap on retries.
+
+    Only the match_finished publish is broken, not every publish. Breaking
+    all of them wedges _abandon's own publish too, and then staying pending
+    is the *correct* answer rather than the bug -- the same trade the abort
+    path already makes for Mongo: during a total outage, do not throw work
+    away. The escape this pins is the bounded one.
+    """
+    queue, events = wiring
+    queue.enqueue(HOUSE_JOB)
+
+    real_publish = events.publish
+
+    def boom(payload):
+        if payload.get("type") == "match_finished":
+            raise ConnectionError("redis went away mid-publish")
+        return real_publish(payload)
+
+    events.publish = boom
+    for _ in range(MAX_DELIVERIES + 2):
+        try:
+            process_one(queue, events, lambda r: None,
+                        consumer="c_publish", min_idle_ms=0)
+        except ConnectionError:
+            pass
+
+    assert queue.pending_count() == 0, (
+        "a failing publish left the entry pending forever"
+    )

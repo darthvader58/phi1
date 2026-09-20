@@ -522,11 +522,24 @@ def process_one(
             return None
         entry_id, job = claimed
 
-    match_id = job["match_id"]
+    match_id = job.get("match_id")
+    if not match_id:
+        # Nothing downstream can run or report against a job with no match
+        # id: match_context, persist and every abandon path key on it. A
+        # redelivery can only fail the same way, and letting the KeyError
+        # escape would re-wedge the queue exactly as an unhandled match
+        # failure used to, so this is retired on the first delivery.
+        log.error("job carries no match id; retiring it")
+        queue.dead_letter(entry_id, job, reason="job carries no match id")
+        return None
     with match_context(match_id):
         log.info("running match")
-        manifest = _manifest_from_job(job)
         try:
+            # Inside the try, not above it. A job that cannot be turned into
+            # a manifest -- duplicate slots, say -- fails deterministically,
+            # and outside the try that raise escaped process_one uncapped
+            # and the healthy job behind it never ran.
+            manifest = _manifest_from_job(job)
             # run_match_isolated, NOT replay_from_manifest. The latter raises
             # NotImplementedError for any participant without a house_bot,
             # because replaying a player bot needs its source and Phase 1
@@ -552,6 +565,15 @@ def process_one(
                      "standings": result["standings"],
                      "lap_data": result["lap_data"],
                      "events": result["events"]})
+
+            # Inside the try for the same reason as the manifest build: a
+            # Redis blip in either of these used to escape uncapped. The
+            # ordering is unchanged -- persist, publish, THEN ack -- and a
+            # redelivery after a failed publish is harmless because
+            # persistence is idempotent.
+            events.publish({"type": "match_finished", "match_id": match_id,
+                            "replay_sha256": digest})
+            queue.ack(entry_id)
         except LimitExceeded as exc:
             return _abandon(
                 queue, events, persist, entry_id, job, match_id,
@@ -583,9 +605,6 @@ def process_one(
                 queue, events, persist, entry_id, job, match_id,
                 log_note=f"{type(exc).__name__}: {exc}",
             )
-        events.publish({"type": "match_finished", "match_id": match_id,
-                        "replay_sha256": digest})
-        queue.ack(entry_id)
         log.info("match complete")
         return match_id
 

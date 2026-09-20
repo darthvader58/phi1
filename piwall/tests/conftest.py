@@ -33,7 +33,6 @@ def throwaway_session():
     client.close()
 
 
-import pytest
 
 
 @pytest.fixture

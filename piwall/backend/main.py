@@ -60,7 +60,7 @@ from backend.sandbox.match_job import run_match_isolated
 # ─── State management ──────────────────────────────────────────────────
 
 # Lobby state lives in Redis so both API replicas see the same lobby. A
-# lobby is a plain dict (fields: race_id, track, race_type, status, speed,
+# lobby is a plain dict (fields: race_id, track, race_type, status,
 # players) — this replaces active_lobbies, a module-global dict invisible
 # to any replica that did not happen to create or mutate a given lobby.
 #
