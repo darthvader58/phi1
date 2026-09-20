@@ -48,6 +48,8 @@ CI has no worker process, and a developer's host Redis is not the (unpublished)
 compose one, so neither of those paths is affected.
 """
 
+import asyncio
+import json
 import os
 import select
 import signal
@@ -67,7 +69,8 @@ from backend.db import crud
 from backend.jobs.queue import STREAM, MatchJobQueue
 from backend.observability.health import _mongo_is_reachable
 from backend.state.lobby import KEY_PREFIX
-from backend.state.redis_client import REDIS_URL, get_redis, redis_is_reachable
+from backend.state.redis_client import get_redis, redis_is_reachable
+from tests.subprocess_env import child_env as _child_env
 
 PIWALL_DIR = Path(__file__).resolve().parents[2]
 
@@ -99,17 +102,37 @@ HOUSE_BOT = "NXS-07"
 # ─── Process plumbing ────────────────────────────────────────────────
 
 
-def _free_port() -> int:
-    """A port nothing is listening on right now.
+def _free_ports(count: int) -> list:
+    """`count` ports nothing is listening on, guaranteed distinct.
 
-    Bind-to-0-then-close, which is racy in principle. In practice the kernel
-    does not hand the same ephemeral port straight back out, and the
-    alternative -- a hardcoded port -- fails outright the moment two copies of
-    the suite run on one machine, which CI and a developer's laptop both do.
+    Every socket is held open until all of them have been bound, and only
+    then are they all released. Binding and closing one at a time -- which is
+    what a single `_free_port()` called twice in a row did -- leaves nothing
+    holding the first port while the second is chosen, so the kernel is free
+    to hand the same ephemeral port back and replica B then fails to bind.
+    Low probability, but this is the file that must not flake.
+
+    A hardcoded port would be worse in a way that is not probabilistic at
+    all: it fails outright whenever two copies of the suite share a machine,
+    which CI and a developer's laptop both do.
+
+    The window between releasing these and the children binding them is not
+    closable from here -- uvicorn is given the port on its command line -- but
+    it is a window against the rest of the machine, not against ourselves,
+    which is the collision that was actually reachable.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    holders = []
+    try:
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            holders.append(sock)
+        ports = [sock.getsockname()[1] for sock in holders]
+        assert len(set(ports)) == count, f"duplicate ports handed out: {ports}"
+        return ports
+    finally:
+        for sock in holders:
+            sock.close()
 
 
 def _throwaway_mongo_url(name: str) -> str:
@@ -124,35 +147,6 @@ def _throwaway_mongo_url(name: str) -> str:
 
     parsed = urlparse(mongo_url())
     return urlunparse(parsed._replace(path=f"/{name}"))
-
-
-def _child_env(mongo_uri: str) -> dict:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(PIWALL_DIR)
-    env["MONGODB_URI"] = mongo_uri
-    # MONGODB_DB OVERRIDES the database named in MONGODB_URI's path --
-    # backend/db/models.py's _resolve_database_name reads the variable first
-    # and only falls back to the path -- and both CI and docker compose set
-    # it. Inheriting it unchanged sends the child to whatever database that
-    # names while this test's assertions read the throwaway one: the child
-    # then finds no manifest for its match, _persist_result refuses to treat
-    # the result as persisted, and the job is never acked. Worse, a developer
-    # with MONGODB_DB=phi1 exported would have the child writing into the
-    # shared database this suite must never touch. Pinning it to the
-    # throwaway database's own name means the two cannot disagree.
-    database_name = urlparse(mongo_uri).path.lstrip("/")
-    assert database_name, f"no database name in {mongo_uri!r}"
-    env["MONGODB_DB"] = database_name
-    # Passed explicitly rather than left to the child's own default: the
-    # parent already resolved REDIS_URL at import time, and a child that
-    # re-derived it from a different environment would be talking to a
-    # different Redis than the assertions read.
-    env["REDIS_URL"] = REDIS_URL
-    # What the runtime image pins (Dockerfile.backend / Dockerfile.worker).
-    # These children compare replay hashes with each other, so they must agree
-    # on the interpreter's hash seed the way production does.
-    env["PYTHONHASHSEED"] = "0"
-    return env
 
 
 class _Child:
@@ -318,7 +312,7 @@ def two_replicas(throwaway_db):
     state rather than shared memory.
     """
     _session, uri = throwaway_db
-    port_a, port_b = _free_port(), _free_port()
+    port_a, port_b = _free_ports(2)
     child_a = _start_replica(port_a, uri, "replica-a")
     child_b = _start_replica(port_b, uri, "replica-b")
     try:
@@ -632,8 +626,8 @@ from backend.jobs.queue import MatchJobQueue
 from backend.worker import process_one
 
 out = []
-process_one(MatchJobQueue(), MatchEvents(), persist=out.append,
-            consumer="gate-baseline", block_ms=5000)
+process_one(MatchJobQueue(), MatchEvents(channel="__CHANNEL__"),
+            persist=out.append, consumer="gate-baseline", block_ms=5000)
 print("BASELINE " + out[0]["replay_sha256"], flush=True)
 '''
 
@@ -657,17 +651,27 @@ def persist(result):
     finally:
         db.close()
 
-match_id = w.process_one(MatchJobQueue(), MatchEvents(), persist,
-                         consumer="gate-worker-2", block_ms=1000, min_idle_ms=0)
+match_id = w.process_one(MatchJobQueue(), MatchEvents(channel="__CHANNEL__"),
+                         persist, consumer="gate-worker-2", block_ms=1000,
+                         min_idle_ms=0)
 print("RECOVERED " + str(match_id), flush=True)
 '''
 
 
 def _run_child_for_line(source: str, uri: str, prefix: str, label: str,
-                        timeout: float = 90.0) -> str:
-    """Run a child to completion and return the line starting with `prefix`."""
+                        timeout: float = 90.0, channel: str = "") -> str:
+    """Run a child to completion and return the line starting with `prefix`.
+
+    `channel` replaces the __CHANNEL__ placeholder in `source`. These children
+    publish a real `match_finished` event, and CHANNEL is one fixed name every
+    worker and API replica must agree on in production -- so publishing a
+    throwaway match id onto it is exactly the cross-delivery
+    test_nothing_is_lost_when_the_worker_dies_before_persisting isolates
+    itself against, a few tests down in this same file. Isolating both means
+    the file does not argue with itself.
+    """
     proc = subprocess.Popen(
-        [sys.executable, "-c", source],
+        [sys.executable, "-c", source.replace("__CHANNEL__", channel)],
         cwd=str(PIWALL_DIR), env=_child_env(uri),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -744,8 +748,10 @@ def test_a_worker_restart_mid_match_loses_no_match(throwaway_db,
 
     # 1. An uninterrupted run, to establish what this manifest produces.
     queue.enqueue(job)
+    channel = f"piwall:events:match:gate-{uuid.uuid4().hex}"
     baseline = _run_child_for_line(
-        _BASELINE_SOURCE, uri, "BASELINE", "the baseline worker"
+        _BASELINE_SOURCE, uri, "BASELINE", "the baseline worker",
+        channel=channel,
     ).split(" ", 1)[1]
     assert baseline.startswith("sha256:")
     assert queue.pending_count() == 0, "the baseline run must have acked"
@@ -810,7 +816,8 @@ def test_a_worker_restart_mid_match_loses_no_match(throwaway_db,
 
     # 3. The replacement worker takes over.
     recovered = _run_child_for_line(
-        _REPLACEMENT_SOURCE, uri, "RECOVERED", "the replacement worker"
+        _REPLACEMENT_SOURCE, uri, "RECOVERED", "the replacement worker",
+        channel=channel,
     ).split(" ", 1)[1]
     assert recovered == match_id, (
         f"the abandoned match was not recovered; worker-2 reported {recovered!r}"
@@ -881,3 +888,234 @@ def test_nothing_is_lost_when_the_worker_dies_before_persisting(throwaway_db,
                 consumer="gate-crasher-2", min_idle_ms=0)
     assert saved and saved[0]["match_id"] == race.id
     assert queue.pending_count() == 0
+
+
+# ─── Gate part 1, continued: the one traffic type not backed by Redis ──
+
+
+async def _finished_event_on(ws_url: str, start_race, timeout: float) -> dict:
+    """Connect, THEN start the race, then wait for the finished event.
+
+    The ordering is the whole point and is why this is one coroutine rather
+    than a connect helper called between two HTTP calls. Match events are
+    Redis pub/sub, which is deliberately fire-and-forget (see
+    backend/jobs/events.py): a replica that is not subscribed when the worker
+    publishes simply never learns. Connecting first, and only then starting
+    the race from inside the connected context, means this test cannot pass
+    or fail on whether it won a race against a five-second countdown.
+    """
+    from websockets.asyncio.client import connect
+
+    async with connect(ws_url) as socket:
+        await asyncio.to_thread(start_race)
+        deadline = time.time() + timeout
+        seen = []
+        while time.time() < deadline:
+            raw = await asyncio.wait_for(
+                socket.recv(), timeout=max(0.1, deadline - time.time())
+            )
+            message = json.loads(raw)
+            seen.append(message.get("type") or message)
+            if message.get("type") == "finished":
+                return message
+        raise AssertionError(
+            f"no finished event on this socket within {timeout}s; saw {seen}"
+        )
+
+
+def test_a_spectator_on_one_replica_sees_a_match_the_other_replica_started(
+    two_replicas, throwaway_db, _clean_shared_redis
+):
+    """Gate part 1 for the WebSocket -- the only cross-replica path whose
+    state is deliberately NOT in Redis.
+
+    `SOCKETS` (backend/main.py:84) is a per-process dict and has to stay one:
+    a live socket is an object owned by one process and cannot be handed to
+    another through Redis. That makes "two replicas serve all traffic
+    correctly" a genuinely non-trivial claim here, in a way it is not for any
+    HTTP path in this file -- it holds only because the worker publishes
+    `match_finished` to a channel EVERY replica subscribes to, and each
+    replica then writes to whichever sockets it happens to hold.
+
+    So: a spectator connects to replica B. The race is created, joined and
+    started on replica A, and run by a worker process that has spoken to
+    neither replica. B's socket must receive the finished event, with the
+    standings its client needs to render anything at all.
+
+    The production lines whose deletion turns this red: the
+    `asyncio.create_task(_relay_match_events())` in backend/main.py's
+    `lifespan`, and `events.publish(...)` in worker.py's `process_one`.
+    Remove either and this socket receives nothing but the 30s keepalive
+    until the deadline -- while every other assertion in this file still
+    passes, because the HTTP path keeps reporting the race finished off the
+    durable write. That asymmetry is exactly the silent regression this
+    closes, and it is a live risk: four review rounds went into keeping
+    SOCKETS per-process, so the pub/sub fan-out is the load-bearing half and
+    nothing else here touches it.
+    """
+    base_a, base_b = two_replicas
+    session, uri = throwaway_db
+    created = _clean_shared_redis
+
+    owner = _player(session, "gate_ws")
+    race_id = _post(base_a, "/api/race/create", owner.api_key,
+                    {"track": "bahrain"}).json()["race_id"]
+    created.append(race_id)
+    assert _post(base_a, f"/api/race/{race_id}/join", owner.api_key,
+                 {"car_id": PLAYER_CAR_ID}).status_code == 200
+    assert _post(base_a, f"/api/race/{race_id}/submit-bot", owner.api_key,
+                 {"code": PLAYER_CODE}).status_code == 200
+
+    worker = _Child(
+        [sys.executable, "-c",
+         "import backend.worker as w; w.run_forever(consumer='gate-ws')"],
+        _child_env(uri),
+        "worker-ws",
+    )
+    try:
+        ws_url = base_b.replace("http://", "ws://") + f"/ws/race/{race_id}"
+
+        def start():
+            started = _post(base_a, f"/api/race/{race_id}/start",
+                            owner.api_key, {})
+            assert started.status_code == 200, started.text
+
+        event = asyncio.run(_finished_event_on(ws_url, start, timeout=90.0))
+
+        assert event["result"]["race_id"] == race_id, (
+            f"replica B's socket got a finished event for the wrong race: "
+            f"{event}"
+        )
+        # Not merely "an event arrived": the payload a client actually
+        # renders. frontend/src/lib/websocket.ts does `if (msg.result)
+        # setResult(msg.result)` and the race page then spreads
+        # result.standings, so an event carrying no standings takes the page
+        # down for every spectator -- the regression _stream_stored_replay's
+        # docstring records as already having shipped once.
+        assert event["result"]["standings"], (
+            f"the finished event reached replica B's socket with no "
+            f"standings to render: {event}"
+        )
+        assert PLAYER_CAR_ID in {
+            car["car_id"] for car in event["result"]["standings"]
+        }
+    finally:
+        worker.stop()
+
+
+# ─── Gate part 2, continued: surviving the loss of the job stream ───────
+
+
+def test_a_worker_survives_losing_the_job_stream_and_drains_the_next_job(
+    throwaway_db, _clean_shared_redis
+):
+    """A Redis restart must not wedge the fleet, silently, forever.
+
+    The job stream and its consumer group live only in Redis. Before the fix
+    that accompanies this test, `_ensure_group` ran in `MatchJobQueue.__init__`
+    and nowhere else, while `run_forever` builds one queue at startup and
+    keeps it for the life of the process -- so a stream key that disappeared
+    afterwards (a Redis restart with no persistence, an eviction under
+    maxmemory, an operator DEL) made every subsequent group-scoped command
+    raise NOGROUP. `run_forever` logged each one as a job failure and backed
+    off to its 30s ceiling; the process never exited, so
+    `restart: unless-stopped` never fired.
+
+    It was silent on both sides. XADD does not fail, so the API went on
+    accepting races and stacking up jobs nothing could read, and `/ready`
+    reported healthy throughout because Redis and Mongo genuinely were. The
+    only symptom was that matches stopped finishing.
+
+    This is the reproduction, with a real worker process: wedge it, then
+    enqueue and require the match to actually run and persist. Revert
+    `_with_group`'s recovery in backend/jobs/queue.py and this goes red by
+    timing out with the race still unfinished -- which is precisely what a
+    production worker did, except without a deadline.
+    """
+    session, uri = throwaway_db
+    client = get_redis()
+
+    owner = _player(session, "gate_wedge")
+    race = crud.create_race(session, "bahrain", "quick", owner_id=owner.id)
+    match_id = race.id
+    job = {
+        "match_id": match_id, "track": "bahrain", "seed": 1000,
+        "participants": [
+            {"slot": 0, "player_id": owner.id, "car_id": PLAYER_CAR_ID,
+             "code": PLAYER_CODE},
+            {"slot": 1, "house_bot": HOUSE_BOT},
+        ],
+    }
+    from backend.worker import _manifest_from_job
+
+    crud.save_manifest(session, _manifest_from_job(job))
+
+    # Built BEFORE the outage, and reused across it. This is not incidental
+    # -- it is what makes the reproduction faithful, and getting it wrong
+    # made an earlier draft of this test pass with the fix reverted.
+    # `MatchJobQueue.__init__` calls `_ensure_group()`, so a queue constructed
+    # *after* the stream key was deleted silently heals the very wedge this
+    # test exists to reproduce, and the worker is then never asked to recover
+    # from anything. Production does not get that accident: backend/main.py's
+    # `_get_jobs()` memoises one queue per API process and `run_forever`
+    # builds one per worker, both at startup, so in a real outage every
+    # surviving process is holding a queue object built before the key
+    # vanished. This holds one too.
+    queue = MatchJobQueue()
+
+    worker = _Child(
+        [sys.executable, "-c",
+         "import backend.worker as w; w.run_forever(consumer='gate-wedge')"],
+        _child_env(uri),
+        "worker-wedge",
+    )
+    try:
+        deadline = time.time() + 45
+        while time.time() < deadline and "worker ready" not in worker.output():
+            time.sleep(0.2)
+        assert "worker ready" in worker.output(), (
+            f"the worker never started:\n{worker.output()}"
+        )
+
+        # The outage. Everything the group knows about goes with the key.
+        client.delete(STREAM)
+
+        # Long enough for the worker's in-flight XREADGROUP (block_ms=2000)
+        # to expire and for it to go round the loop into the NOGROUP path at
+        # least once -- so this is genuinely testing recovery from the wedged
+        # state rather than a worker that never noticed.
+        time.sleep(4)
+
+        # XADD rebuilds the key with no consumer group -- note this goes
+        # through the queue built above, so nothing here re-creates the
+        # group on the worker's behalf. Before the fix this call succeeded
+        # exactly as it does now, and the job was simply unreachable
+        # forever: that silent success is half of what made the wedge so
+        # hard to notice.
+        queue.enqueue(job)
+        assert client.exists(STREAM), "the enqueue must have rebuilt the key"
+
+        deadline = time.time() + 90
+        status = None
+        while time.time() < deadline:
+            if worker.proc.poll() is not None:
+                pytest.fail(
+                    f"the worker exited (code {worker.proc.returncode}) "
+                    f"instead of recovering:\n{worker.output()}"
+                )
+            persisted = crud.get_race(session, match_id)
+            status = persisted.status if persisted else None
+            if status == "finished":
+                break
+            time.sleep(0.5)
+
+        assert status == "finished", (
+            f"the worker never drained a job enqueued after the stream key "
+            f"was lost; the race is still {status!r}. The worker is wedged "
+            f"on NOGROUP.\n{worker.output()[-3000:]}"
+        )
+        assert crud.get_replay_hash(session, match_id), (
+            "the recovered job must have been persisted, not merely acked"
+        )
+    finally:
+        worker.stop()
