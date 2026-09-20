@@ -19,6 +19,18 @@ services:
     image: redis:8-alpine
     expose:
       - "6379"
+    # Persistence is not an optimisation here, it is what stops a restart of
+    # this one container from taking the worker fleet down with it. The job
+    # stream and its consumer group live only in Redis; lose the key and
+    # every worker's group-scoped command fails with NOGROUP. The queue now
+    # recovers from that on its own (backend/jobs/queue.py's _with_group),
+    # but recovery still costs whatever was in flight, and an in-memory-only
+    # Redis turns `docker compose restart redis` into a fleet-wide event for
+    # no reason at all. appendonly gives the stream fsync-backed durability;
+    # the named volume is what makes it outlive the container.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -130,3 +142,4 @@ services:
 
 volumes:
   mongodata:
+  redisdata:
