@@ -427,6 +427,13 @@ def test_lifespan_shutdown_actually_calls_drain_sockets(monkeypatch):
     client = MongoClient(_throwaway_mongo_url(name))
     database = client[name]
     monkeypatch.setattr(main, "db_engine", database)
+    # lifespan's first act is `_session_factory = init_db(db_engine)`, which
+    # binds the module-global factory to THIS throwaway database -- and the
+    # client below is closed when the test ends. Without restoring it, every
+    # later test in the session that calls main.SessionLocal() talks to a
+    # closed MongoClient and fails somewhere unrelated to its own subject.
+    # monkeypatch restores whatever is here now once this test is done.
+    monkeypatch.setattr(main, "_session_factory", main._session_factory)
 
     socket = _FakeSocket()
     main.SOCKETS["r_lifespan_drain"] = {socket}
