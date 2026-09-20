@@ -232,6 +232,19 @@ def test_a_real_sigterm_mid_job_still_finishes_and_acks_the_claimed_match(
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PIWALL_DIR)
     env["MONGODB_URI"] = mongo_url
+    # MONGODB_DB OVERRIDES the database named in MONGODB_URI's path --
+    # backend/db/models.py's _resolve_database_name reads the variable first
+    # and only falls back to the path -- and both CI and docker compose set
+    # it. Inheriting it unchanged sends the child to whatever database that
+    # names while this test's assertions read the throwaway one: the child
+    # then finds no manifest for its match, _persist_result refuses to treat
+    # the result as persisted, and the job is never acked. Worse, a developer
+    # with MONGODB_DB=phi1 exported would have the child writing into the
+    # shared database this suite must never touch. Pinning it to the
+    # throwaway database's own name means the two cannot disagree.
+    database_name = urlparse(mongo_url).path.lstrip("/")
+    assert database_name, f"no database name in {mongo_url!r}"
+    env["MONGODB_DB"] = database_name
 
     child_source = _CHILD_SOURCE.replace("__CONSUMER__", consumer)
 
