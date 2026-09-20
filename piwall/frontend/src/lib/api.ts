@@ -20,10 +20,10 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
 
 export const api = {
   // Races
-  createRace: (track: string, speed = 5, raceType = "quick") =>
+  createRace: (track: string, raceType = "quick") =>
     apiFetch("/race/create", {
       method: "POST",
-      body: JSON.stringify({ track, speed, race_type: raceType }),
+      body: JSON.stringify({ track, race_type: raceType }),
     }),
 
   joinRace: (raceId: string, compound = "MEDIUM") =>

@@ -70,7 +70,6 @@ export default function RacePage() {
     countdown,
     lightsOut,
     abortReason,
-    setSpeed
   } = useRaceWebSocket(raceInfo?.status === "lobby" ? null : raceId);
 
   useEffect(() => {
@@ -325,18 +324,6 @@ export default function RacePage() {
         )}
 
         <div className="ml-auto flex items-center gap-2">
-          <span className="text-[10px] text-pit-muted uppercase tracking-wider hidden sm:inline">Speed</span>
-          {[1, 5, 20].map((s) => (
-            <button
-              key={s}
-              onClick={() => setSpeed(s)}
-              className="px-2.5 py-1 rounded-md bg-pit-surface text-pit-text text-[11px] font-bold
-                         hover:bg-pit-border hover:text-white transition-colors duration-150"
-              type="button"
-            >
-              {s}x
-            </button>
-          ))}
           <div
             className={`w-2 h-2 rounded-full ml-1 ${
               connected ? "bg-green-500" : status === "disconnected" ? "bg-yellow-500 animate-pulse-slow" : "bg-red-500"

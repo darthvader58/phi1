@@ -412,7 +412,15 @@ class RegisterRequest(BaseModel):
 class CreateRaceRequest(BaseModel):
     track: str
     race_type: str = "quick"
-    speed: float = 5.0
+    # No `speed`. Playback pacing was a property of the in-process
+    # simulation this phase deleted -- the API replayed lap_data on an
+    # asyncio.sleep(11.0 / lobby.speed) loop. The worker now runs a match to
+    # completion in one shot and publishes one terminal event, so there is
+    # nothing left for a speed to pace. Pydantic ignores unknown keys by
+    # default, so a client still sending one is accepted and ignored rather
+    # than rejected. If replay playback returns with Phase 4's replay
+    # bodies, the control belongs in the browser, over the stored replay --
+    # not as server state two API replicas have to agree on.
 
 # A car_id is not just a label: belief dicts are keyed by it, and those keys
 # become attributes of the Namespace object every bot in the race receives
@@ -510,7 +518,6 @@ def create_race(request: Request, req: CreateRaceRequest, x_api_key: str = Heade
         race = crud.create_race(db, req.track, req.race_type, season_id=season_id,
                                 owner_id=player["id"])
         LOBBIES.create(race.id, track=req.track, race_type=req.race_type)
-        LOBBIES.set_speed(race.id, req.speed)
         return {"race_id": race.id, "track": req.track, "status": "lobby",
                 "race_type": req.race_type, "season_id": season_id}
     finally:
@@ -1120,12 +1127,14 @@ async def websocket_race(websocket: WebSocket, race_id: str):
         # connects mid-race has nothing to catch up on until the
         # "finished" event arrives; it is not silently dropping one.
 
-        # Keep connection alive, listen for speed control messages
+        # Keep the connection alive. Nothing a client sends is acted on:
+        # the only inbound message this ever handled was {"type":"speed"},
+        # which wrote a lobby field no reader has read since the in-process
+        # display loop was deleted. Received and discarded rather than
+        # refused, so an older client page cannot break its own socket.
         while True:
             try:
-                msg = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
-                if msg.get("type") == "speed":
-                    LOBBIES.set_speed(race_id, float(msg.get("speed", 1.0)))
+                await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
             except asyncio.TimeoutError:
                 # Send ping to keep alive
                 await websocket.send_json({"type": "ping"})

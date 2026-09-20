@@ -94,12 +94,19 @@ def test_players_is_empty_for_a_new_lobby(replica_a):
     assert replica_a.players(RACE) == {}
 
 
-def test_speed_round_trips_as_a_float(replica_a, replica_b):
-    """Redis stores strings; a speed read back as '5.0' breaks arithmetic."""
+def test_a_new_lobby_carries_no_playback_speed(replica_a):
+    """Replaces test_speed_round_trips_as_a_float, which tested a field
+    that no longer exists.
+
+    `speed` was written by create_race, by a WebSocket message and by
+    LobbyStore.create, and read by nothing: the
+    `asyncio.sleep(11.0 / lobby.speed)` display loop that consumed it is
+    what this phase deleted. A lobby field with three writers and no
+    readers is not dormant, it is misleading -- and it still had a UI
+    control in front of it that changed nothing a user could observe.
+    """
     replica_a.create(RACE, track="bahrain")
-    replica_a.set_speed(RACE, 5.0)
-    assert replica_b.get(RACE)["speed"] == 5.0
-    assert isinstance(replica_b.get(RACE)["speed"], float)
+    assert "speed" not in replica_a.get(RACE)
 
 
 def test_list_open_includes_a_waiting_lobby(replica_a):

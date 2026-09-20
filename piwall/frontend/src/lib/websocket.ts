@@ -126,12 +126,6 @@ export function useRaceWebSocket(raceId: string | null) {
     };
   }, [raceId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const setSpeed = useCallback((speed: number) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "speed", speed }));
-    }
-  }, []);
-
   return {
     connected,
     status,
@@ -144,6 +138,5 @@ export function useRaceWebSocket(raceId: string | null) {
     countdown,
     lightsOut,
     abortReason,
-    setSpeed,
   };
 }

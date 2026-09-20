@@ -45,7 +45,7 @@ def _match_ids(lines):
     return {line.get("match_id") for line in lines}
 
 
-def test_run_race_puts_the_match_id_on_its_log_lines(monkeypatch):
+def test_run_race_puts_the_match_id_on_its_log_lines(monkeypatch, throwaway_session):
     """Red line: the `with match_context(race_id):` wrapper in
     main._run_race. Remove it and every line comes out with no match_id,
     which is the state this finding describes.
@@ -54,6 +54,8 @@ def test_run_race_puts_the_match_id_on_its_log_lines(monkeypatch):
     from backend.db import crud
 
     monkeypatch.setattr(main.asyncio, "sleep", _no_sleep)
+    # Writes go to a database this test owns, never the shared one.
+    monkeypatch.setattr(main, "SessionLocal", lambda: throwaway_session)
 
     race_id = f"m_corr_{int(time.time() * 1000)}"
     store = LobbyStore()
@@ -95,7 +97,7 @@ def test_run_race_puts_the_match_id_on_its_log_lines(monkeypatch):
     )
 
 
-def test_the_id_does_not_leak_past_the_match(monkeypatch):
+def test_the_id_does_not_leak_past_the_match(monkeypatch, throwaway_session):
     """Why match_context and not bind_match. _run_race can leave by an
     exception, and a bare clear_match() after the body would be skipped --
     leaving one match's id stamped on whatever ran next in this context.
@@ -109,6 +111,7 @@ def test_the_id_does_not_leak_past_the_match(monkeypatch):
     monkeypatch.setattr(main.asyncio, "sleep", _no_sleep)
     monkeypatch.setattr(crud, "save_manifest",
                         lambda *_a: (_ for _ in ()).throw(ValueError("x")))
+    monkeypatch.setattr(main, "SessionLocal", lambda: throwaway_session)
 
     race_id = f"m_corr_leak_{int(time.time() * 1000)}"
     store = LobbyStore()
@@ -140,7 +143,7 @@ def test_the_id_does_not_leak_past_the_match(monkeypatch):
     )
 
 
-def test_streaming_a_finished_replay_is_also_correlated(monkeypatch):
+def test_streaming_a_finished_replay_is_also_correlated(monkeypatch, throwaway_session):
     """The third process in the story: the replica that streams the result
     is often not the one that created the match.
 
@@ -157,5 +160,6 @@ def test_streaming_a_finished_replay_is_also_correlated(monkeypatch):
         seen.append(_match_id.get())
 
     monkeypatch.setattr(main, "_broadcast", recording_broadcast)
+    monkeypatch.setattr(main, "SessionLocal", lambda: throwaway_session)
     asyncio.run(main._stream_stored_replay(race_id))
     assert seen == [race_id]

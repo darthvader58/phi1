@@ -84,7 +84,7 @@ def test_a_missing_lobby_answers_no_rather_than_raising():
 # ── F2 at the endpoint ────────────────────────────────────────────────────
 
 def test_a_second_start_is_refused_rather_than_spawning_a_second_race(
-    monkeypatch, lobby_id
+    monkeypatch, lobby_id, throwaway_session
 ):
     """F2 end to end.
 
@@ -102,12 +102,9 @@ def test_a_second_start_is_refused_rather_than_spawning_a_second_race(
     from backend.db import crud
     from fastapi import HTTPException
 
-    race = None
-    db = main.SessionLocal()
-    try:
-        race = crud.create_race(db, "bahrain", "quick", owner_id="p_owner")
-    finally:
-        db.close()
+    monkeypatch.setattr(main, "SessionLocal", lambda: throwaway_session)
+    race = crud.create_race(throwaway_session, "bahrain", "quick",
+                            owner_id="p_owner")
 
     store = LobbyStore()
     store.delete(race.id)
@@ -254,7 +251,7 @@ def test_a_failing_background_task_does_not_break_shutdown():
 
 
 def test_a_late_failure_does_not_abort_a_race_the_worker_already_finished(
-    monkeypatch
+    monkeypatch, throwaway_session
 ):
     """The other half of F2, and the one that was permanent.
 
@@ -276,6 +273,7 @@ def test_a_late_failure_does_not_abort_a_race_the_worker_already_finished(
         return None
 
     monkeypatch.setattr(main.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(main, "SessionLocal", lambda: throwaway_session)
 
     race_id = f"m_late_abort_{int(time.time() * 1000)}"
     store = LobbyStore()

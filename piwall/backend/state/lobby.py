@@ -270,7 +270,6 @@ class LobbyStore:
             "track": track,
             "race_type": race_type,
             "status": "lobby",
-            "speed": 1.0,
             "players": {},
         }
         self._write(lobby)
@@ -281,15 +280,7 @@ class LobbyStore:
         return self._decode(raw) if raw else None
 
     def _decode(self, raw: str) -> dict:
-        lobby = json.loads(raw)
-        # Redis has no float type; a whole-number speed (5.0) comes back
-        # from Lua/JSON as the int 5, and 11.0 / 5 behaves very differently
-        # from 11.0 / 5.0 the moment someone divides by it. Restoring the
-        # type here, once, means every caller gets a real float regardless
-        # of how the value happened to be encoded on the way in.
-        if "speed" in lobby:
-            lobby["speed"] = float(lobby["speed"])
-        return lobby
+        return json.loads(raw)
 
     def _write(self, lobby: dict) -> None:
         self._redis.set(
@@ -325,9 +316,6 @@ class LobbyStore:
                   json.dumps(list(expected))],
         )
         return bool(ok)
-
-    def set_speed(self, race_id: str, speed: float) -> None:
-        self._atomic_set(race_id, "field", "speed", float(speed))
 
     def add_player(self, race_id: str, player_id: str, data: dict) -> None:
         self._atomic_set(race_id, "player", player_id, data)

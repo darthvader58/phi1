@@ -89,10 +89,6 @@ class TyreModel:
             base_deg += CLIFF_RATE * math.pow(over, CLIFF_EXPONENT)
         return base_deg
 
-    def lap_time_tyre_only(self, age: int) -> float:
-        """Base + tyre deg (no fuel, no weather)."""
-        return self.base_lap_time + self.degradation(age)
-
 
 @dataclass
 class TrackPhysics:
