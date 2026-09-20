@@ -12,23 +12,83 @@ services:
       timeout: 5s
       retries: 5
 
+  # Not published, on purpose: only the backend and the worker speak to it,
+  # and an exposed Redis with no auth is the classic way a dev stack becomes
+  # an incident.
+  redis:
+    image: redis:8-alpine
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   backend:
     build:
       context: .
       dockerfile: Dockerfile.backend
+    # A host port RANGE, not "8000:8000". Two replicas cannot both bind one
+    # host port, so a single mapping makes `up` fail outright with "port is
+    # already allocated"; a range hands each replica its own (8000 and 8001).
+    #
+    # Dropping the mapping altogether would also start, and would be wrong in
+    # a way that only shows up in a browser: the frontend's HTTP traffic goes
+    # through the Next.js proxy by service name and is load-balanced across
+    # replicas, but the live-timing WebSocket is dialled by the visitor's
+    # browser at NEXT_PUBLIC_WS_URL and must therefore reach a published port.
+    # Pointing it at one replica is correct rather than a compromise: match
+    # events reach EVERY replica over Redis pub/sub (backend/jobs/events.py),
+    # so a spectator pinned to one replica still sees a match another replica
+    # started and a worker ran.
     ports:
-      - "8000:8000"
+      - "8000-8001:8000"
     environment:
       MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGODB_DB}?authSource=admin
       MONGODB_DB: ${MONGODB_DB}
+      REDIS_URL: redis://redis:6379/0
       CORS_ORIGINS: ${CORS_ORIGINS}
       # Must match the frontend's value exactly. Compose refuses to start
       # rather than boot a backend whose registration silently 404s.
       PROVISIONING_SECRET: ${PROVISIONING_SECRET:?set PROVISIONING_SECRET to a random secret shared by backend and frontend; registration is closed without it}
     restart: unless-stopped
+    # Two of them. This is the phase gate's first property, running rather
+    # than described: lobby state, the job queue and match events all live in
+    # Redis precisely so a second replica is just another stateless reader.
+    deploy:
+      replicas: 2
     depends_on:
       mongodb:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./fastf1_cache:/app/fastf1_cache
+      - ./processed_cache:/app/processed_cache
+
+  # Match execution, off the API processes entirely. An API replica no longer
+  # holds a race in memory for the length of it, which is what makes scaling
+  # the API to two replicas meaningful in the first place.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      MONGODB_URI: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGODB_DB}?authSource=admin
+      MONGODB_DB: ${MONGODB_DB}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # A restart is safe by construction, which is the phase gate's second
+    # property: a job is acked only after its result is durable, so a worker
+    # that dies holding one leaves it in the consumer group's pending list for
+    # another worker to reclaim (backend/jobs/queue.py).
+    restart: unless-stopped
     volumes:
       - ./fastf1_cache:/app/fastf1_cache
       - ./processed_cache:/app/processed_cache
