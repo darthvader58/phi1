@@ -27,6 +27,18 @@ class CalibrationMismatch(ValueError):
     """
 
 
+class ReplayHashConflict(ValueError):
+    """Two executions of one manifest produced different replay bytes.
+
+    The contract this project rests on is that they cannot. Raised by
+    crud.save_replay_hash when a second execution of a match disagrees with
+    the hash already recorded for it, instead of the disagreement being
+    written over the original -- which is what used to happen, and which
+    erased the only evidence the system is able to produce that determinism
+    broke.
+    """
+
+
 def replay_bytes(result: RaceResult, manifest: MatchManifest) -> bytes:
     payload = {
         "format_version": REPLAY_FORMAT_VERSION,

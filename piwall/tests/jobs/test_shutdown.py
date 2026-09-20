@@ -40,6 +40,7 @@ notices.
 import asyncio
 import os
 import select
+import hashlib
 import signal
 import subprocess
 import sys
@@ -209,11 +210,17 @@ def test_a_real_sigterm_mid_job_still_finishes_and_acks_the_claimed_match(
     race = crud.create_race(session, "bahrain", "quick", owner_id=player.id)
     match_id = race.id
 
+    # The job and the manifest must describe the SAME match, the way
+    # main._build_job_and_manifest builds them: the code_sha256 the manifest
+    # declares is the one the job carries. A placeholder here meant the
+    # stored manifest was not the one the worker rebuilds from this job,
+    # which _persist_result now refuses.
+    code_sha256 = "sha256:" + hashlib.sha256(PLAYER_CODE.encode()).hexdigest()
     job = {
         "match_id": match_id, "track": "bahrain", "seed": 1000,
         "participants": [
             {"slot": 0, "player_id": player.id, "car_id": "USR-01",
-             "code": PLAYER_CODE},
+             "code": PLAYER_CODE, "code_sha256": code_sha256},
             {"slot": 1, "house_bot": "NXS-07"},
         ],
     }
@@ -221,7 +228,7 @@ def test_a_real_sigterm_mid_job_still_finishes_and_acks_the_claimed_match(
         match_id=match_id, seed=1000, track="bahrain",
         participants=[
             Participant(slot=0, player_id=player.id, bot_version_id=None,
-                       code_sha256="sha256:" + "a" * 64, house_bot=None),
+                       code_sha256=code_sha256, house_bot=None),
             Participant(slot=1, player_id=None, bot_version_id=None,
                        code_sha256=None, house_bot="NXS-07"),
         ],

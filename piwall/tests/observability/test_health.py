@@ -43,9 +43,12 @@ def test_ready_is_200_when_both_dependencies_answer(monkeypatch):
 
     monkeypatch.setattr(mod, "redis_is_reachable", lambda **kw: True)
     monkeypatch.setattr(mod, "_mongo_is_reachable", lambda **kw: True)
+    monkeypatch.setattr(mod, "_live_worker_count", lambda: 2)
     response = _client().get("/ready")
     assert response.status_code == 200
-    assert response.json() == {"status": "ready", "redis": True, "mongo": True}
+    assert response.json() == {
+        "status": "ready", "redis": True, "mongo": True, "workers": 2,
+    }
 
 
 def test_ready_is_503_when_redis_is_down(monkeypatch):

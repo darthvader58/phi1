@@ -23,6 +23,7 @@ test_the_unique_index_is_what_prevents_duplicate_history_rows below close
 both gaps directly.
 """
 
+import hashlib
 import uuid
 
 import pytest
@@ -65,19 +66,27 @@ def _job_and_manifest(match_id: str, player_id: str):
     JOB fixture: a player bot in the mix on purpose, so a worker that could
     only replay house bots would still fail this.
     """
+    code_sha256 = "sha256:" + hashlib.sha256(PLAYER_CODE.encode()).hexdigest()
     job = {
         "match_id": match_id, "track": "bahrain", "seed": 1000,
         "participants": [
             {"slot": 0, "player_id": player_id, "car_id": "USR-01",
-             "code": PLAYER_CODE},
+             "code": PLAYER_CODE, "code_sha256": code_sha256},
             {"slot": 1, "house_bot": "NXS-07"},
         ],
     }
+    # The job and the manifest must describe the SAME match, exactly as
+    # main._build_job_and_manifest builds them -- same slots, same
+    # player_ids, same code_sha256. They did not before: the manifest
+    # declared a placeholder code_sha256 the job never carried, so the
+    # manifest saved here was not the one the worker rebuilds from this
+    # job. _persist_result now compares the two digests and refuses a
+    # mismatch, which is what caught it.
     manifest = build_manifest(
         match_id=match_id, seed=1000, track="bahrain",
         participants=[
             Participant(slot=0, player_id=player_id, bot_version_id=None,
-                       code_sha256="sha256:" + "a" * 64, house_bot=None),
+                       code_sha256=code_sha256, house_bot=None),
             Participant(slot=1, player_id=None, bot_version_id=None,
                        code_sha256=None, house_bot="NXS-07"),
         ],
@@ -274,6 +283,7 @@ def test_k_factor_follows_the_race_documents_race_type(db):
         return {
             "match_id": match_id,
             "replay_sha256": "sha256:" + "c" * 64,
+            "manifest": manifest,
             "standings": standings,
             "lap_data": [{"lap": 1}],
             "events": [],
@@ -411,6 +421,7 @@ def test_the_unique_index_is_what_prevents_duplicate_history_rows(throwaway_db):
     result = {
         "match_id": match_id,
         "replay_sha256": "sha256:" + "e" * 64,
+        "manifest": manifest,
         "standings": [
             {"player_id": player.id, "car_id": "USR-01", "position": 1,
              "retired": False, "total_time": 100.0, "pit_laps": [],
@@ -472,6 +483,7 @@ def test_a_missing_race_document_refuses_the_job_rather_than_guessing_k(db):
     result = {
         "match_id": match_id,
         "replay_sha256": "sha256:" + "f" * 64,
+        "manifest": manifest,
         "standings": [
             {"player_id": "VEL-01", "car_id": "VEL-01", "position": 1,
              "retired": False, "total_time": 100.0, "pit_laps": [],
@@ -520,6 +532,7 @@ def test_a_refused_job_does_not_leave_the_lobby_reporting_finished(db):
     result = {
         "match_id": match_id,
         "replay_sha256": "sha256:" + "7" * 64,
+        "manifest": manifest,
         "standings": [
             {"player_id": "VEL-01", "car_id": "VEL-01", "position": 1,
              "retired": False, "total_time": 100.0, "pit_laps": [],
@@ -548,11 +561,11 @@ def test_a_crash_between_history_and_rating_still_converges_on_redelivery(db):
     moved the vulnerable window rather than closing it.
 
     A crash between crud.save_elo_history (the history row lands) and
-    crud.update_player_elo (the rating itself never moves) for one player
+    crud.apply_player_elo (the rating itself never moves) for one player
     left that player's rating stuck at its pre-race value forever on
     round 2's code: the redelivery's save_elo_history call raised
-    DuplicateKeyError, which round 2 caught and skipped, so
-    update_player_elo for that player was never even attempted again.
+    DuplicateKeyError, which round 2 caught and skipped, so the rating
+    write for that player was never even attempted again.
     elo_history then permanently contradicted players.elo for that player.
 
     Reproduced with three real players, k=48 (season), matching the
@@ -583,6 +596,7 @@ def test_a_crash_between_history_and_rating_still_converges_on_redelivery(db):
     result = {
         "match_id": match_id,
         "replay_sha256": "sha256:" + "9" * 64,
+        "manifest": manifest,
         "standings": [
             {"player_id": p1.id, "car_id": "P01", "position": 1,
              "retired": False, "total_time": 100.0, "pit_laps": [],
@@ -607,25 +621,28 @@ def test_a_crash_between_history_and_rating_still_converges_on_redelivery(db):
             standings_tuples, {p1.id: 1200.0, p2.id: 1200.0, p3.id: 1200.0}, 48.0
         )
 
-        # Simulate a crash strictly between save_elo_history and
-        # update_player_elo for the first player _persist_result reaches
+        # Simulate a crash strictly between save_elo_history and the
+        # rating write for the first player _persist_result reaches
         # (dict insertion order == standings order, since compute_elo_updates
-        # returns dict(ratings) mutated in place).
-        real_update_player_elo = crud.update_player_elo
+        # returns dict(ratings) mutated in place). The rating write is
+        # crud.apply_player_elo, not crud.update_player_elo: the match path
+        # moved to an atomic $inc / compare-and-set so two different matches
+        # finishing for one player at once cannot lose an update.
+        real_apply_player_elo = crud.apply_player_elo
         calls = []
 
-        def exploding_update_player_elo(*args, **kwargs):
+        def exploding_apply_player_elo(*args, **kwargs):
             if not calls:
                 calls.append(1)
                 raise RuntimeError("simulated worker death after save_elo_history")
-            return real_update_player_elo(*args, **kwargs)
+            return real_apply_player_elo(*args, **kwargs)
 
-        crud.update_player_elo = exploding_update_player_elo
+        crud.apply_player_elo = exploding_apply_player_elo
         try:
             with pytest.raises(RuntimeError):
                 _persist_result(db, result)
         finally:
-            crud.update_player_elo = real_update_player_elo
+            crud.apply_player_elo = real_apply_player_elo
 
         # Confirm the exact partial state this test is named for: one
         # history row exists, no rating has moved yet.
@@ -689,6 +706,7 @@ def test_the_race_document_is_marked_finished_before_the_redis_lobby(db):
         _persist_result(db, {
             "match_id": match_id,
             "replay_sha256": "sha256:" + "1" * 64,
+            "manifest": manifest,
             "standings": [
                 {"player_id": player.id, "car_id": "USR-01", "position": 1,
                  "retired": False, "total_time": 100.0, "pit_laps": [],

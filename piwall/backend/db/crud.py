@@ -68,7 +68,57 @@ def get_player_by_id(db, player_id: str):
 
 
 def update_player_elo(db, player_id: str, new_elo: float):
+    """Set a player's rating outright. Prefer apply_player_elo for a match.
+
+    Kept because it is the honest operation for anything that genuinely does
+    know the value it wants (an admin correction, a fixture). It is a plain
+    read-modify-write from the caller's point of view and carries the lost
+    update that goes with one, which is why the match path does not use it.
+    """
     db.db.players.update_one({"id": player_id}, {"$set": {"elo": new_elo}})
+
+
+def apply_player_elo(db, player_id: str, elo_before: float, elo_after: float,
+                     first_application: bool):
+    """Move a player's rating by one match's delta, atomically.
+
+    The old `$set` here was a lost update between two DIFFERENT matches
+    finishing for the same player at once: both read the pre-race rating,
+    both computed from it, and the second `$set` discarded the first match's
+    change while both elo_history rows persisted -- so the history and the
+    rating disagreed permanently. Redelivery of the same match was safe
+    (determinism gives the same number); concurrency across matches was not,
+    and the whole point of this phase is that matches now finish
+    asynchronously on a fleet instead of serially inside one API process.
+
+    Two paths, because the safe write differs by what the caller knows:
+
+    * first_application -- the caller just inserted this player's
+      elo_history row for this race, and the unique index on
+      (player_id, race_id) means that insert happens at most once ever. So
+      this branch runs at most once per transition and `$inc` is exactly
+      right: it is atomic in the server, it composes with a concurrent
+      match's `$inc`, and it cannot be applied twice.
+    * otherwise -- the row already existed, so an earlier delivery may or
+      may not have got as far as moving the rating. `$inc` here could double
+      the move. A compare-and-set from the pre-race value applies it only if
+      the rating is still exactly what it was before this race, which is the
+      one state in which the move is definitely outstanding. If it is not,
+      either this transition was already applied or another match has since
+      moved the rating -- and in both cases doing nothing is right, where
+      the old `$set` would have clobbered the other match.
+
+    Returns True if this call moved the rating.
+    """
+    if first_application:
+        result = db.db.players.update_one(
+            {"id": player_id}, {"$inc": {"elo": elo_after - elo_before}}
+        )
+    else:
+        result = db.db.players.update_one(
+            {"id": player_id, "elo": elo_before}, {"$set": {"elo": elo_after}}
+        )
+    return bool(result.modified_count)
 
 
 def get_leaderboard(db, limit: int = 50):
@@ -108,13 +158,51 @@ def get_active_races(db):
     return [to_namespace(doc) for doc in docs]
 
 
+# Which status stamps which timestamp. A table rather than a chain of ifs
+# because abort_race below needs the same rule and must not re-derive it.
+_STATUS_TIMESTAMP = {"running": "started_at", "finished": "finished_at"}
+
+
+def _stamp_once(db, race_id: str, field: str) -> None:
+    """Set a timestamp only if it is not already set.
+
+    The job queue is at-least-once, so a fully persisted match can be
+    delivered again; an unconditional $set then walks the recorded finish
+    time forward on every redelivery, and an operator XGROUP DESTROY walks
+    every finish time in the stream forward at once. The filter is what makes
+    this write value-idempotent like every other write in _persist_result.
+
+    `{field: None}` matches a document where the field is null AND one where
+    it is absent -- both of which mean "not stamped yet".
+    """
+    db.db.races.update_one(
+        {"id": race_id, field: None}, {"$set": {field: _now()}}
+    )
+
+
 def update_race_status(db, race_id: str, status: str):
-    updates = {"status": status}
-    if status == "running":
-        updates["started_at"] = _now()
-    elif status == "finished":
-        updates["finished_at"] = _now()
-    db.db.races.update_one({"id": race_id}, {"$set": updates})
+    field = _STATUS_TIMESTAMP.get(status)
+    if field:
+        _stamp_once(db, race_id, field)
+    db.db.races.update_one({"id": race_id}, {"$set": {"status": status}})
+
+
+def abort_race(db, race_id: str, reason: str):
+    """Mark a race aborted, recording why, without overwriting a result.
+
+    Filtered on a non-terminal status rather than written unconditionally.
+    Two callers can reach here about a race that is already finished -- a
+    redelivered job whose earlier delivery completed, and (before the lobby
+    status became a compare-and-set) the loser of a concurrent /start -- and
+    an unconditional write would mark a race that has results in
+    race_results as aborted, permanently, with the results still sitting
+    there. A race that already finished is not abortable.
+    """
+    _stamp_once(db, race_id, "finished_at")
+    return db.db.races.update_one(
+        {"id": race_id, "status": {"$ne": "finished"}},
+        {"$set": {"status": "aborted", "abort_reason": reason}},
+    )
 
 
 def save_race_data(db, race_id: str, lap_data: list, events: list):
@@ -386,7 +474,27 @@ def get_manifest(db, match_id: str):
 
 
 def save_replay_hash(db, match_id: str, replay_sha256: str):
-    """Record a replay's hash against its manifest.
+    """Record a replay's hash against its manifest. Never overwrite a
+    DIFFERENT one.
+
+    This is the one place in the system where two independent executions of
+    the same match can be compared, and at-least-once delivery guarantees a
+    second execution eventually happens. A `$set` here meant that if the
+    second run produced different bytes -- a determinism break, the single
+    failure this whole product rests on not happening -- the second hash
+    silently replaced the first, with no error, no log and no trace. The
+    mechanism best placed to catch it was erasing it.
+
+    So: the write is conditional on the stored hash being absent or already
+    equal, in ONE atomic update rather than a read-then-write (two workers
+    persisting the same match concurrently is a designed-for state here, not
+    an exotic one). If that matches nothing, the row either does not exist
+    or holds a different hash; the differing hash is appended to
+    `replay_sha256_conflicts` -- preserved alongside the original, not over
+    it -- and ReplayHashConflict is raised so a caller cannot mistake this
+    for a successful write. save_manifest three functions above already
+    refuses a changed manifest this way; the replay hash is the same kind of
+    claim about the same match.
 
     Returns the raw UpdateResult (matched_count == 0 means no manifest
     document exists for match_id yet, since this is update-only and never
@@ -394,9 +502,56 @@ def save_replay_hash(db, match_id: str, replay_sha256: str):
     was actually touched -- the worker, ack-ing only once persistence is
     real -- can check that itself instead of trusting a silent no-op.
     """
-    return db.db.manifests.update_one(
-        {"match_id": match_id}, {"$set": {"replay_sha256": replay_sha256}}
+    from ..determinism.replay import ReplayHashConflict
+
+    result = db.db.manifests.update_one(
+        {
+            "match_id": match_id,
+            "$or": [{"replay_sha256": None}, {"replay_sha256": replay_sha256}],
+        },
+        {"$set": {"replay_sha256": replay_sha256}},
     )
+    if result.matched_count:
+        return result
+
+    # Nothing matched: either there is no manifest row (the caller's own
+    # matched_count == 0 check handles that, and $addToSet below touches
+    # nothing) or the row holds a hash that is not this one.
+    conflicted = db.db.manifests.find_one_and_update(
+        {"match_id": match_id},
+        {"$addToSet": {"replay_sha256_conflicts": replay_sha256}},
+    )
+    if conflicted is None:
+        return result
+    raise ReplayHashConflict(
+        f"match {match_id!r} already recorded replay hash "
+        f"{conflicted.get('replay_sha256')} and this execution produced "
+        f"{replay_sha256}. The same manifest produced different bytes, so "
+        f"the determinism contract is broken for this build. Both hashes "
+        f"are kept on the manifest document."
+    )
+
+
+def get_replay_hash_conflicts(db, match_id: str) -> list:
+    """Every replay hash for this match that disagreed with the first.
+
+    Empty for every healthy match. Non-empty is the loudest fact this
+    database can hold about the engine.
+    """
+    raw = db.db.manifests.find_one({"match_id": match_id})
+    return list(raw.get("replay_sha256_conflicts") or []) if raw else []
+
+
+def get_manifest_digest(db, match_id: str):
+    """The stored manifest's own digest, or None if there is no manifest.
+
+    Read rather than recomputed from get_manifest(): the point of the check
+    this feeds (worker._persist_result) is to catch a manifest that would
+    rebuild differently in this process, and rebuilding it here to compare
+    would be comparing this process against itself.
+    """
+    raw = db.db.manifests.find_one({"match_id": match_id}, {"manifest_sha256": 1})
+    return raw.get("manifest_sha256") if raw else None
 
 
 def get_replay_hash(db, match_id: str):

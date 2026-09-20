@@ -633,6 +633,14 @@ def get_race(race_id: str):
             ],
             "lap_data": race.lap_data_json,
             "events": race.events_json,
+            # Why a match never ran, for the player whose bot was in it.
+            # None for every race that completed. Without it the only
+            # difference between "aborted" and "finished with nobody
+            # scoring" is an empty results list, which tells a player
+            # nothing about their own bot -- and the commonest reason to
+            # land here is that their bot exceeded its resource budget,
+            # which is something they can fix.
+            "abort_reason": getattr(race, "abort_reason", None),
         }
     finally:
         db.close()
@@ -1357,10 +1365,27 @@ async def _relay_match_events() -> None:
                         executor, EVENTS.listen, pubsub, 1.0
                     )
                     backoff = _RELAY_MIN_BACKOFF_SECONDS
-                    if not event or event.get("type") != "match_finished":
+                    if not event:
+                        continue
+                    kind = event.get("type")
+                    if kind not in ("match_finished", "match_aborted"):
                         continue
                     race_id = event["match_id"]
                     if race_id not in SOCKETS:
+                        continue
+                    if kind == "match_aborted":
+                        # A match the worker could not run. The durable
+                        # record (race status "aborted" and its reason) is
+                        # already written, same as for a finished match;
+                        # this is fan-out only. The reason is composed by
+                        # the worker from its own constants and is safe to
+                        # show an unauthenticated spectator -- see
+                        # worker.UNRUNNABLE_REASON and
+                        # sandbox/isolation.py's LimitExceeded.
+                        await _broadcast(race_id, {
+                            "type": "aborted",
+                            "reason": event.get("reason") or "internal error",
+                        })
                         continue
                     await _stream_stored_replay(race_id)
                 except asyncio.CancelledError:
